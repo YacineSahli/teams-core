@@ -50,19 +50,25 @@ pub async fn get_presence_data(client: &TeamsClient) -> Result<PresenceInfo> {
 
 /// Set presence status
 pub async fn set_presence(status: &str) -> Result<()> {
+    let client = TeamsClient::new().await?;
+    set_presence_with_client(&client, status).await
+}
+
+/// Set presence through an existing client (embedder API).
+pub async fn set_presence_with_client(client: &TeamsClient, status: &str) -> Result<()> {
     let (availability, activity) = match status.to_lowercase().as_str() {
         "available" => ("Available", "Available"),
         "busy" => ("Busy", "InACall"),
         "dnd" | "donotdisturb" => ("DoNotDisturb", "Presenting"),
         "away" => ("Away", "Away"),
         "offline" => ("Offline", "OffWork"),
+        "brb" | "berightback" => ("BeRightBack", "BeRightBack"),
         other => bail!(
-            "Unknown status: {}. Use: available, busy, dnd, away, offline",
+            "Unknown status: {}. Use: available, brb, busy, dnd, away, offline",
             other
         ),
     };
 
-    let client = TeamsClient::new().await?;
     let body = serde_json::json!({
         "sessionId": "teams-cli",
         "availability": availability,
@@ -74,6 +80,5 @@ pub async fn set_presence(status: &str) -> Result<()> {
         .graph_post("/me/presence/setUserPreferredPresence", &body)
         .await?;
 
-    println!("Presence set to: {}", status);
     Ok(())
 }

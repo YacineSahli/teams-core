@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::fs;
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -77,11 +77,51 @@ impl Config {
         let path = Self::config_path_for(profile)?;
 
         if !path.exists() {
+            // Tokens at rest live in the OS keyring; the plaintext file is
+            // removed after saves. Restore from there when it exists.
+            if let Some(cfg) = Self::load_from_keyring(profile) {
+                return Ok(cfg);
+            }
             return Ok(Self::default());
         }
 
         let content = fs::read_to_string(&path).context("Failed to read config file")?;
-        toml::from_str(&content).context("Failed to parse config file")
+        let cfg: Self = toml::from_str(&content).context("Failed to parse config file")?;
+        // Migrate plaintext to the keyring (best effort; on failure the
+        // plaintext file stays and nothing is lost).
+        if let Err(error) = Self::persist_secure(&cfg, profile, &path) {
+            tracing::warn!("token keyring migration failed: {error:#}");
+        }
+        Ok(cfg)
+    }
+
+    const KEYRING_SERVICE: &str = "teamsfast";
+
+    fn keyring_entry(profile: &str) -> Result<keyring::Entry, keyring::Error> {
+        keyring::Entry::new(Self::KEYRING_SERVICE, &format!("tokens-{profile}"))
+    }
+
+    /// The whole config TOML, stored as the OS keyring secret.
+    fn persist_secure(
+        cfg: &Self,
+        profile: &str,
+        plaintext_path: &Path,
+    ) -> Result<()> {
+        let content = toml::to_string_pretty(cfg)
+            .context("Failed to serialize config for the keyring")?;
+        let entry = Self::keyring_entry(profile)?;
+        entry
+            .set_password(&content)
+            .context("Failed to store tokens in the keyring")?;
+        // Plaintext copy gone; the keyring is the only copy now.
+        let _ = fs::remove_file(plaintext_path);
+        Ok(())
+    }
+
+    fn load_from_keyring(profile: &str) -> Option<Self> {
+        let entry = Self::keyring_entry(profile).ok()?;
+        let text = entry.get_password().ok()?;
+        toml::from_str(&text).ok()
     }
 
     /// Load configuration, reusing an in-memory copy when the file is
@@ -135,6 +175,10 @@ impl Config {
     pub fn delete_for(profile: &str) -> Result<bool> {
         let name = normalize_profile(profile);
         Self::invalidate_cache_for(&name);
+        // The keyring copy goes too (best effort).
+        if let Ok(entry) = Self::keyring_entry(&name) {
+            let _ = entry.delete_credential();
+        }
         let path = Self::config_path_for(&name)?;
         if !path.exists() {
             return Ok(false);

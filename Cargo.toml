@@ -57,6 +57,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Config/storage
 directories = "5"
 toml = "0.8"
+# Tokens at rest: the whole config TOML lives in the OS keyring
+# (Secret Service on Linux); the plaintext file is removed after saves.
+keyring = { version = "3", features = ["sync-secret-service"] }
 
 # Async utilities
 futures = "0.3"

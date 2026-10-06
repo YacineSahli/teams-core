@@ -151,7 +151,7 @@ pub use planner::{
     set_assignment_body, set_complete_body, set_task_assignee_data, set_task_complete_data,
     task_path, tasks_path,
 };
-pub use presence::get_presence_data;
+pub use presence::{get_presence_data, set_presence_with_client};
 pub use tabs::{list_chat_tabs_data, list_tabs_data};
 pub use teams::{
     add_member_body, add_team_member_data, channel_react_body,
