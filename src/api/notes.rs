@@ -45,12 +45,14 @@ struct WirePage {
 // -- Public data types --
 
 /// OneNote notebook metadata.
+#[derive(Debug, Clone)]
 pub struct NotebookInfo {
     pub id: String,
     pub name: String,
 }
 
 /// OneNote section with its pages (nested to save round trips).
+#[derive(Debug, Clone)]
 pub struct SectionInfo {
     pub id: String,
     pub name: String,
@@ -58,6 +60,7 @@ pub struct SectionInfo {
 }
 
 /// OneNote page metadata (content arrives via [`read_note_page_data`]).
+#[derive(Debug, Clone)]
 pub struct PageInfo {
     pub id: String,
     pub title: String,
@@ -65,6 +68,7 @@ pub struct PageInfo {
 }
 
 /// OneNote page content: title scraped from `<title>`, raw HTML body.
+#[derive(Debug, Clone)]
 pub struct NotePage {
     pub id: String,
     pub title: String,
