@@ -63,6 +63,7 @@ pub async fn list_teams() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Team metadata for TUI display.
+#[derive(Debug, Clone)]
 pub struct TeamInfo {
     pub id: String,
     pub name: String,
@@ -70,6 +71,7 @@ pub struct TeamInfo {
 }
 
 /// Channel metadata for TUI display.
+#[derive(Debug, Clone)]
 pub struct ChannelInfo {
     pub id: String,
     pub name: String,
