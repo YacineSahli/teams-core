@@ -690,9 +690,10 @@ pub async fn run_call_with_stop(
 
 /// Derive the epconv URL from region_gtms.
 ///
-/// Uses calling_conversationServiceUrl directly if available,
-/// otherwise falls back to extracting the regional base from potentialCallRequestUrl.
-fn derive_epconv_url(region_gtms: &serde_json::Value) -> Option<String> {
+/// Derive the regional epconv URL from the config's `region_gtms` blob
+/// (`calling_conversationServiceUrl` first, `potentialCallRequestUrl`
+/// fallback). `TEAMS_EPCONV_URL` overrides for region testing.
+pub fn derive_epconv_url(region_gtms: &serde_json::Value) -> Option<String> {
     // Allow env var override for testing different regions
     if let Ok(url) = std::env::var("TEAMS_EPCONV_URL") {
         return Some(url);

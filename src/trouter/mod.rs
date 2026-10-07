@@ -177,7 +177,7 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
                                 });
                             }
                         }
-                        handle_frame(&text, &http, skype_token_str).await
+                        handle_frame(&text).await
                     }
                     Ok(None) => {
                         break DisconnectReason::Error(anyhow::anyhow!("WebSocket closed by server"));
@@ -236,7 +236,7 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
 }
 
 /// Handle an incoming socket.io frame.
-async fn handle_frame(frame: &str, http: &reqwest::Client, skype_token: &str) {
+async fn handle_frame(frame: &str) {
     // socket.io framing:
     // 1:: — handshake (handled above)
     // 2:: — heartbeat ping (server)
@@ -276,7 +276,7 @@ async fn handle_frame(frame: &str, http: &reqwest::Client, skype_token: &str) {
             // TEAMS_MANUAL_CALLS=1 to take accept/end themselves; the
             // invitation is still published to event_hub above either way.
             if is_call && std::env::var_os("TEAMS_MANUAL_CALLS").is_none() {
-                handle_call_event(json_str, http, skype_token).await;
+                handle_call_event(json_str).await;
             }
         } else {
             println!("Frame: {}", frame);
@@ -312,6 +312,12 @@ async fn handle_frame(frame: &str, http: &reqwest::Client, skype_token: &str) {
 /// plain body isn't JSON). Only chat-service events (`resourceType` /
 /// `resource` / `eventMessages`) are returned; anything else (calls,
 /// other services) is None and keeps its existing path.
+///
+/// Exception: call-signalling callbacks posted to our registered
+/// `callAgent` paths (`…/conversation/conversationEnd/`, `…/call/end/`)
+/// come back through the same data frames. They are published as a
+/// `callCallback` envelope so embedders can react to remote hang-up /
+/// caller-cancel; every other call frame stays filtered out.
 pub fn data_frame_event(payload: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(payload).ok()?;
     let obj = v.as_object()?;
@@ -329,7 +335,18 @@ pub fn data_frame_event(payload: &str) -> Option<String> {
             .and_then(|(_, d)| d.as_object())
             .and_then(|d| find_body(d))
     })?;
+    let url = obj
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("url"))
+        .and_then(|(_, u)| u.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let is_call_callback = url.contains("conversationEnd") || url.contains("/call/end");
+
     if body_val.is_object() {
+        if is_call_callback {
+            return Some(call_callback_json(&url, &body_val));
+        }
         return chat_event_json(&body_val.to_string());
     }
     let body = body_val.as_str()?;
@@ -344,8 +361,30 @@ pub fn data_frame_event(payload: &str) -> Option<String> {
             })
         })
         .unwrap_or(false);
-    let plain = if gzip_header { None } else { chat_event_json(body) };
-    plain.or_else(|| gunzip_base64(body).and_then(|t| chat_event_json(&t)))
+    // Decode the body: plain JSON, base64+gzip when flagged, or base64+gzip
+    // unflagged when the plain text isn't JSON (legacy fallback).
+    let decoded: Option<String> = if gzip_header {
+        gunzip_base64(body)
+    } else if serde_json::from_str::<serde_json::Value>(body).is_ok() {
+        Some(body.to_string())
+    } else {
+        gunzip_base64(body)
+    };
+    let decoded = decoded?;
+    if is_call_callback {
+        return Some(call_callback_json(
+            &url,
+            &serde_json::from_str(&decoded).unwrap_or(serde_json::Value::Null),
+        ));
+    }
+    chat_event_json(&decoded)
+}
+
+/// Wrap a call-signalling callback into the embedder envelope. The URL is
+/// kept verbatim (its trailing segment names the callback: conversationEnd,
+/// end, …); the body is passed through as-is (may be Null for non-JSON).
+fn call_callback_json(url: &str, body: &serde_json::Value) -> String {
+    serde_json::json!({ "type": "callCallback", "url": url, "body": body }).to_string()
 }
 
 fn chat_event_json(text: &str) -> Option<String> {
@@ -382,7 +421,7 @@ fn gunzip_base64(body: &str) -> Option<String> {
 }
 
 /// Handle a call event from Trouter — parse invitation and auto-answer.
-async fn handle_call_event(json_str: &str, http: &reqwest::Client, skype_token: &str) {
+async fn handle_call_event(json_str: &str) {
     let notification = match calling::parse_call_notification(json_str) {
         Some(n) => n,
         None => {
@@ -416,261 +455,31 @@ async fn handle_call_event(json_str: &str, http: &reqwest::Client, skype_token: 
         }
     }
 
-    // Determine if video modality is requested.
+    // Determine if video modality is requested (the answer itself stays
+    // audio-only; `answer_call_with_stop` owns the modalities).
     let has_video = notification
         .call_invitation
         .as_ref()
         .and_then(|inv| inv.call_modalities.as_ref())
         .map(|mods| mods.iter().any(|m| m.eq_ignore_ascii_case("video")))
         .unwrap_or(false);
+    if has_video {
+        println!("  (video offered; answering audio-only)");
+    }
 
-    // Auto-answer: generate SDP answer and send acceptance.
+    // Auto-answer in a detached task: the trouter event loop must keep
+    // draining (the answer flow runs until the call ends). Same behaviour
+    // as the pre-extraction inline flow; embedders with UI-driven
+    // signaling set TEAMS_MANUAL_CALLS=1 and take accept/end themselves.
     println!("  Auto-answering call...");
-
-    // Try to acquire TURN relay credentials (best-effort, fail gracefully).
-    let relay_config = match calling::turn::acquire_relay_credentials(http, skype_token).await {
-        Ok(config) => {
-            tracing::info!(
-                "Acquired relay credentials: {} servers, username={}, ttl={}s",
-                config.servers.len(),
-                config.username,
-                config.ttl
-            );
-            Some(config)
+    let never_stop = tokio::sync::watch::channel(false).1;
+    tokio::spawn(async move {
+        if let Err(e) = crate::calling::answer_call_with_stop(&notification, false, never_stop)
+            .await
+        {
+            tracing::warn!("Auto-answer flow failed: {:#}", e);
         }
-        Err(e) => {
-            tracing::info!(
-                "Relay credential acquisition failed (will use direct/srflx only): {:#}",
-                e
-            );
-            None
-        }
-    };
-
-    // Gather relay candidate if we have credentials.
-    let relay_candidate = if let Some(ref config) = relay_config {
-        match calling::turn::gather_relay_candidate(config).await {
-            Some((candidate, _client)) => {
-                tracing::info!(
-                    "Gathered relay candidate: {}:{}",
-                    candidate.address,
-                    candidate.port
-                );
-                Some(candidate)
-            }
-            None => {
-                tracing::info!("Failed to gather relay candidate (TURN allocate failed)");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Try to generate and send media answer first (protocol order: media answer before acceptance).
-    if let Some(ref inv) = notification.call_invitation {
-        if let Some(ref mc) = inv.media_content {
-            if let Some(ref blob) = mc.blob {
-                match calling::sdp::parse_sdp_offer(blob) {
-                    Ok(offer_info) => {
-                        let local_ip = calling::sdp::get_local_ip();
-
-                        // Parse remote SRTP keying material from the offer's crypto lines.
-                        let remote_audio_crypto = offer_info
-                            .crypto_lines
-                            .iter()
-                            .find_map(|line| calling::srtp::parse_crypto_line(line).ok());
-
-                        let remote_video_crypto = offer_info.video.as_ref().and_then(|v| {
-                            v.crypto_lines
-                                .iter()
-                                .find_map(|line| calling::srtp::parse_crypto_line(line).ok())
-                        });
-
-                        // Build local candidates list (relay if available).
-                        let mut local_cands: Vec<calling::ice::IceCandidate> = Vec::new();
-                        if let Some(ref rc) = relay_candidate {
-                            local_cands.push(rc.clone());
-                        }
-
-                        // Generate SDP answer with ICE credentials.
-                        let answer_result = calling::sdp::generate_sdp_answer_full(
-                            &local_ip,
-                            0,
-                            0,
-                            &offer_info,
-                            &local_cands,
-                            &[],
-                        );
-
-                        // Parse our own SRTP keying material from the answer.
-                        let local_audio_crypto =
-                            calling::srtp::parse_crypto_line(&answer_result.audio_crypto_line).ok();
-                        let local_video_crypto = answer_result
-                            .video_crypto_line
-                            .as_ref()
-                            .and_then(|line| calling::srtp::parse_crypto_line(line).ok());
-
-                        tracing::info!(
-                            "Generated SDP answer ({} bytes, video={}, ufrag={})",
-                            answer_result.sdp.len(),
-                            offer_info.video.is_some(),
-                            answer_result.audio_ice_ufrag
-                        );
-
-                        if let Err(e) = calling::signaling::send_media_answer(
-                            http,
-                            skype_token,
-                            &notification,
-                            &answer_result.sdp,
-                        )
-                        .await
-                        {
-                            tracing::warn!("Failed to send media answer: {:#}", e);
-                        }
-
-                        // Start audio media session with ICE connectivity checks.
-                        if let (Some(local_mat), Some(remote_mat)) =
-                            (local_audio_crypto, remote_audio_crypto)
-                        {
-                            let candidates = calling::ice::parse_candidates_from_sdp(blob);
-                            if candidates.iter().any(|c| {
-                                c.transport == calling::ice::Transport::Udp && c.component == 1
-                            }) {
-                                let local_creds = calling::ice::IceCredentials {
-                                    ufrag: answer_result.audio_ice_ufrag.clone(),
-                                    pwd: answer_result.audio_ice_pwd.clone(),
-                                };
-                                let remote_creds = calling::ice::IceCredentials {
-                                    ufrag: offer_info.ice_ufrag.clone(),
-                                    pwd: offer_info.ice_pwd.clone(),
-                                };
-                                tracing::info!(
-                                    "Starting audio media session with ICE ({} candidates)",
-                                    candidates.len()
-                                );
-                                tokio::spawn(async move {
-                                    match calling::media::MediaSession::start_with_ice(
-                                        0,
-                                        &candidates,
-                                        &local_creds,
-                                        &remote_creds,
-                                        &local_mat,
-                                        &remote_mat,
-                                    )
-                                    .await
-                                    {
-                                        Ok(session) => {
-                                            tracing::info!(
-                                                "Audio session started on port {}",
-                                                session.local_port().unwrap_or(0)
-                                            );
-                                            loop {
-                                                tokio::time::sleep(std::time::Duration::from_secs(
-                                                    5,
-                                                ))
-                                                .await;
-                                                let stats = session.stats().await;
-                                                tracing::info!(
-                                                    "Audio stats: sent={}, recv={} ({} bytes)",
-                                                    stats.packets_sent,
-                                                    stats.packets_received,
-                                                    stats.bytes_received
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Failed to start audio session: {:#}",
-                                                e
-                                            );
-                                        }
-                                    }
-                                });
-                            } else {
-                                tracing::warn!("No suitable audio ICE candidate found");
-                            }
-                        } else {
-                            tracing::warn!(
-                                "Missing audio SRTP keying material, audio session not started"
-                            );
-                        }
-
-                        // Start video media session if video modality is present.
-                        if has_video {
-                            if let (Some(local_mat), Some(remote_mat)) =
-                                (local_video_crypto, remote_video_crypto)
-                            {
-                                let vid_candidates =
-                                    calling::ice::parse_candidates_from_sdp_section(blob, "video");
-                                if let Some(remote_addr) =
-                                    calling::ice::select_remote_candidate(&vid_candidates)
-                                {
-                                    tracing::info!(
-                                        "Starting video media session to remote {}",
-                                        remote_addr
-                                    );
-                                    tokio::spawn(async move {
-                                        match calling::media::VideoMediaSession::start(
-                                            0,
-                                            remote_addr,
-                                            &local_mat,
-                                            &remote_mat,
-                                        )
-                                        .await
-                                        {
-                                            Ok(session) => {
-                                                tracing::info!(
-                                                    "Video session started on port {}",
-                                                    session.local_port().unwrap_or(0)
-                                                );
-                                                loop {
-                                                    tokio::time::sleep(
-                                                        std::time::Duration::from_secs(5),
-                                                    )
-                                                    .await;
-                                                    let stats = session.stats().await;
-                                                    tracing::info!(
-                                                        "Video stats: sent={} pkts/{} frames, recv={} pkts/{} frames ({} bytes)",
-                                                        stats.packets_sent,
-                                                        stats.frames_sent,
-                                                        stats.packets_received,
-                                                        stats.frames_received,
-                                                        stats.bytes_received
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "Failed to start video session: {:#}",
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    });
-                                } else {
-                                    tracing::warn!("No suitable video ICE candidate found");
-                                }
-                            } else {
-                                tracing::warn!(
-                                    "Missing video SRTP keying material, video session not started"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Could not parse SDP offer (may be compressed): {:#}", e);
-                        // Still try acceptance without media answer.
-                    }
-                }
-            }
-        }
-    }
-
-    // Send acceptance.
-    if let Err(e) = calling::signaling::accept_call(http, skype_token, &notification).await {
-        tracing::warn!("Failed to accept call: {:#}", e);
-    }
+    });
 }
 
 #[cfg(test)]
@@ -733,5 +542,44 @@ mod sendfix_tests {
         assert!(data_frame_event(&frame(r#"{"callNotification":{}}"#, serde_json::json!({}))).is_none());
         assert!(data_frame_event("not json").is_none());
         assert!(data_frame_event(r#"{"id":1,"status":200}"#).is_none());
+    }
+
+    #[test]
+    fn call_callback_conversation_end_is_published() {
+        // Call-signalling callbacks arrive on our registered callAgent paths.
+        // conversationEnd (remote hang-up / caller-cancel) must surface as a
+        // callCallback envelope; other call paths stay filtered out.
+        let conv_end = frame(r#"{"reason":"hangup"}"#, serde_json::json!({})).replace(
+            "/v4/f/x/messaging",
+            "/v4/f/EP/ab12cd34/conversation/conversationEnd/",
+        );
+        let got = data_frame_event(&conv_end).expect("conversationEnd publishes");
+        let v: serde_json::Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(v["type"], "callCallback");
+        assert!(v["url"].as_str().unwrap().contains("conversationEnd"));
+        assert_eq!(v["body"]["reason"], "hangup");
+
+        // A plain rosterUpdate (not conversationEnd/call end) stays filtered.
+        let roster = conv_end.replace("conversationEnd", "rosterUpdate");
+        assert!(data_frame_event(&roster).is_none());
+    }
+
+    #[test]
+    fn call_callback_end_path_is_published_and_gzip_decoded() {
+        use base64::Engine;
+        use std::io::Write;
+        let body = serde_json::json!({"callState": "Disconnected"}).to_string();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(body.as_bytes()).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(enc.finish().unwrap());
+        let call_end = frame(
+            &b64,
+            serde_json::json!({"X-Microsoft-Skype-Content-Encoding": "gzip"}),
+        )
+        .replace("/v4/f/x/messaging", "/v4/f/EP/ab12cd34/call/end/");
+        let got = data_frame_event(&call_end).expect("call/end publishes");
+        let v: serde_json::Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(v["type"], "callCallback");
+        assert_eq!(v["body"]["callState"], "Disconnected");
     }
 }
