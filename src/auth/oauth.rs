@@ -2,16 +2,20 @@
 
 use anyhow::{Context, Result};
 use oauth2::{
-    basic::BasicClient, AuthUrl, ClientId, DeviceAuthorizationUrl, RefreshToken, Scope,
-    StandardDeviceAuthorizationResponse, TokenResponse, TokenUrl,
+    basic::BasicClient, AuthUrl, ClientId, DeviceAuthorizationUrl, EndpointNotSet, EndpointSet,
+    RefreshToken, Scope, StandardDeviceAuthorizationResponse, TokenResponse, TokenUrl,
 };
+
+/// The fully-built client: auth, device-auth and token endpoints set.
+type OauthClient =
+    BasicClient<EndpointSet, EndpointSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
 use super::skype::exchange_skype_token;
 use super::{AuthConfig, TokenStore};
 use crate::config::Config;
 
 /// Build the OAuth2 client from an AuthConfig
-fn build_client(auth_config: &AuthConfig) -> Result<BasicClient> {
+fn build_client(auth_config: &AuthConfig) -> Result<OauthClient> {
     let auth_url = AuthUrl::new(format!(
         "https://login.microsoftonline.com/{}/oauth2/v2.0/authorize",
         auth_config.tenant
@@ -25,18 +29,15 @@ fn build_client(auth_config: &AuthConfig) -> Result<BasicClient> {
         auth_config.tenant
     ))?;
 
-    Ok(BasicClient::new(
-        ClientId::new(auth_config.client_id.to_string()),
-        None,
-        auth_url,
-        Some(token_url),
-    )
-    .set_device_authorization_url(device_url))
+    Ok(BasicClient::new(ClientId::new(auth_config.client_id.to_string()))
+        .set_auth_uri(auth_url)
+        .set_token_uri(token_url)
+        .set_device_authorization_url(device_url))
 }
 
 /// Acquire an IC3 token by exchanging the refresh token with IC3 scope.
 async fn acquire_ic3_token(
-    client: &BasicClient,
+    client: &OauthClient,
     refresh_token_str: &str,
 ) -> Result<(String, Option<u64>)> {
     let token_response = client
@@ -45,7 +46,7 @@ async fn acquire_ic3_token(
             "https://ic3.teams.office.com/.default".to_string(),
         ))
         .add_scope(Scope::new("offline_access".to_string()))
-        .request_async(oauth2::reqwest::async_http_client)
+        .request_async(&reqwest::Client::new())
         .await
         .context("Failed to acquire IC3 token")?;
 
@@ -57,7 +58,7 @@ async fn acquire_ic3_token(
 
 /// Acquire a recorder service AAD token (audience: 4580fd1d-e5a3-4f56-9ad1-aab0e3bf8f76).
 async fn acquire_recorder_token(
-    client: &BasicClient,
+    client: &OauthClient,
     refresh_token_str: &str,
 ) -> Result<(String, Option<u64>)> {
     let token_response = client
@@ -66,7 +67,7 @@ async fn acquire_recorder_token(
             "4580fd1d-e5a3-4f56-9ad1-aab0e3bf8f76/.default".to_string(),
         ))
         .add_scope(Scope::new("offline_access".to_string()))
-        .request_async(oauth2::reqwest::async_http_client)
+        .request_async(&reqwest::Client::new())
         .await
         .context("Failed to acquire recorder token")?;
 
@@ -78,7 +79,7 @@ async fn acquire_recorder_token(
 
 /// Acquire a Graph API token by exchanging the refresh token with Graph scope.
 async fn acquire_graph_token(
-    client: &BasicClient,
+    client: &OauthClient,
     refresh_token_str: &str,
 ) -> Result<(String, Option<u64>)> {
     let token_response = client
@@ -87,7 +88,7 @@ async fn acquire_graph_token(
             "https://graph.microsoft.com/.default".to_string(),
         ))
         .add_scope(Scope::new("offline_access".to_string()))
-        .request_async(oauth2::reqwest::async_http_client)
+        .request_async(&reqwest::Client::new())
         .await
         .context("Failed to acquire Graph token")?;
 
@@ -123,7 +124,7 @@ pub async fn refresh_for(profile: &str) -> Result<bool> {
             "https://api.spaces.skype.com/.default".to_string(),
         ))
         .add_scope(Scope::new("offline_access".to_string()))
-        .request_async(oauth2::reqwest::async_http_client)
+        .request_async(&reqwest::Client::new())
         .await
         .context("Failed to refresh AAD token")?;
 
@@ -264,12 +265,12 @@ where
     tracing::info!("Initiating device code flow...");
 
     let device_auth_response: StandardDeviceAuthorizationResponse = client
-        .exchange_device_code()?
+        .exchange_device_code()
         .add_scope(Scope::new(
             "https://api.spaces.skype.com/.default".to_string(),
         ))
         .add_scope(Scope::new("offline_access".to_string()))
-        .request_async(oauth2::reqwest::async_http_client)
+        .request_async(&reqwest::Client::new())
         .await
         .context("Failed to request device code")?;
 
@@ -282,7 +283,7 @@ where
 
     let token_response = client
         .exchange_device_access_token(&device_auth_response)
-        .request_async(oauth2::reqwest::async_http_client, tokio::time::sleep, None)
+        .request_async(&reqwest::Client::new(), tokio::time::sleep, None)
         .await
         .context("Failed to exchange device code for token")?;
 

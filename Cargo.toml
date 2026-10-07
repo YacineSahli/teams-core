@@ -20,14 +20,14 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP client (use 0.11 for rustc 1.82 compatibility, native-tls avoids ICU issue)
-reqwest = { version = "0.11", features = ["json", "native-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
 
 # JSON serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # OAuth2 / Authentication
-oauth2 = { version = "4", features = ["reqwest"] }
+oauth2 = { version = "5", features = ["reqwest"] }
 url = "2"
 # Pin home to avoid 0.5.12 which requires edition 2024 (rustc 1.85+)
 home = "=0.5.11"
