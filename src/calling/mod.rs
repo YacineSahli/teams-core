@@ -5,6 +5,8 @@
 #[cfg(feature = "audio")]
 pub mod audio;
 pub mod call_test;
+
+pub use call_test::{run_call_test, run_call_with_stop, CallTestResult};
 #[cfg(feature = "video-capture")]
 pub mod camera;
 #[cfg(feature = "video-capture")]

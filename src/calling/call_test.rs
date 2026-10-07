@@ -70,6 +70,35 @@ pub async fn run_call_test(
     use_display: bool,
     tone_mode: bool,
 ) -> Result<CallTestResult> {
+    // Never-firing stop signal.
+    let (_tx, stop) = tokio::sync::watch::channel(false);
+    run_call_with_stop(
+        duration_secs,
+        record,
+        echo,
+        thread_override,
+        use_camera,
+        use_display,
+        tone_mode,
+        stop,
+    )
+    .await
+}
+
+/// [`run_call_test`] with a cooperative stop signal: the call tears down
+/// as soon as `stop` flips to true (checked every 250 ms) or the duration
+/// elapses — whichever comes first. GUI embedders hang up through it.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_call_with_stop(
+    duration_secs: u64,
+    record: bool,
+    echo: bool,
+    thread_override: Option<String>,
+    use_camera: bool,
+    use_display: bool,
+    tone_mode: bool,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<CallTestResult> {
     let config = Config::load_cached().context("Failed to load config")?;
     let skype_token = config
         .get_skype_token()
@@ -141,10 +170,13 @@ pub async fn run_call_test(
     let is_1to1_call = echo || callee_mri.is_some();
 
     // Get tenant ID
-    let tenant_id = config
-        .tenant_id
-        .as_deref()
-        .context("No tenant_id in config. Run `teams-cli login` first.")?;
+    let tenant_id = match config.tenant_id.as_deref() {
+        Some(t) if !t.trim().is_empty() => t.to_string(),
+        // Older configs never stored tenant_id — the Skype token's `tid`
+        // claim carries it.
+        _ => extract_claim_from_skype_token(skype_token_str, "tid")
+            .context("No tenant_id in config or Skype token")?,
+    };
 
     // Fetch user profile for display name
     let (display_name, mail) = match &graph_token {
@@ -295,7 +327,7 @@ pub async fn run_call_test(
         chain_id: &chain_id,
         message_id: &message_id,
         caller_oid,
-        tenant_id,
+        tenant_id: tenant_id.as_str(),
         region: &teams_region,
     };
 
@@ -553,9 +585,19 @@ pub async fn run_call_test(
         }
     }
 
-    // 10. Wait for test duration
-    tracing::info!("Call active, running for {}s...", duration_secs);
-    tokio::time::sleep(Duration::from_secs(duration_secs)).await;
+    // 10. Wait for test duration or a stop signal (GUI hang-up).
+    tracing::info!("Call active, running for up to {}s...", duration_secs);
+    let started = std::time::Instant::now();
+    loop {
+        if *stop.borrow() {
+            tracing::info!("Stop signal received — hanging up");
+            break;
+        }
+        if started.elapsed() >= Duration::from_secs(duration_secs) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 
     // 11. Stop media
     outgoing_handles.abort_all();
@@ -1785,6 +1827,17 @@ async fn end_call_by_url(http: &reqwest::Client, skype_token: &str, end_url: &st
 ///
 /// Skype tokens are JWTs. The payload contains a "skypeid" claim like
 /// "orgid:<guid>" which we prefix with "8:" to form the MRI.
+/// Decode one string claim from the Skype token's JWT payload.
+fn extract_claim_from_skype_token(token: &str, claim: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(payload))
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    json.get(claim).and_then(|v| v.as_str()).map(String::from)
+}
+
 fn extract_mri_from_skype_token(token: &str) -> Option<String> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() < 2 {
