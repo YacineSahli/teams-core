@@ -40,7 +40,7 @@ pub use calendar::{
 pub use files::{FileVersion, SharedFile};
 pub use me::UserInfo;
 pub use notes::{NotePage, NotebookInfo, PageInfo, SectionInfo};
-pub use planner::{BucketInfo, PlanInfo, PlannerTaskInfo};
+pub use planner::{set_task_complete_with_client, BucketInfo, PlanInfo, PlannerTaskInfo};
 pub use presence::PresenceInfo;
 pub use team_settings::{team_settings_data, TeamMemberSettings};
 pub use recordings::{

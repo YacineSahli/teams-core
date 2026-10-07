@@ -173,12 +173,14 @@ pub fn create_task_body(plan_id: &str, bucket_id: &str, title: &str) -> Result<s
 // ---------------------------------------------------------------------------
 
 /// Planner board metadata.
+#[derive(Debug, Clone)]
 pub struct PlanInfo {
     pub id: String,
     pub title: String,
 }
 
 /// Bucket (board column) metadata.
+#[derive(Debug, Clone)]
 pub struct BucketInfo {
     pub id: String,
     pub plan_id: String,
@@ -186,6 +188,7 @@ pub struct BucketInfo {
 }
 
 /// Planner task metadata.
+#[derive(Debug, Clone)]
 pub struct PlannerTaskInfo {
     pub id: String,
     pub plan_id: String,
@@ -360,6 +363,23 @@ pub async fn set_task_complete_data(
     patch_task(task_id, etag, &set_complete_body(complete)).await
 }
 
+/// `set_task_complete_data` for embedders: derive the Graph token from
+/// `client`'s config rather than creating a new session.
+pub async fn set_task_complete_with_client(
+    client: &TeamsClient,
+    task_id: &str,
+    etag: &str,
+    complete: bool,
+) -> Result<PlannerTaskInfo> {
+    patch_task_with_token(
+        client.graph_token()?,
+        task_id,
+        etag,
+        &set_complete_body(complete),
+    )
+    .await
+}
+
 /// Assign (`assign=true`) or unassign one user on one task and return
 /// the task. Same `If-Match` / refresh-first contract as
 /// [`set_task_complete_data`].
@@ -389,10 +409,22 @@ async fn patch_task(
     if token.is_expired() {
         bail!("Graph token expired. Run 'teams-cli login'.");
     }
+    patch_task_with_token(token.token.clone(), task_id, etag, body).await
+}
+
+/// PATCH a task using an explicit Graph token (embedder path).
+async fn patch_task_with_token(
+    graph_token: String,
+    task_id: &str,
+    etag: &str,
+    body: &serde_json::Value,
+) -> Result<PlannerTaskInfo> {
+    let path = task_path(task_id)?;
+    check_etag(etag)?;
     let url = format!("{}{}", GRAPH_BASE, path);
     let resp = super::client::shared_http()
         .patch(&url)
-        .bearer_auth(token.token)
+        .bearer_auth(graph_token)
         .header("If-Match", etag)
         .header("Prefer", "return=representation")
         .json(body)

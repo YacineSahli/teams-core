@@ -233,7 +233,7 @@ impl TeamsClient {
         check_response(resp, &url).await
     }
 
-    fn graph_token(&self) -> Result<String> {
+    pub(crate) fn graph_token(&self) -> Result<String> {
         let token = self
             .config
             .get_graph_token()

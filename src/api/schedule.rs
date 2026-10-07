@@ -105,6 +105,7 @@ pub struct ScheduleInfo {
 }
 
 /// One shift row: shared slot wins, draft slot is the fallback.
+#[derive(Debug, Clone)]
 pub struct ShiftInfo {
     pub id: String,
     pub user_id: Option<String>,
