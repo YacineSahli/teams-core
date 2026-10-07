@@ -9,8 +9,10 @@ use base64::Engine;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+#[cfg(feature = "video-cam")]
+use crate::calling::{camera, codec};
 #[cfg(feature = "video-capture")]
-use crate::calling::{camera, codec, display};
+use crate::calling::display;
 use crate::calling::{ice, recording, rtcp, rtp, sdp, signaling, srtp, test_tone, video};
 use crate::config::Config;
 use crate::trouter::{registrar, session, websocket};
@@ -482,7 +484,7 @@ pub async fn run_call_with_stop(
     let mic_rx: Option<std::sync::mpsc::Receiver<Vec<i16>>> = None;
 
     // 9a. Initialize camera and display AFTER audio (SDL2 can interfere with audio)
-    #[cfg(feature = "video-capture")]
+    #[cfg(feature = "video-cam")]
     {
         if use_camera {
             match camera::CameraCapture::start(None, 320, 240, 15) {
@@ -500,6 +502,9 @@ pub async fn run_call_with_stop(
                 }
             }
         }
+    }
+    #[cfg(feature = "video-capture")]
+    {
         if use_display {
             match display::VideoDisplay::start("Teams Video - Received") {
                 Ok((_display, tx)) => {
@@ -513,10 +518,16 @@ pub async fn run_call_with_stop(
             }
         }
     }
+    #[cfg(not(feature = "video-cam"))]
+    {
+        if use_camera {
+            tracing::warn!("Camera requested but binary was not built with --features video-cam");
+        }
+    }
     #[cfg(not(feature = "video-capture"))]
     {
-        if use_camera || use_display {
-            tracing::warn!("Video capture/display requested but binary was not built with --features video-capture");
+        if use_display {
+            tracing::warn!("Video display requested but binary was not built with --features video-capture");
         }
     }
 
@@ -735,7 +746,7 @@ struct MediaLeg {
     /// Audio SSRC matching the SDP x-ssrc-range.
     audio_ssrc: u32,
     /// Camera frame receiver (when --camera is active).
-    #[cfg(feature = "video-capture")]
+    #[cfg(feature = "video-cam")]
     camera_rx: Option<std::sync::mpsc::Receiver<camera::YuvFrame>>,
     /// Display frame sender (when --display is active).
     #[cfg(feature = "video-capture")]
@@ -906,7 +917,7 @@ async fn setup_media_leg(
         video_local_pwd: local_video_pwd.to_string(),
         video_ssrc,
         audio_ssrc,
-        #[cfg(feature = "video-capture")]
+        #[cfg(feature = "video-cam")]
         camera_rx: None,
         #[cfg(feature = "video-capture")]
         display_tx: None,
@@ -1224,9 +1235,9 @@ fn spawn_media_leg(
         let vid_send_stats = video_send_stats.clone();
         let label = label.clone();
 
-        #[cfg(feature = "video-capture")]
+        #[cfg(feature = "video-cam")]
         let camera_rx = leg.camera_rx.take();
-        #[cfg(not(feature = "video-capture"))]
+        #[cfg(not(feature = "video-cam"))]
         let camera_rx: Option<()> = None;
 
         handles.push(tokio::spawn(async move {
@@ -1234,7 +1245,7 @@ fn spawn_media_leg(
             let mut interval =
                 tokio::time::interval(Duration::from_millis(video::FRAME_INTERVAL_MS));
 
-            #[cfg(feature = "video-capture")]
+            #[cfg(feature = "video-cam")]
             let mut encoder = camera_rx.as_ref().and_then(|_| {
                 match codec::H264Encoder::new(320, 240, 15.0, 256) {
                     Ok(enc) => {
@@ -1260,7 +1271,7 @@ fn spawn_media_leg(
 
                 // Try camera frame, fall back to black iframe
                 let nal_units = {
-                    #[cfg(feature = "video-capture")]
+                    #[cfg(feature = "video-cam")]
                     {
                         if let (Some(ref rx), Some(ref mut enc)) = (&camera_rx, &mut encoder) {
                             match rx.try_recv() {
@@ -1278,7 +1289,7 @@ fn spawn_media_leg(
                             video::generate_black_iframe()
                         }
                     }
-                    #[cfg(not(feature = "video-capture"))]
+                    #[cfg(not(feature = "video-cam"))]
                     {
                         let _ = &camera_rx;
                         video::generate_black_iframe()

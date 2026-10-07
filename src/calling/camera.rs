@@ -132,6 +132,7 @@ fn capture_loop(
 }
 
 /// Capture ~3s of video from V4L2 camera, then play it back in an SDL2 window.
+#[cfg(feature = "video-capture")]
 pub fn cam_test() -> anyhow::Result<()> {
     use super::display::{DisplayFrame, VideoDisplay};
     use anyhow::bail;

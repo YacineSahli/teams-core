@@ -9,9 +9,9 @@ pub mod call_test;
 
 pub use answer::{answer_call_with_stop, decline_call, CallAnswerResult};
 pub use call_test::{derive_epconv_url, run_call_test, run_call_with_stop, CallTestResult};
-#[cfg(feature = "video-capture")]
+#[cfg(feature = "video-cam")]
 pub mod camera;
-#[cfg(feature = "video-capture")]
+#[cfg(feature = "video-cam")]
 pub mod codec;
 #[cfg(feature = "video-capture")]
 pub mod display;
