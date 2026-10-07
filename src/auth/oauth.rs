@@ -200,6 +200,21 @@ pub async fn refresh_for(profile: &str) -> Result<bool> {
 
 /// Perform OAuth2 login flow
 pub async fn login(force: bool) -> Result<()> {
+    login_with_code_sink(force, |url, code| {
+        println!();
+        println!("To sign in, visit: {}", url);
+        println!("Enter code:        {}", code);
+        println!();
+    })
+    .await
+}
+
+/// Device-code login that hands the verification URL + code to `sink`
+/// instead of printing them (GUI embedder surface).
+pub async fn login_with_code_sink<F>(force: bool, sink: F) -> Result<()>
+where
+    F: FnOnce(&str, &str),
+{
     {
         let config = Config::load_cached()?;
 
@@ -224,7 +239,7 @@ pub async fn login(force: bool) -> Result<()> {
                     );
                     return Ok(());
                 }
-                // Try refresh before falling through to device code
+                // Try refresh before falling back to device code
                 if config.get_refresh_token().is_some() {
                     tracing::info!("AAD token expired, attempting refresh...");
                     match refresh().await {
@@ -260,11 +275,7 @@ pub async fn login(force: bool) -> Result<()> {
 
     let verification_url = device_auth_response.verification_uri().as_str();
     let user_code = device_auth_response.user_code().secret();
-
-    println!();
-    println!("To sign in, visit: {}", verification_url);
-    println!("Enter code:        {}", user_code);
-    println!();
+    sink(verification_url, user_code);
 
     // Poll for token
     tracing::info!("Waiting for authentication...");
