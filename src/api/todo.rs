@@ -145,6 +145,7 @@ pub async fn complete_todo_task(list_id: &str, task_id: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// To Do list metadata.
+#[derive(Debug, Clone)]
 pub struct TodoListInfo {
     pub id: String,
     pub name: String,
@@ -153,6 +154,7 @@ pub struct TodoListInfo {
 }
 
 /// To Do task metadata.
+#[derive(Debug, Clone)]
 pub struct TodoTaskInfo {
     pub id: String,
     pub title: String,

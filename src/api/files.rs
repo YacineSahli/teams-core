@@ -141,6 +141,7 @@ struct GraphAttachment {
 // -- Public model --
 
 /// One shared file (driveItem projection for list/upload/download).
+#[derive(Debug, Clone)]
 pub struct SharedFile {
     pub id: String,
     pub name: String,

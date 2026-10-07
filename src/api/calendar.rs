@@ -76,6 +76,7 @@ struct CalendarEvent {
 // ---------------------------------------------------------------------------
 
 /// One upcoming calendar event with meeting-join metadata.
+#[derive(Debug, Clone)]
 pub struct MeetingInfo {
     pub id: String,
     pub subject: String,
