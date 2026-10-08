@@ -1299,11 +1299,14 @@ pub async fn invite_user(
                 "participantId": callee_participant_id
             }]
         },
-        // Include call invitation data to trigger ringing on callee's device
-        "participantInvitationData": {
-            "callModalities": call_modalities,
-            "callDirection": "Outgoing"
-        },
+        // Empty participantInvitationData, exactly like the WORKING echo
+        // bot invite. The previous shape — callModalities +
+        // callDirection:"Outgoing" — produced one-sided calls against
+        // real clients: they answered but never streamed RTP (peer RTCP
+        // pkt_count stayed 0) and the CDR recorded the call with
+        // REVERSED direction ("missed call from" the callee). The
+        // modalities already ride on the epconv-level callInvitation.
+        "participantInvitationData": {},
         "callInvitation": {
             "callModalities": call_modalities,
             "replaces": null,
