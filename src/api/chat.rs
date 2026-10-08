@@ -22,8 +22,18 @@ struct Conversation {
     id: Option<String>,
     #[serde(rename = "threadProperties")]
     thread_properties: Option<ThreadProperties>,
+    #[serde(rename = "properties")]
+    properties: Option<ConversationProperties>,
     #[serde(rename = "lastMessage")]
     last_message: Option<NativeMessage>,
+}
+
+/// Server-side read position: `consumptionhorizon` updates when ANY of
+/// the user's clients reads the chat.
+#[derive(Debug, Deserialize)]
+struct ConversationProperties {
+    #[serde(rename = "consumptionhorizon")]
+    consumption_horizon: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +43,13 @@ struct ThreadProperties {
     last_join_at: Option<String>,
     /// For 1:1 chats, contains member MRIs
     members: Option<String>,
+    #[serde(rename = "consumptionhorizon")]
+    consumption_horizon: Option<String>,
+}
+
+/// First `;` component of a `"<ms>;<ms>;<messageId>"` horizon.
+fn horizon_ms(v: &str) -> Option<u64> {
+    v.split(';').next()?.trim().parse::<u64>().ok()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1330,6 +1347,9 @@ pub struct ChatInfo {
     pub last_message_time: Option<String>,
     pub last_message_sender: Option<String>,
     pub last_message_preview: Option<String>,
+    /// Server read position (consumption horizon, epoch ms): messages
+    /// older than this were read on SOME client, not just ours.
+    pub last_read_ms: Option<u64>,
 }
 
 /// A single message for TUI display.
@@ -1617,10 +1637,14 @@ async fn resolve_mate_name(
     self_oid: &str,
 ) -> Option<String> {
     let members = thread_member_mris(client, chat_id).await.ok()?;
+    // Bots (Cortana quick-reply et al.) ride along in 1:1 rosters; they
+    // are never the mate. Without this, `mates.len() != 1` bails and the
+    // chat falls back to the last-message sender's name — which shows
+    // the user's own name whenever they spoke last.
     let mates: Vec<&str> = members
         .iter()
         .map(String::as_str)
-        .filter(|m| !mri_is_self(m, self_oid))
+        .filter(|m| !mri_is_self(m, self_oid) && !m.starts_with("28:"))
         .collect();
     if mates.len() != 1 {
         return None;
@@ -1830,6 +1854,7 @@ pub fn parse_created_chat(value: &serde_json::Value) -> Result<ChatInfo> {
         last_message_time: None,
         last_message_sender: None,
         last_message_preview: None,
+        last_read_ms: None,
     })
 }
 
@@ -1954,6 +1979,7 @@ pub async fn create_one_to_one_chat_data(
         last_message_time: None,
         last_message_sender: None,
         last_message_preview: None,
+        last_read_ms: None,
     })
 }
 
@@ -2076,6 +2102,7 @@ pub async fn create_group_chat_data(
         last_message_time: None,
         last_message_sender: None,
         last_message_preview: None,
+        last_read_ms: None,
     })
 }
 
@@ -2365,6 +2392,19 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
             (None, None, None)
         };
 
+        // Server read position: prefer the sibling `properties` map, then
+        // threadProperties (placement varies across payload shapes).
+        let last_read_ms = conv
+            .properties
+            .as_ref()
+            .and_then(|p| p.consumption_horizon.as_deref())
+            .or_else(|| {
+                conv.thread_properties
+                    .as_ref()
+                    .and_then(|p| p.consumption_horizon.as_deref())
+            })
+            .and_then(horizon_ms);
+
         chats.push(ChatInfo {
             id,
             name,
@@ -2372,6 +2412,7 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
             last_message_time: last_time,
             last_message_sender: last_sender,
             last_message_preview: last_preview,
+            last_read_ms,
         });
     }
 
