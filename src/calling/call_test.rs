@@ -1398,11 +1398,21 @@ fn spawn_media_leg(
                                 Ok(frame) if frame.width > 0 => {
                                     if camera_active {
                                         if let Some(ref pt) = preview_tx {
-                                            let _ = pt.try_send(video::VideoFrame {
+                                            match pt.try_send(video::VideoFrame {
                                                 width: frame.width,
                                                 height: frame.height,
                                                 data: frame.data.clone(),
-                                            });
+                                            }) {
+                                                Err(e) => {
+                                                    tracing::debug!(
+                                                        "[{}] preview send failed: {e}",
+                                                        label
+                                                    );
+                                                }
+                                                Ok(()) => {}
+                                            }
+                                        } else {
+                                            tracing::debug!("[{}] no preview sink", label);
                                         }
                                         match enc.encode(&frame.data) {
                                             Ok(nals) if !nals.is_empty() => nals,
