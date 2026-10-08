@@ -1086,6 +1086,7 @@ pub async fn create_1to1_call(
     epconv_url: &str,
     params: &ConversationCallParams<'_>,
     sdp_offer: &str,
+    callee_mri: Option<&str>,
 ) -> Result<(ConversationCreated, ConversationJoined)> {
     let tc = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
     let cause_id = &params.message_id[..8.min(params.message_id.len())];
@@ -1130,7 +1131,14 @@ pub async fn create_1to1_call(
                 "participantId": params.participant_id,
                 "languageId": "en-US"
             },
-            "to": []
+            "to": callee_mri
+                .map(|mri| {
+                    serde_json::json!([{
+                        "id": mri,
+                        "participantId": uuid::Uuid::new_v4().to_string()
+                    }])
+                })
+                .unwrap_or_else(|| serde_json::json!([]))
         },
         "capabilities": null,
         "endpointCapabilities": 73463,

@@ -459,13 +459,22 @@ pub async fn run_call_with_controls(
         region: &teams_region,
     };
 
-    // Place the call: 1:1 calls (echo or thread) use single-shot epconv, channel uses two-phase
+    // Place the call: 1:1 calls (echo or thread) use single-shot epconv, channel uses two-phase.
+    // A 1:1 callee is declared in participants.to at CREATE time so the CC
+    // dials them as the call target — the post-hoc participant-add left the
+    // CC with a hostless meeting and a placeholder media leg (one-sided
+    // audio, reversed CDR).
     let (phase1, _phase2) = if is_1to1_call {
         // 1:1 call: single POST to epconv with SDP
         tracing::info!("Creating 1:1 call (single-shot epconv with SDP)...");
-        let (created, joined) =
-            signaling::create_1to1_call(&http, &epconv_url, &conv_params, &offer_result.sdp)
-                .await?;
+        let (created, joined) = signaling::create_1to1_call(
+            &http,
+            &epconv_url,
+            &conv_params,
+            &offer_result.sdp,
+            callee_mri.as_deref(),
+        )
+        .await?;
         (created, joined)
     } else {
         // Channel call: two-phase (create conversation, then join with SDP)
@@ -500,15 +509,20 @@ pub async fn run_call_with_controls(
         tracing::info!("Inviting Echo bot...");
         signaling::invite_echo_bot(&http, &phase1.conversation_controller, &conv_params).await?;
     } else if let Some(ref mri) = callee_mri {
-        tracing::info!("Inviting user {}...", mri);
-        signaling::invite_user(
-            &http,
-            &phase1.conversation_controller,
-            &conv_params,
-            mri,
-            use_camera,
-        )
-        .await?;
+        if is_1to1_call {
+            // Already declared in the epconv create (participants.to).
+            tracing::info!("Callee {} declared at create; skipping add", mri);
+        } else {
+            tracing::info!("Inviting user {}...", mri);
+            signaling::invite_user(
+                &http,
+                &phase1.conversation_controller,
+                &conv_params,
+                mri,
+                use_camera,
+            )
+            .await?;
+        }
     }
 
     // 7. Wait for mediaAnswer on Trouter
