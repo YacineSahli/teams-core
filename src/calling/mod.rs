@@ -8,7 +8,10 @@ pub mod answer;
 pub mod call_test;
 
 pub use answer::{answer_call_with_stop, decline_call, CallAnswerResult};
-pub use call_test::{derive_epconv_url, run_call_test, run_call_with_stop, CallTestResult};
+pub use call_test::{
+    call_controls, derive_epconv_url, run_call_test, run_call_with_controls, run_call_with_stop,
+    CallControls, CallControlsHandle, CallTestResult,
+};
 #[cfg(feature = "video-cam")]
 pub mod camera;
 #[cfg(feature = "video-cam")]

@@ -10,8 +10,97 @@ use anyhow::{bail, Result};
 /// H.264 payload type (dynamic, matching our SDP).
 pub const PT_H264: u8 = 122;
 
+/// A raw I420 video frame handed across the embedder boundary (decoded
+/// remote video, or the local camera preview). Deliberately feature-gate
+/// free so call controls can reference it unconditionally.
+#[derive(Debug, Clone)]
+pub struct VideoFrame {
+    pub width: u32,
+    pub height: u32,
+    /// Planar I420: Y (w*h) + U (w*h/4) + V (w*h/4).
+    pub data: Vec<u8>,
+}
+
+impl VideoFrame {
+    /// Convert to packed RGBA8 (unmultiplied) for GPU textures / egui.
+    pub fn to_rgba(&self) -> Vec<u8> {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let y = &self.data[..w * h];
+        let (u, v) = (&self.data[w * h..w * h + w * h / 4], &self.data[w * h + w * h / 4..]);
+        let mut rgba = vec![0u8; w * h * 4];
+        for row in 0..h {
+            for col in 0..w {
+                let yi = row * w + col;
+                let ci = (row / 2) * (w / 2) + (col / 2);
+                // ITU-R BT.601 full-range, standard integer form.
+                let c = y[yi] as i32 - 16;
+                let d = u[ci] as i32 - 128;
+                let e = v[ci] as i32 - 128;
+                let r = (298 * c + 409 * e + 128) >> 8;
+                let g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+                let b = (298 * c + 516 * d + 128) >> 8;
+                let o = yi * 4;
+                rgba[o] = r.clamp(0, 255) as u8;
+                rgba[o + 1] = g.clamp(0, 255) as u8;
+                rgba[o + 2] = b.clamp(0, 255) as u8;
+                rgba[o + 3] = 255;
+            }
+        }
+        rgba
+    }
+
+    /// Flat gray frame of the given size (test/QA helper): Y = level,
+    /// neutral chroma.
+    pub fn gray(w: u32, h: u32, level: u8) -> Self {
+        let y_size = (w * h) as usize;
+        let mut data = vec![128u8; y_size + y_size / 2];
+        data[..y_size].fill(level);
+        Self { width: w, height: h, data }
+    }
+}
+
 /// Video clock rate (90 kHz per RTP spec for video).
 pub const CLOCK_RATE: u32 = 90000;
+
+#[cfg(test)]
+mod frame_tests {
+    use super::VideoFrame;
+
+    #[test]
+    fn gray_to_rgba_matches_bt601() {
+        // Neutral chroma (U=V=128) maps Y straight to RGB via BT.601.
+        for level in [16u8, 64, 128, 235] {
+            let f = VideoFrame::gray(8, 4, level);
+            assert_eq!(f.data.len(), 8 * 4 + 8 * 4 / 2);
+            let rgba = f.to_rgba();
+            assert_eq!(rgba.len(), 8 * 4 * 4);
+            let expected = {
+                let c = level as i32 - 16;
+                ((298 * c + 128) >> 8).clamp(0, 255) as u8
+            };
+            for px in rgba.chunks_exact(4) {
+                assert_eq!(px[0], expected);
+                assert_eq!(px[1], expected);
+                assert_eq!(px[2], expected);
+                assert_eq!(px[3], 255);
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_blue_tints_b_up() {
+        // U=240 pulls blue up, red down (BT.601).
+        let mut f = VideoFrame::gray(2, 2, 128);
+        let uv_start = (2 * 2) as usize;
+        for b in f.data[uv_start..uv_start + 1].iter_mut() {
+            *b = 240;
+        }
+        let rgba = f.to_rgba();
+        let (b_chan, r_chan) = (rgba[2], rgba[0]);
+        assert!(b_chan > r_chan, "blue={} red={}", b_chan, r_chan);
+    }
+}
 
 /// Maximum RTP payload size before fragmentation.
 pub const MTU: usize = 1200;

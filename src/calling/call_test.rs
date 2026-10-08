@@ -57,6 +57,61 @@ impl CallTestResult {
     }
 }
 
+/// Live, embedder-driven controls for one call plus its frame sinks.
+/// Create with [`call_controls`]; pass the `CallControls` half to
+/// [`run_call_with_controls`] and keep the `CallControlsHandle` for the
+/// call UI. All types are feature-gate free on purpose.
+pub struct CallControls {
+    /// Mic gate: `false` makes the send loop emit silence (mute toggle).
+    pub mic_on: tokio::sync::watch::Receiver<bool>,
+    /// Camera gate: `false` sends black keyframes so the stream (and the
+    /// agreed modality) stays alive while the lens is "off".
+    pub camera_on: tokio::sync::watch::Receiver<bool>,
+    /// Decoded remote video frames. Bounded and drop-on-full: live video
+    /// is latest-wins, the UI just drains and keeps the newest.
+    pub remote_frames: std::sync::mpsc::SyncSender<crate::calling::video::VideoFrame>,
+    /// Local camera preview frames (teed off the encode input); None on
+    /// audio-only calls or when the embedder doesn't want a preview.
+    pub local_preview: Option<std::sync::mpsc::SyncSender<crate::calling::video::VideoFrame>>,
+}
+
+/// The UI-side twin of [`CallControls`].
+pub struct CallControlsHandle {
+    pub mic_on: tokio::sync::watch::Sender<bool>,
+    pub camera_on: tokio::sync::watch::Sender<bool>,
+    pub remote_frames: std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>,
+    pub local_preview: Option<std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>>,
+}
+
+/// Create the control pair for one call.
+pub fn call_controls(local_preview: bool) -> (CallControls, CallControlsHandle) {
+    let (mic_tx, mic_rx) = tokio::sync::watch::channel(true);
+    let (cam_tx, cam_rx) = tokio::sync::watch::channel(true);
+    let (rmt_tx, rmt_rx) =
+        std::sync::mpsc::sync_channel::<crate::calling::video::VideoFrame>(8);
+    let (prev_tx, prev_rx) = if local_preview {
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<crate::calling::video::VideoFrame>(4);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    (
+        CallControls {
+            mic_on: mic_rx,
+            camera_on: cam_rx,
+            remote_frames: rmt_tx,
+            local_preview: prev_tx,
+        },
+        CallControlsHandle {
+            mic_on: mic_tx,
+            camera_on: cam_tx,
+            remote_frames: rmt_rx,
+            local_preview: prev_rx,
+        },
+    )
+}
+
 /// Run an outgoing call test.
 ///
 /// Modes:
@@ -99,7 +154,36 @@ pub async fn run_call_with_stop(
     use_camera: bool,
     use_display: bool,
     tone_mode: bool,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<CallTestResult> {
+    run_call_with_controls(
+        duration_secs,
+        record,
+        echo,
+        thread_override,
+        use_camera,
+        use_display,
+        tone_mode,
+        stop,
+        None,
+    )
+    .await
+}
+
+/// [`run_call_with_stop`] plus live [`CallControls`]: mic/camera gates the
+/// media loops observe, and frame sinks the call UI renders from. Pass
+/// `None` for the plain CLI behaviour.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_call_with_controls(
+    duration_secs: u64,
+    record: bool,
+    echo: bool,
+    thread_override: Option<String>,
+    use_camera: bool,
+    use_display: bool,
+    tone_mode: bool,
     mut stop: tokio::sync::watch::Receiver<bool>,
+    mut controls: Option<CallControls>,
 ) -> Result<CallTestResult> {
     let config = Config::load_cached().context("Failed to load config")?;
     let skype_token = config
@@ -440,6 +524,21 @@ pub async fn run_call_with_stop(
     .await
     .context("Failed to set up outgoing media leg")?;
 
+    // Live controls: split the pair across the media loops (mic gate →
+    // audio send, camera gate + preview tee → video send, remote sink →
+    // video receive).
+    let (mic_gate, camera_gate, remote_tx, preview_tx) = match controls.take() {
+        Some(c) => (
+            Some(c.mic_on),
+            Some(c.camera_on),
+            Some(c.remote_frames),
+            c.local_preview,
+        ),
+        None => (None, None, None, None),
+    };
+    outgoing_leg.remote_tx = remote_tx;
+    outgoing_leg.preview_tx = preview_tx;
+
     // 9. Initialize audio FIRST — before SDL2 display, which can interfere with
     // audio device enumeration on Linux (PulseAudio/ALSA).
     let recorder = Arc::new(Mutex::new(test_tone::AudioRecorder::new(
@@ -538,6 +637,8 @@ pub async fn run_call_with_stop(
         false,
         speaker_tx,
         mic_rx,
+        mic_gate,
+        camera_gate,
     );
 
     // 8b. Start recording in background after a short delay to let audio establish.
@@ -751,6 +852,10 @@ struct MediaLeg {
     /// Display frame sender (when --display is active).
     #[cfg(feature = "video-capture")]
     display_tx: Option<std::sync::mpsc::SyncSender<display::DisplayFrame>>,
+    /// Decoded remote video frames for the embedder's call UI.
+    remote_tx: Option<std::sync::mpsc::SyncSender<video::VideoFrame>>,
+    /// Local camera preview frames teed off the encode input.
+    preview_tx: Option<std::sync::mpsc::SyncSender<video::VideoFrame>>,
 }
 
 /// Handles to spawned media tasks and shared stats for one leg.
@@ -921,6 +1026,8 @@ async fn setup_media_leg(
         camera_rx: None,
         #[cfg(feature = "video-capture")]
         display_tx: None,
+        remote_tx: None,
+        preview_tx: None,
     })
 }
 
@@ -937,6 +1044,8 @@ fn spawn_media_leg(
     loopback: bool,
     speaker_tx: Option<std::sync::mpsc::SyncSender<Vec<i16>>>,
     mic_rx: Option<std::sync::mpsc::Receiver<Vec<i16>>>,
+    mic_gate: Option<tokio::sync::watch::Receiver<bool>>,
+    camera_gate: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> MediaLegHandles {
     let label = leg.label.clone();
     let mut handles = Vec::new();
@@ -988,17 +1097,23 @@ fn spawn_media_leg(
             loop {
                 interval.tick().await;
 
+                // Mute gate: false → send silence without stopping RTP.
+                let mic_active = mic_gate.as_ref().map(|g| *g.borrow()).unwrap_or(true);
+
                 // Priority: loopback > microphone > 1kHz tone
                 let samples = if let Some(ref mut rx) = loopback_rx {
                     match rx.try_recv() {
                         Ok(s) => s,
                         Err(_) => vec![0i16; rtp::SAMPLES_PER_PACKET],
                     }
-                } else if let Some(ref rx) = mic_rx {
+                } else if let Some(rx) = mic_rx.as_ref().filter(|_| mic_active) {
                     match rx.try_recv() {
                         Ok(s) => s,
                         Err(_) => vec![0i16; rtp::SAMPLES_PER_PACKET],
                     }
+                } else if mic_gate.is_some() {
+                    // Muted on a real mic call: RTP silence, no tone.
+                    vec![0i16; rtp::SAMPLES_PER_PACKET]
                 } else {
                     tone.next_frame()
                 };
@@ -1239,6 +1354,7 @@ fn spawn_media_leg(
         let camera_rx = leg.camera_rx.take();
         #[cfg(not(feature = "video-cam"))]
         let camera_rx: Option<()> = None;
+        let preview_tx = leg.preview_tx.take();
 
         handles.push(tokio::spawn(async move {
             let mut packetizer = video::VideoPacketizer::new(video_ssrc);
@@ -1269,20 +1385,41 @@ fn spawn_media_leg(
             loop {
                 interval.tick().await;
 
-                // Try camera frame, fall back to black iframe
+                // Try camera frame, fall back to black iframe. The camera
+                // gate ("lens off") keeps the stream alive with black
+                // keyframes instead of renegotiating the modality.
                 let nal_units = {
                     #[cfg(feature = "video-cam")]
                     {
+                        let camera_active =
+                            camera_gate.as_ref().map(|g| *g.borrow()).unwrap_or(true);
                         if let (Some(ref rx), Some(ref mut enc)) = (&camera_rx, &mut encoder) {
                             match rx.try_recv() {
-                                Ok(frame) if frame.width > 0 => match enc.encode(&frame.data) {
-                                    Ok(nals) if !nals.is_empty() => nals,
-                                    Ok(_) => video::generate_black_iframe(),
-                                    Err(e) => {
-                                        tracing::debug!("[{}] Encode error: {:#}", label, e);
+                                Ok(frame) if frame.width > 0 => {
+                                    if camera_active {
+                                        if let Some(ref pt) = preview_tx {
+                                            let _ = pt.try_send(video::VideoFrame {
+                                                width: frame.width,
+                                                height: frame.height,
+                                                data: frame.data.clone(),
+                                            });
+                                        }
+                                        match enc.encode(&frame.data) {
+                                            Ok(nals) if !nals.is_empty() => nals,
+                                            Ok(_) => video::generate_black_iframe(),
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    "[{}] Encode error: {:#}",
+                                                    label,
+                                                    e
+                                                );
+                                                video::generate_black_iframe()
+                                            }
+                                        }
+                                    } else {
                                         video::generate_black_iframe()
                                     }
-                                },
+                                }
                                 _ => video::generate_black_iframe(),
                             }
                         } else {
@@ -1292,6 +1429,7 @@ fn spawn_media_leg(
                     #[cfg(not(feature = "video-cam"))]
                     {
                         let _ = &camera_rx;
+                        let _ = &preview_tx;
                         video::generate_black_iframe()
                     }
                 };
@@ -1337,24 +1475,37 @@ fn spawn_media_leg(
 
         #[cfg(feature = "video-capture")]
         let display_tx = leg.display_tx.take();
+        let remote_tx = leg.remote_tx.take();
 
         handles.push(tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             let mut depacketizer = video::VideoDepacketizer::new();
 
+            // Decode when ANY sink wants frames: the CLI's SDL display or
+            // the embedder's remote-video sink.
             #[cfg(feature = "video-capture")]
-            let mut decoder = display_tx
-                .as_ref()
-                .and_then(|_| match codec::H264Decoder::new() {
+            let has_display = display_tx.as_ref().is_some();
+            #[cfg(not(feature = "video-capture"))]
+            let has_display = false;
+            #[cfg(feature = "video-cam")]
+            let wants_decode = has_display || remote_tx.as_ref().is_some();
+            #[cfg(feature = "video-cam")]
+            let mut decoder = if wants_decode {
+                match codec::H264Decoder::new() {
                     Ok(dec) => {
-                        tracing::info!("[{}] H.264 decoder initialized for display", label);
+                        tracing::info!("[{}] H.264 decoder initialized", label);
                         Some(dec)
                     }
                     Err(e) => {
                         tracing::warn!("[{}] Failed to create H.264 decoder: {:#}", label, e);
                         None
                     }
-                });
+                }
+            } else {
+                None
+            };
+            #[cfg(not(feature = "video-cam"))]
+            let decoder: Option<()> = None;
 
             loop {
                 match socket.recv_from(&mut buf).await {
@@ -1422,22 +1573,31 @@ fn spawn_media_leg(
                                     }
                                     drop(rssrc);
 
-                                    // Depacketize and optionally decode + display
+                                    // Depacketize and optionally decode + forward
                                     let marker = pkt.marker;
                                     match depacketizer.depacketize(&pkt.payload, marker) {
                                         Ok(Some(nal)) => {
-                                            #[cfg(feature = "video-capture")]
-                                            if let (Some(ref mut dec), Some(ref tx)) =
-                                                (&mut decoder, &display_tx)
-                                            {
+                                            #[cfg(feature = "video-cam")]
+                                            if let Some(ref mut dec) = decoder {
                                                 match dec.decode(&nal) {
                                                     Ok(Some(frame)) => {
-                                                        let _ =
-                                                            tx.try_send(display::DisplayFrame {
-                                                                width: frame.width,
-                                                                height: frame.height,
-                                                                data: frame.data,
-                                                            });
+                                                        #[cfg(feature = "video-capture")]
+                                                        if let Some(ref tx) = display_tx {
+                                                            let _ = tx
+                                                                .try_send(display::DisplayFrame {
+                                                                    width: frame.width,
+                                                                    height: frame.height,
+                                                                    data: frame.data.clone(),
+                                                                });
+                                                        }
+                                                        if let Some(ref tx) = remote_tx {
+                                                            let _ = tx
+                                                                .try_send(video::VideoFrame {
+                                                                    width: frame.width,
+                                                                    height: frame.height,
+                                                                    data: frame.data,
+                                                                });
+                                                        }
                                                     }
                                                     Ok(None) => {} // decoder needs more data
                                                     Err(e) => {
@@ -1448,6 +1608,11 @@ fn spawn_media_leg(
                                                         );
                                                     }
                                                 }
+                                            }
+                                            #[cfg(not(feature = "video-cam"))]
+                                            {
+                                                let _ = &decoder;
+                                                let _ = &remote_tx;
                                             }
                                         }
                                         Ok(None) => {} // more fragments needed
