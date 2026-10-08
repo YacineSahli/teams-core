@@ -61,6 +61,27 @@ impl CallTestResult {
 /// Create with [`call_controls`]; pass the `CallControls` half to
 /// [`run_call_with_controls`] and keep the `CallControlsHandle` for the
 /// call UI. All types are feature-gate free on purpose.
+/// Where the call stands, as far as the driver can tell. GUIs surface
+/// this verbatim; `Connecting`->`Ringing` happens at placement,
+/// `Connected` when the peer's SDP acceptance was parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CallPhase {
+    #[default]
+    Connecting,
+    Ringing,
+    Connected,
+}
+
+impl std::fmt::Display for CallPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CallPhase::Connecting => "calling…",
+            CallPhase::Ringing => "ringing…",
+            CallPhase::Connected => "connected",
+        })
+    }
+}
+
 pub struct CallControls {
     /// Mic gate: `false` makes the send loop emit silence (mute toggle).
     pub mic_on: tokio::sync::watch::Receiver<bool>,
@@ -73,12 +94,16 @@ pub struct CallControls {
     /// Local camera preview frames (teed off the encode input); None on
     /// audio-only calls or when the embedder doesn't want a preview.
     pub local_preview: Option<std::sync::mpsc::SyncSender<crate::calling::video::VideoFrame>>,
+    /// Live call phase (Connecting → Ringing → Connected); the driver
+    /// transitions it, the UI reads.
+    pub phase: tokio::sync::watch::Sender<CallPhase>,
 }
 
 /// The UI-side twin of [`CallControls`].
 pub struct CallControlsHandle {
     pub mic_on: tokio::sync::watch::Sender<bool>,
     pub camera_on: tokio::sync::watch::Sender<bool>,
+    pub phase: tokio::sync::watch::Receiver<CallPhase>,
     pub remote_frames: std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>,
     pub local_preview: Option<std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>>,
 }
@@ -96,16 +121,19 @@ pub fn call_controls(local_preview: bool) -> (CallControls, CallControlsHandle) 
     } else {
         (None, None)
     };
+    let (phase_tx, phase_rx) = tokio::sync::watch::channel(CallPhase::Connecting);
     (
         CallControls {
             mic_on: mic_rx,
             camera_on: cam_rx,
             remote_frames: rmt_tx,
             local_preview: prev_tx,
+            phase: phase_tx,
         },
         CallControlsHandle {
             mic_on: mic_tx,
             camera_on: cam_tx,
+            phase: phase_rx,
             remote_frames: rmt_rx,
             local_preview: prev_rx,
         },
@@ -222,6 +250,20 @@ pub async fn run_call_with_controls(
         .get_region_gtms()
         .context("No region_gtms in config. Run `teams-cli login` first.")?;
     let http = reqwest::Client::new();
+
+    // Live controls: split the pair up front (mic gate → audio send,
+    // camera gate + preview tee → video send, remote sink → video
+    // receive, phase → the embedder's UI).
+    let (mic_gate, camera_gate, remote_frames_tx, preview_tx, phase_tx) = match controls.take() {
+        Some(c) => (
+            Some(c.mic_on),
+            Some(c.camera_on),
+            Some(c.remote_frames),
+            c.local_preview,
+            Some(c.phase),
+        ),
+        None => (None, None, None, None, None),
+    };
 
     // Extract caller MRI from skype token (JWT)
     let caller_mri = extract_mri_from_skype_token(skype_token_str)
@@ -449,6 +491,9 @@ pub async fn run_call_with_controls(
         (created, joined)
     };
     println!("call_placed=true");
+    if let Some(ref tx) = phase_tx {
+        let _ = tx.send(CallPhase::Ringing);
+    }
 
     // 1:1 calls: invite the callee after creating the conversation
     if echo {
@@ -485,6 +530,9 @@ pub async fn run_call_with_controls(
         }
     };
     println!("call_accepted=true");
+    if let Some(ref tx) = phase_tx {
+        let _ = tx.send(CallPhase::Connected);
+    }
 
     // 7b. Phase 3: Acknowledge call acceptance and register CC callbacks
     if let Some(ref ack_url) = acceptance.acknowledgement_url {
@@ -524,19 +572,7 @@ pub async fn run_call_with_controls(
     .await
     .context("Failed to set up outgoing media leg")?;
 
-    // Live controls: split the pair across the media loops (mic gate →
-    // audio send, camera gate + preview tee → video send, remote sink →
-    // video receive).
-    let (mic_gate, camera_gate, remote_tx, preview_tx) = match controls.take() {
-        Some(c) => (
-            Some(c.mic_on),
-            Some(c.camera_on),
-            Some(c.remote_frames),
-            c.local_preview,
-        ),
-        None => (None, None, None, None),
-    };
-    outgoing_leg.remote_tx = remote_tx;
+    outgoing_leg.remote_tx = remote_frames_tx;
     outgoing_leg.preview_tx = preview_tx;
 
     // 9. Initialize audio FIRST — before SDL2 display, which can interfere with
