@@ -106,6 +106,9 @@ const BLOCK_TAGS: &[&str] = &[
     "p", "div", "br", "section", "article", "header", "footer", "h1", "h2", "h3", "h4",
     "h5", "h6", "ul", "ol", "li", "dl", "dt", "dd", "table", "tr", "td", "th",
     "blockquote", "pre", "hr",
+    // Connector/bot payloads wrap sentences in <span>/<font>; without
+    // these the preview glues words ("…in a commentGareth Bell…").
+    "span", "font",
 ];
 
 /// Tag name of a raw `<…>` body: attributes and the `/` of closing
@@ -3516,6 +3519,11 @@ src="x">"#));
         // Attributes, case, and entities still handled.
         assert_eq!(strip_html("<P CLASS=\"x\">a</P><p>b</p>"), "a b");
         assert_eq!(strip_html("<p>a &amp; b</p>"), "a & b");
+        // Connector spans separate words (the "commentGareth" bug).
+        assert_eq!(
+            strip_html("<p>mentioned you in a comment<span>Gareth Bell</span> here</p>"),
+            "mentioned you in a comment Gareth Bell here"
+        );
     }
 
     fn conv(json: &str) -> Conversation {
