@@ -459,6 +459,79 @@ pub async fn run_call_with_controls(
         region: &teams_region,
     };
 
+    // Ringback thread: the CC never streams ringback audio on these legs —
+    // official clients synthesize it locally. Own playback (the received-
+    // audio stream only opens after acceptance); EU ringback 425 Hz,
+    // 1 s on / 4 s off. Exits when the phase leaves Ringing (connected)
+    // or the call task ends (phase sender dropped / stop signalled).
+    #[cfg(feature = "audio")]
+    {
+        let rb_phase = phase_tx.as_ref().map(|tx| tx.subscribe());
+        let rb_stop = stop.clone();
+        std::thread::Builder::new()
+            .name("ringback".into())
+            .spawn(move || {
+                use std::time::Duration;
+                use tokio::sync::watch;
+                fn wait_ringing(
+                    watch: &mut watch::Receiver<CallPhase>,
+                    stop: &watch::Receiver<bool>,
+                ) -> bool {
+                    loop {
+                        if *stop.borrow() {
+                            return false;
+                        }
+                        if *watch.borrow_and_update() == CallPhase::Ringing {
+                            return true;
+                        }
+                        if watch.has_changed().is_err() {
+                            return false; // call task ended
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                let Some(mut watch) = rb_phase else { return };
+                if !wait_ringing(&mut watch, &rb_stop) {
+                    return;
+                }
+                tracing::info!("ringback: start (425 Hz, 1s on / 4s off)");
+                let Some((playback, speaker_tx)) = super::audio::AudioPlayback::start()
+                else {
+                    return;
+                };
+                let mut gen = super::test_tone::ToneGenerator::with(425.0, 0.35);
+                let silence = vec![0i16; 160];
+                let mut on = true;
+                let mut until = std::time::Instant::now() + Duration::from_secs(1);
+                loop {
+                    if *rb_stop.borrow() {
+                        break;
+                    }
+                    if *watch.borrow_and_update() != CallPhase::Ringing {
+                        break;
+                    }
+                    let now = std::time::Instant::now();
+                    if now >= until {
+                        on = !on;
+                        until = now
+                            + if on {
+                                Duration::from_secs(1)
+                            } else {
+                                Duration::from_secs(4)
+                            };
+                    }
+                    let frame = if on { gen.next_frame() } else { silence.clone() };
+                    if speaker_tx.try_send(frame).is_err() {
+                        break; // stream closed
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                drop(playback);
+                tracing::info!("ringback: stop");
+            })
+            .ok();
+    }
+
     // Place the call: 1:1 calls (echo or thread) use single-shot epconv, channel uses two-phase.
     // A 1:1 callee is declared in participants.to at CREATE time so the CC
     // dials them as the call target — the post-hoc participant-add left the

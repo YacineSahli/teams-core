@@ -21,6 +21,16 @@ impl ToneGenerator {
         }
     }
 
+    /// A tone at `frequency` Hz with `amplitude` (0.0–1.0).
+    pub fn with(frequency: f64, amplitude: f64) -> Self {
+        Self {
+            phase: 0.0,
+            frequency,
+            sample_rate: 8000.0,
+            amplitude: amplitude.clamp(0.0, 1.0),
+        }
+    }
+
     /// Generate the next 160-sample frame (20ms at 8kHz).
     pub fn next_frame(&mut self) -> Vec<i16> {
         let mut samples = Vec::with_capacity(160);
@@ -177,5 +187,17 @@ mod tests {
         let samples = vec![0i16; 8000];
         let result = detect_echo(&samples, 1000.0, 8000.0);
         assert!(!result.detected);
+    }
+
+    /// with() honours frequency/amplitude and produces non-silent frames.
+    #[test]
+    fn tone_with_frequency() {
+        let mut g = ToneGenerator::with(425.0, 0.35);
+        let f = g.next_frame();
+        assert_eq!(f.len(), 160);
+        let peak = f.iter().map(|x| x.abs()).max().unwrap();
+        assert!((11_400..=12_100).contains(&peak), "peak {peak} ~0.35*32767");
+        // 425 Hz at 8 kHz: ~18.8 samples/cycle — consecutive samples differ.
+        assert_ne!(f[0], f[1]);
     }
 }
