@@ -12,6 +12,8 @@ pub use call_test::{
     call_controls, derive_epconv_url, run_call_test, run_call_with_controls, run_call_with_stop,
     CallControls, CallControlsHandle, CallTestResult,
 };
+#[cfg(feature = "screen")]
+pub mod screen;
 #[cfg(feature = "video-cam")]
 pub mod camera;
 #[cfg(feature = "video-cam")]

@@ -18,6 +18,9 @@ path = "src/main.rs"
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+ashpd = { version = "0.13", optional = true, default-features = false, features = ["tokio", "screencast"] }
+pipewire = { version = "0.10", optional = true }
+libspa = { version = "0.10", optional = true }
 
 # HTTP client (use 0.11 for rustc 1.82 compatibility, native-tls avoids ICU issue)
 reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
@@ -85,6 +88,11 @@ audio = ["cpal"]
 video-cam = ["v4l", "openh264"]
 # + the CLI's SDL2 preview window for received video.
 video-capture = ["video-cam", "sdl2"]
+# Screenshare: xdg-desktop-portal ScreenCast + PipeWire capture (Linux).
+screen = ["ashpd", "pipewire", "libspa"]
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+# Screenshare (Wayland portal + PipeWire capture). Optional: the embedder
+# requests a portal session and pumps frames into the video send path.
