@@ -582,25 +582,30 @@ pub async fn run_call_with_controls(
         tracing::info!("Inviting Echo bot...");
         signaling::invite_echo_bot(&http, &phase1.conversation_controller, &conv_params).await?;
     } else if let Some(ref mri) = callee_mri {
-        if is_1to1_call {
-            // Already declared in the epconv create (participants.to).
-            tracing::info!("Callee {} declared at create; skipping add", mri);
-        } else {
-            tracing::info!("Inviting user {}...", mri);
-            signaling::invite_user(
-                &http,
-                &phase1.conversation_controller,
-                &conv_params,
-                mri,
-                use_camera,
-            )
-            .await?;
-        }
+        // A/B #3: the callee is declared in participants.to AND gets the
+        // explicit invite. A/B #2 (declaration only, invite skipped)
+        // placed the call (201) but the CC never dialed — zero call
+        // events on Trouter, 30s timeout; the echo bot (which always gets
+        // its own invite) answered fine. participants.to alone doesn't
+        // ring anyone; the invite is the dial signal. Keeping both: the
+        // declaration should still bind the real media leg (A/B #1's
+        // invite-only produced a placeholder leg).
+        tracing::info!("Inviting user {} (declared at create + invite)...", mri);
+        signaling::invite_user(
+            &http,
+            &phase1.conversation_controller,
+            &conv_params,
+            mri,
+            use_camera,
+        )
+        .await?;
     }
 
     // 7. Wait for mediaAnswer on Trouter
     tracing::info!("Waiting for media answer on Trouter...");
-    let acceptance = match wait_for_call_acceptance(&mut ws, Duration::from_secs(30)).await {
+    // 60s: official Teams rings the callee for ~45s+ before voicemail;
+    // 30s cut off humans mid-ring (echo answers in ~2s).
+    let acceptance = match wait_for_call_acceptance(&mut ws, Duration::from_secs(60)).await {
         Ok(acc) => {
             if let Some(ref reason) = acc.rejection_reason {
                 tracing::warn!("Call rejected: {}", reason);
