@@ -800,6 +800,69 @@ pub fn play_tone(msecs: u64) -> anyhow::Result<u32> {
 }
 
 /// Named-device variant of `play_tone` (None/empty = default output).
+/// Ring pattern until `stop` flips (or `max_ms` elapses): `freq` Hz tone
+/// for `on_ms`, silence for `off_ms`, repeat. Owns its playback stream.
+/// Blocks — run on a dedicated thread (incoming-call ringer).
+pub fn play_ring_until(
+    freq: f64,
+    on_ms: u64,
+    off_ms: u64,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    max_ms: u64,
+) {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let Some((playback, speaker_tx)) = AudioPlayback::start() else {
+        return;
+    };
+    let mut gen = super::test_tone::ToneGenerator::with(freq, 0.35);
+    let silence = vec![0i16; 160];
+    let started = Instant::now();
+    while !stop.load(Ordering::SeqCst) && started.elapsed().as_millis() < max_ms as u128 {
+        let burst_start = Instant::now();
+        while !stop.load(Ordering::SeqCst)
+            && burst_start.elapsed().as_millis() < on_ms as u128
+        {
+            if speaker_tx.send(gen.next_frame()).is_err() {
+                drop(playback);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let rest = Instant::now();
+        while !stop.load(Ordering::SeqCst)
+            && rest.elapsed().as_millis() < off_ms as u128
+        {
+            if speaker_tx.send(silence.clone()).is_err() {
+                drop(playback);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    drop(playback);
+}
+
+/// One `freq`-Hz tone burst (call-ended / busy feedback). Blocks ≈`msecs`.
+pub fn play_tone_freq(freq: f64, msecs: u64) -> anyhow::Result<u32> {
+    let msecs = msecs.clamp(100, 10_000);
+    let (playback, speaker_tx) = match AudioPlayback::start_on_detailed(None) {
+        Ok(p) => p,
+        Err(e) => anyhow::bail!("{}", e),
+    };
+    let mut gen = super::test_tone::ToneGenerator::with(freq, 0.35);
+    let n_frames = (msecs / 20).max(1);
+    for _ in 0..n_frames {
+        if speaker_tx.send(gen.next_frame()).is_err() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    drop(playback);
+    Ok(n_frames as u32)
+}
+
 pub fn play_tone_on(msecs: u64, output: Option<&str>) -> anyhow::Result<u32> {
     use anyhow::bail;
 
