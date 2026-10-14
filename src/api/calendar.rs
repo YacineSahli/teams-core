@@ -57,6 +57,9 @@ struct EmailAddress {
 struct CalendarEvent {
     id: String,
     subject: Option<String>,
+    /// Graph `status`: `cancelled` marks organizer-canceled events
+    /// (native Teams dims + strikes them; they still appear in views).
+    status: Option<String>,
     #[serde(rename = "isOnlineMeeting")]
     is_online_meeting: Option<bool>,
     #[serde(rename = "onlineMeeting")]
@@ -95,6 +98,9 @@ pub struct MeetingInfo {
     pub is_organizer: bool,
     /// True when Graph flags the event as an online meeting.
     pub is_online: bool,
+    /// True when `status` is `cancelled` (organizer canceled; the slot
+    /// still shows, dimmed, in native clients).
+    pub canceled: bool,
 }
 
 fn meeting_info(e: CalendarEvent) -> MeetingInfo {
@@ -124,6 +130,10 @@ fn meeting_info(e: CalendarEvent) -> MeetingInfo {
             .filter(|a| !a.trim().is_empty()),
         is_organizer: e.is_organizer.unwrap_or(false),
         is_online: e.is_online_meeting.unwrap_or(false),
+        canceled: e
+            .status
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("cancelled")),
     }
 }
 
@@ -623,14 +633,20 @@ mod tests {
              "isOnlineMeeting": false,
              "start": {"dateTime": "2026-09-25T12:00:00.0000000", "timeZone": "UTC"},
              "end": null, "organizer": null},
-            {"id": "E3"}
+            {"id": "E3"},
+            {"id": "E4", "subject": "Canceled 1:1", "status": "cancelled",
+             "isOnlineMeeting": true,
+             "onlineMeeting": {"joinUrl": "https://teams.microsoft.com/l/meetup-join/1"},
+             "start": {"dateTime": "2026-09-26T10:00:00.0000000", "timeZone": "UTC"},
+             "end": {"dateTime": "2026-09-26T10:30:00.0000000", "timeZone": "UTC"}},
+            {"id": "E5", "subject": "Tentative", "status": "tentative"}
         ]
     }"#;
 
     #[test]
     fn calendar_parse_fields() {
         let ms = parse_calendar_view(VIEW_JSON).unwrap();
-        assert_eq!(ms.len(), 3);
+        assert_eq!(ms.len(), 5);
         assert_eq!(ms[0].id, "E1");
         assert_eq!(ms[0].subject, "Standup");
         assert!(ms[0].is_online);
@@ -649,6 +665,15 @@ mod tests {
         assert_eq!(ms[2].id, "E3");
         assert_eq!(ms[2].subject, "(no subject)");
         assert!(ms[2].start.is_none());
+    }
+
+    #[test]
+    fn calendar_parse_canceled_flag() {
+        let ms = parse_calendar_view(VIEW_JSON).unwrap();
+        let by_id = |id: &str| ms.iter().find(|m| m.id == id).unwrap();
+        assert!(by_id("E4").canceled, "cancelled status must parse");
+        assert!(!by_id("E5").canceled, "tentative is not canceled");
+        assert!(!by_id("E1").canceled, "absent status defaults to live");
     }
 
     #[test]
