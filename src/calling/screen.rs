@@ -234,6 +234,7 @@ fn pipewire_consume(
             if user_data.seq % 100 == 1 {
                 tracing::info!("screenshare: frame #{} {}x{}", user_data.seq, w, h);
             }
+            let frame = cap_resolution(frame, 1920, 1080);
             let _ = user_data.tx.try_send(frame);
         })
         .register()
@@ -325,4 +326,86 @@ fn bgra_to_i420(src: &[u8], stride: usize, w: u32, h: u32, swap_rb: bool) -> Vid
     data.extend_from_slice(&u);
     data.extend_from_slice(&v);
     VideoFrame { width: w as u32, height: h as u32, data }
+}
+
+/// Cap a frame to `max_w`x`max_h` by repeated factor-2 nearest downscales
+/// (keeps even dims — I420 chroma is subsampled 2x2). Monitors above 1080p
+/// (1440p/4K) would melt a software 15fps encode; 1080p screen content is
+/// the readable-text sweet spot for the bitrate the leg carries.
+pub fn cap_resolution(frame: VideoFrame, max_w: u32, max_h: u32) -> VideoFrame {
+    let mut f = frame;
+    while f.width > max_w || f.height > max_h {
+        f = half_resolution(&f);
+        if f.width < 2 || f.height < 2 {
+            break;
+        }
+    }
+    f
+}
+
+/// One factor-2 nearest downscale of a planar I420 frame.
+fn half_resolution(f: &VideoFrame) -> VideoFrame {
+    let (w, h) = (f.width as usize, f.height as usize);
+    let (nw, nh) = (w / 2 & !1, h / 2 & !1); // even, for the 2x2 chroma
+    if nw == 0 || nh == 0 {
+        return f.clone();
+    }
+    let src = &f.data;
+    let y_src = &src[..w * h];
+    let u_src = &src[w * h..w * h + w * h / 4];
+    let v_src = &src[w * h + w * h / 4..];
+    let mut y = vec![0u8; nw * nh];
+    let mut u = vec![0u8; nw * nh / 4];
+    let mut v = vec![0u8; nw * nh / 4];
+    for row in 0..nh {
+        for col in 0..nw {
+            y[row * nw + col] = y_src[(row * 2) * w + col * 2];
+        }
+    }
+    for row in 0..nh / 2 {
+        for col in 0..nw / 2 {
+            let (si, di) = (row * (w / 2) + col, row * (nw / 2) + col);
+            u[di] = u_src[si];
+            v[di] = v_src[si];
+        }
+    }
+    VideoFrame { width: nw as u32, height: nh as u32, data: { let mut d = y; d.extend_from_slice(&u); d.extend_from_slice(&v); d } }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_resolution_halves_4k_to_1080p() {
+        // 3840x2160 all-Y=200 frame halves once to 1920x1080.
+        let (w, h) = (3840usize, 2160usize);
+        let mut data = vec![200u8; w * h];
+        data.extend(vec![128u8; w * h / 4]);
+        data.extend(vec![128u8; w * h / 4]);
+        let out = cap_resolution(VideoFrame { width: 3840, height: 2160, data }, 1920, 1080);
+        assert_eq!((out.width, out.height), (1920, 1080));
+        assert_eq!(out.data.len(), 1920 * 1080 * 3 / 2);
+        assert!(out.data.iter().take(1920 * 1080).all(|&p| p == 200));
+    }
+
+    #[test]
+    fn cap_resolution_keeps_smaller_frames() {
+        let f = VideoFrame { width: 1280, height: 720, data: vec![7; 1280 * 720 * 3 / 2] };
+        let out = cap_resolution(f.clone(), 1920, 1080);
+        assert_eq!((out.width, out.height), (1280, 720));
+        assert_eq!(out.data, f.data);
+    }
+
+    #[test]
+    fn cap_resolution_odd_dims_stay_even() {
+        // 2561 > 1920: halves to 1280x540 (floor-even), then fits.
+        let (w, h) = (2560usize, 1080usize);
+        let mut data = vec![9u8; w * h];
+        data.extend(vec![60u8; w * h / 4]);
+        data.extend(vec![200u8; w * h / 4]);
+        let out = cap_resolution(VideoFrame { width: 2560, height: 1080, data }, 1920, 1080);
+        assert_eq!((out.width, out.height), (1280, 540));
+        assert_eq!(out.data.len(), 1280 * 540 * 3 / 2);
+    }
 }

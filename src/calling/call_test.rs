@@ -97,6 +97,11 @@ pub struct CallControls {
     /// Live call phase (Connecting → Ringing → Connected); the driver
     /// transitions it, the UI reads.
     pub phase: tokio::sync::watch::Sender<CallPhase>,
+    /// Embedder-injected screen-share source (see [`screen`]). While the
+    /// slot holds a receiver the video send loop prefers it over the
+    /// camera; the camera gate does NOT gate the share (they are separate
+    /// toggles, like the native client).
+    pub screen_source: ScreenShareSlot,
 }
 
 /// The UI-side twin of [`CallControls`].
@@ -106,6 +111,30 @@ pub struct CallControlsHandle {
     pub phase: tokio::sync::watch::Receiver<CallPhase>,
     pub remote_frames: std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>,
     pub local_preview: Option<std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>>,
+    pub screen_source: ScreenShareSlot,
+}
+
+/// Shared slot carrying the call's screen-share frame source. The embedder
+/// owns the capture session (portal + PipeWire in `screen`, or any synthetic
+/// source for tests) and swaps the receiver in/out; the video send loop
+/// reads it every tick. No re-negotiation: the share rides the existing
+/// video leg (the call must have been placed with video).
+pub type ScreenShareSlot = std::sync::Arc<
+    std::sync::Mutex<Option<std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>>>,
+>;
+
+impl CallControlsHandle {
+    /// Swap the screen-share source. `Some(rx)` starts sharing (the send
+    /// loop re-initializes the encoder at the stream's resolution);
+    /// `None` stops and returns to the camera (or black keyframes).
+    pub fn set_screen_source(
+        &self,
+        rx: Option<std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>>,
+    ) {
+        if let Ok(mut slot) = self.screen_source.lock() {
+            *slot = rx;
+        }
+    }
 }
 
 /// Create the control pair for one call.
@@ -122,6 +151,7 @@ pub fn call_controls(local_preview: bool) -> (CallControls, CallControlsHandle) 
         (None, None)
     };
     let (phase_tx, phase_rx) = tokio::sync::watch::channel(CallPhase::Connecting);
+    let screen_source: ScreenShareSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
     (
         CallControls {
             mic_on: mic_rx,
@@ -129,6 +159,7 @@ pub fn call_controls(local_preview: bool) -> (CallControls, CallControlsHandle) 
             remote_frames: rmt_tx,
             local_preview: prev_tx,
             phase: phase_tx,
+            screen_source: screen_source.clone(),
         },
         CallControlsHandle {
             mic_on: mic_tx,
@@ -136,6 +167,7 @@ pub fn call_controls(local_preview: bool) -> (CallControls, CallControlsHandle) 
             phase: phase_rx,
             remote_frames: rmt_rx,
             local_preview: prev_rx,
+            screen_source,
         },
     )
 }
@@ -254,16 +286,18 @@ pub async fn run_call_with_controls(
     // Live controls: split the pair up front (mic gate → audio send,
     // camera gate + preview tee → video send, remote sink → video
     // receive, phase → the embedder's UI).
-    let (mic_gate, camera_gate, remote_frames_tx, preview_tx, phase_tx) = match controls.take() {
-        Some(c) => (
-            Some(c.mic_on),
-            Some(c.camera_on),
-            Some(c.remote_frames),
-            c.local_preview,
-            Some(c.phase),
-        ),
-        None => (None, None, None, None, None),
-    };
+    let (mic_gate, camera_gate, remote_frames_tx, preview_tx, phase_tx, screen_slot) =
+        match controls.take() {
+            Some(c) => (
+                Some(c.mic_on),
+                Some(c.camera_on),
+                Some(c.remote_frames),
+                c.local_preview,
+                Some(c.phase),
+                Some(c.screen_source),
+            ),
+            None => (None, None, None, None, None, None),
+        };
 
     // Extract caller MRI from skype token (JWT)
     let caller_mri = extract_mri_from_skype_token(skype_token_str)
@@ -666,6 +700,7 @@ pub async fn run_call_with_controls(
 
     outgoing_leg.remote_tx = remote_frames_tx;
     outgoing_leg.preview_tx = preview_tx;
+    outgoing_leg.screen_source = screen_slot;
 
     // 9. Initialize audio FIRST — before SDL2 display, which can interfere with
     // audio device enumeration on Linux (PulseAudio/ALSA).
@@ -984,6 +1019,9 @@ struct MediaLeg {
     remote_tx: Option<std::sync::mpsc::SyncSender<video::VideoFrame>>,
     /// Local camera preview frames teed off the encode input.
     preview_tx: Option<std::sync::mpsc::SyncSender<video::VideoFrame>>,
+    /// Embedder-injected screen-share source; see [`ScreenShareSlot`].
+    /// Set on the outgoing leg only (sharing is OUR send path).
+    screen_source: Option<ScreenShareSlot>,
 }
 
 /// Handles to spawned media tasks and shared stats for one leg.
@@ -1156,6 +1194,7 @@ async fn setup_media_leg(
         display_tx: None,
         remote_tx: None,
         preview_tx: None,
+        screen_source: None,
     })
 }
 
@@ -1483,25 +1522,20 @@ fn spawn_media_leg(
         #[cfg(not(feature = "video-cam"))]
         let camera_rx: Option<()> = None;
         let preview_tx = leg.preview_tx.take();
+        let screen_source = leg.screen_source.take();
 
         handles.push(tokio::spawn(async move {
             let mut packetizer = video::VideoPacketizer::new(video_ssrc);
             let mut interval =
                 tokio::time::interval(Duration::from_millis(video::FRAME_INTERVAL_MS));
 
+            // The encoder (re)initializes whenever the source resolution
+            // changes: the camera is a fixed 320x240, an injected
+            // screen-share is monitor-sized. `None` until the first frame.
             #[cfg(feature = "video-cam")]
-            let mut encoder = camera_rx.as_ref().and_then(|_| {
-                match codec::H264Encoder::new(320, 240, 15.0, 256) {
-                    Ok(enc) => {
-                        tracing::info!("[{}] H.264 encoder initialized (320x240, 256kbps)", label);
-                        Some(enc)
-                    }
-                    Err(e) => {
-                        tracing::warn!("[{}] Failed to create H.264 encoder: {:#}", label, e);
-                        None
-                    }
-                }
-            });
+            let mut encoder: Option<codec::H264Encoder> = None;
+            #[cfg(feature = "video-cam")]
+            let mut enc_dims = (0u32, 0u32);
 
             tracing::info!(
                 "[{}] Video send loop started (SSRC: {:#010x}, camera: {})",
@@ -1513,61 +1547,126 @@ fn spawn_media_leg(
             loop {
                 interval.tick().await;
 
-                // Try camera frame, fall back to black iframe. The camera
-                // gate ("lens off") keeps the stream alive with black
-                // keyframes instead of renegotiating the modality.
+                // Source priority: screen share > camera > black iframe.
+                // The camera gate ("lens off") keeps the stream alive with
+                // black keyframes instead of renegotiating the modality;
+                // it does NOT gate a screen share (separate toggles).
                 let nal_units = {
+                    // Screen share: drain to the LATEST frame — capture can
+                    // outrun the send tick and a stale backlog would grow
+                    // unbounded lag. A dropped sender (share stopped without
+                    // clearing the slot) clears the slot and falls through.
+                    let screen_frame = screen_source.as_ref().and_then(|slot| {
+                        let mut guard = slot.lock().ok()?;
+                        let rx = guard.as_mut()?;
+                        match rx.try_recv() {
+                            Ok(mut latest) => {
+                                while let Ok(newer) = rx.try_recv() {
+                                    latest = newer;
+                                }
+                                Some(latest)
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                tracing::info!(
+                                    "[{}] screen share source disconnected",
+                                    label
+                                );
+                                *guard = None;
+                                None
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        }
+                    });
+
                     #[cfg(feature = "video-cam")]
                     {
-                        let camera_active =
-                            camera_gate.as_ref().map(|g| *g.borrow()).unwrap_or(true);
-                        if let (Some(ref rx), Some(ref mut enc)) = (&camera_rx, &mut encoder) {
-                            match rx.try_recv() {
-                                Ok(frame) if frame.width > 0 => {
-                                    if camera_active {
-                                        if let Some(ref pt) = preview_tx {
-                                            match pt.try_send(video::VideoFrame {
-                                                width: frame.width,
-                                                height: frame.height,
-                                                data: frame.data.clone(),
-                                            }) {
-                                                Err(e) => {
-                                                    tracing::debug!(
-                                                        "[{}] preview send failed: {e}",
-                                                        label
-                                                    );
-                                                }
-                                                Ok(()) => {}
-                                            }
-                                        } else {
-                                            tracing::debug!("[{}] no preview sink", label);
+                        let pick = if let Some(frame) = screen_frame {
+                            Some(frame)
+                        } else {
+                            let camera_active =
+                                camera_gate.as_ref().map(|g| *g.borrow()).unwrap_or(true);
+                            camera_rx.as_ref().filter(|_| camera_active).and_then(|rx| {
+                                match rx.try_recv() {
+                                    Ok(mut latest) => {
+                                        // Latest-wins (same as the screen
+                                        // path): never encode a backlog.
+                                        while let Ok(newer) = rx.try_recv() {
+                                            latest = newer;
                                         }
-                                        match enc.encode(&frame.data) {
-                                            Ok(nals) if !nals.is_empty() => nals,
-                                            Ok(_) => video::generate_black_iframe(),
-                                            Err(e) => {
-                                                tracing::debug!(
-                                                    "[{}] Encode error: {:#}",
-                                                    label,
-                                                    e
-                                                );
-                                                video::generate_black_iframe()
-                                            }
+                                        Some(video::VideoFrame {
+                                            width: latest.width,
+                                            height: latest.height,
+                                            data: latest.data,
+                                        })
+                                    }
+                                    _ => None,
+                                }
+                            })
+                        };
+                        match pick {
+                            Some(frame) if frame.width > 0 && frame.height > 0 => {
+                                if enc_dims != (frame.width, frame.height) {
+                                    // Camera keeps its tuned 256 kbps;
+                                    // screen-sized sources scale with area
+                                    // (capped — screen content compresses
+                                    // well, but readable text needs
+                                    // headroom over a camera keyframe).
+                                    let kbps = (((frame.width as u64 * frame.height as u64)
+                                        * 256)
+                                        / (320 * 240))
+                                        .clamp(256, 3500) as u32;
+                                    match codec::H264Encoder::new(
+                                        frame.width, frame.height, 15.0, kbps,
+                                    ) {
+                                        Ok(enc) => {
+                                            tracing::info!(
+                                                "[{}] H.264 encoder initialized ({}x{}, {kbps}kbps)",
+                                                label, frame.width, frame.height
+                                            );
+                                            encoder = Some(enc);
                                         }
-                                    } else {
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "[{}] encoder {}x{} failed: {e:#} — black frames",
+                                                label, frame.width, frame.height
+                                            );
+                                            encoder = None;
+                                        }
+                                    }
+                                    enc_dims = (frame.width, frame.height);
+                                }
+                                if let Some(ref pt) = preview_tx {
+                                    if pt.try_send(frame.clone()).is_err() {
+                                        tracing::debug!(
+                                            "[{}] preview send failed (full)",
+                                            label
+                                        );
+                                    }
+                                }
+                                match encoder.as_mut().map(|enc| enc.encode(&frame.data)) {
+                                    Some(Ok(nals)) if !nals.is_empty() => nals,
+                                    Some(Ok(_)) | None => video::generate_black_iframe(),
+                                    Some(Err(e)) => {
+                                        tracing::debug!(
+                                            "[{}] Encode error: {:#}",
+                                            label,
+                                            e
+                                        );
                                         video::generate_black_iframe()
                                     }
                                 }
-                                _ => video::generate_black_iframe(),
                             }
-                        } else {
-                            video::generate_black_iframe()
+                            _ => video::generate_black_iframe(),
                         }
                     }
                     #[cfg(not(feature = "video-cam"))]
                     {
+                        // No encoder without video-cam (codec is gated on
+                        // it): screen frames can't be encoded here; keep
+                        // the stream alive with black keyframes.
                         let _ = &camera_rx;
                         let _ = &preview_tx;
+                        let _ = screen_frame;
                         video::generate_black_iframe()
                     }
                 };
