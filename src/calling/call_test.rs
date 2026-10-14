@@ -1536,6 +1536,9 @@ fn spawn_media_leg(
             let mut encoder: Option<codec::H264Encoder> = None;
             #[cfg(feature = "video-cam")]
             let mut enc_dims = (0u32, 0u32);
+            // Held screen frame between capture ticks (sticky share).
+            #[cfg(feature = "video-cam")]
+            let mut last_screen: Option<video::VideoFrame> = None;
 
             tracing::info!(
                 "[{}] Video send loop started (SSRC: {:#010x}, camera: {})",
@@ -1552,36 +1555,54 @@ fn spawn_media_leg(
                 // black keyframes instead of renegotiating the modality;
                 // it does NOT gate a screen share (separate toggles).
                 let nal_units = {
-                    // Screen share: drain to the LATEST frame — capture can
-                    // outrun the send tick and a stale backlog would grow
-                    // unbounded lag. A dropped sender (share stopped without
-                    // clearing the slot) clears the slot and falls through.
-                    let screen_frame = screen_source.as_ref().and_then(|slot| {
-                        let mut guard = slot.lock().ok()?;
-                        let rx = guard.as_mut()?;
-                        match rx.try_recv() {
-                            Ok(mut latest) => {
-                                while let Ok(newer) = rx.try_recv() {
-                                    latest = newer;
+                    // Screen share is STICKY: while the slot holds a
+                    // receiver, the share IS the call's video — hold the
+                    // last frame between capture ticks (a 10fps source on
+                    // a 15fps send tick must not fall through to the
+                    // camera, or the encoder flaps resolution every tick
+                    // and the remote sees a strobing mess). The camera
+                    // returns only after the slot is cleared. Drain to the
+                    // LATEST frame — capture can outrun the send tick and
+                    // a stale backlog would grow unbounded lag. A dropped
+                    // sender (share stopped without clearing the slot)
+                    // clears the slot and falls through.
+                    let mut sharing_active = false;
+                    let mut screen_frame: Option<video::VideoFrame> = None;
+                    if let Some(slot) = screen_source.as_ref() {
+                        if let Ok(mut guard) = slot.lock() {
+                            if let Some(rx) = guard.as_mut() {
+                                match rx.try_recv() {
+                                    Ok(mut latest) => {
+                                        while let Ok(newer) = rx.try_recv() {
+                                            latest = newer;
+                                        }
+                                        screen_frame = Some(latest);
+                                        sharing_active = true;
+                                    }
+                                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                        tracing::info!(
+                                            "[{}] screen share source disconnected",
+                                            label
+                                        );
+                                        *guard = None;
+                                    }
+                                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                        sharing_active = true;
+                                    }
                                 }
-                                Some(latest)
                             }
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                tracing::info!(
-                                    "[{}] screen share source disconnected",
-                                    label
-                                );
-                                *guard = None;
-                                None
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => None,
                         }
-                    });
+                    }
 
                     #[cfg(feature = "video-cam")]
                     {
-                        let pick = if let Some(frame) = screen_frame {
-                            Some(frame)
+                        let pick = if sharing_active {
+                            if let Some(f) = screen_frame {
+                                last_screen = Some(f.clone());
+                                Some(f)
+                            } else {
+                                last_screen.clone()
+                            }
                         } else {
                             let camera_active =
                                 camera_gate.as_ref().map(|g| *g.borrow()).unwrap_or(true);
