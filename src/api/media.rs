@@ -88,13 +88,18 @@ pub fn auth_headers(url: &str, token: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Lowercased host of an https URL, or None.
+/// Lowercased host of an https URL, or None. Parsed with the `url`
+/// crate, the parser reqwest connects with, so the host checked here is
+/// the host the request goes to. A URL with credentials in it
+/// (`https://user@host/`) is refused outright: splitting it by hand once
+/// read `https://x.teams.microsoft.com@attacker.example/` as a Microsoft
+/// host while the request went to `attacker.example` with the token.
 fn host_of(url: &str) -> Option<String> {
-    let rest = url.trim().strip_prefix("https://")?;
-    let end = rest
-        .find(|c: char| c == '/' || c == '?' || c == '#' || c == '@' || c == ':')
-        .unwrap_or(rest.len());
-    let host = rest[..end].to_lowercase();
+    let parsed = url::Url::parse(url.trim()).ok()?;
+    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
     if host.is_empty() {
         None
     } else {
@@ -111,7 +116,7 @@ pub async fn fetch_media_data(client: &TeamsClient, url: &str) -> Result<MediaBy
         bail!("media: only https URLs are fetched");
     }
     if host_of(u).is_none() {
-        bail!("media: unparseable URL");
+        bail!("media: unparseable URL or credentials in it");
     }
     client.media_get(u).await
 }
@@ -130,7 +135,7 @@ pub async fn fetch_media_head_data(
         bail!("media: only https URLs are fetched");
     }
     if host_of(u).is_none() {
-        bail!("media: unparseable URL");
+        bail!("media: unparseable URL or credentials in it");
     }
     client.media_get_head(u, max_bytes.clamp(1, MAX_BYTES), timeout).await
 }
@@ -237,6 +242,52 @@ mod tests {
         );
         assert_eq!(host_of("https://H.EXAMPLE.COM/x").as_deref(), Some("h.example.com"));
         assert!(host_of("https://").is_none());
+    }
+
+    /// The host we check must be the host reqwest connects to. Userinfo
+    /// before `@` once passed for the host (token sent to the attacker).
+    #[test]
+    fn userinfo_never_passes_for_the_host() {
+        for u in [
+            "https://x.teams.microsoft.com@attacker.example/p.png",
+            "https://us-api.asm.skype.com@attacker.example/v1/objects/x/views/imgo",
+            "https://amer.ng.msg.teams.microsoft.com:443@attacker.example/x",
+            "https://a:b@us-api.asm.skype.com/v1/objects/x/views/imgo",
+            "https://msg.skype.com:pw@attacker.example/x",
+        ] {
+            assert!(!needs_auth(u), "no auth for {u}");
+            assert!(auth_headers(u, "T").is_empty(), "no token for {u}");
+            assert!(host_of(u).is_none(), "refused: {u}");
+        }
+    }
+
+    /// Where the checked host and the connected host agree on odd forms.
+    #[test]
+    fn checked_host_matches_connected_host() {
+        for u in [
+            "https://us-api.asm.skype.com\\@attacker.example/x",
+            "https://US-API.asm.skype.com./x",
+            "https://attacker.example#@us-api.asm.skype.com/x",
+            "https://attacker.example?@us-api.asm.skype.com/x",
+            "  https://us-api.asm.skype.com/x  ",
+        ] {
+            let connected = url::Url::parse(u.trim())
+                .ok()
+                .and_then(|p| p.host_str().map(str::to_ascii_lowercase));
+            assert_eq!(host_of(u), connected, "{u}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_credentials_before_network() {
+        let client = TeamsClient::for_test(crate::config::Config::default());
+        let err = fetch_media_data(
+            &client,
+            "https://x.teams.microsoft.com@attacker.example/p.png",
+        )
+        .await
+        .expect_err("refused");
+        assert!(format!("{err:#}").contains("credentials"), "{err:#}");
     }
 }
 

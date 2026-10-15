@@ -79,6 +79,51 @@ pub fn shared_http() -> reqwest::Client {
     .clone()
 }
 
+/// HTTP client for inline media: [`shared_http`]'s settings, but it never
+/// follows a redirect itself. reqwest drops only the standard
+/// `Authorization` header when a redirect changes host, while the
+/// chat-service token rides in `Authentication` and `X-SkypeToken`, so
+/// [`TeamsClient::media_get`] follows redirects by hand and decides the
+/// token headers again for every hop.
+fn media_http() -> reqwest::Client {
+    static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
+    HTTP.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+    .clone()
+}
+
+/// Redirects a media fetch follows before giving up (reqwest's default).
+const MAX_MEDIA_REDIRECTS: usize = 10;
+
+/// Per-hop token headers for a media fetch: the host rules of
+/// [`super::media::auth_headers`] applied to each hop's own URL, or none
+/// when the fetch carries no token.
+fn media_auth(token: Option<&str>) -> impl Fn(&str) -> Vec<(&'static str, String)> + Sync + '_ {
+    move |url: &str| {
+        token
+            .map(|t| super::media::auth_headers(url, t))
+            .unwrap_or_default()
+    }
+}
+
+/// The URL a redirect's `Location` points to, resolved against the
+/// current one. Only http and https are followed, and never from https
+/// down to http.
+fn next_media_hop(current: &url::Url, location: &str) -> Result<url::Url> {
+    let next = current
+        .join(location)
+        .with_context(|| format!("bad redirect Location {location:?}"))?;
+    match (current.scheme(), next.scheme()) {
+        ("https", "https") | ("http", "http") | ("http", "https") => Ok(next),
+        (from, to) => bail!("refusing redirect from {from} to {to}"),
+    }
+}
+
 /// Connect deadline for every request on the shared client (§77).
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default whole-request deadline for API calls (§77). Uploads and
@@ -636,13 +681,20 @@ impl TeamsClient {
     /// auth so the token never leaks to third parties. Rejects over-cap
     /// payloads (never truncated).
     pub async fn media_get(&self, url: &str) -> Result<super::media::MediaBytes> {
-        let headers = if super::media::needs_auth(url) {
-            let token = self.skype_token()?;
-            super::media::auth_headers(url, &token)
+        let token = self.media_token(url)?;
+        let auth = media_auth(token.as_deref());
+        Self::media_fetch(&media_http(), url, &auth).await
+    }
+
+    /// The Skype token when `url` is a Microsoft media host, else None.
+    /// Only a URL that starts on a Microsoft host may carry the token at
+    /// all; a redirect never adds it to a fetch that began without it.
+    fn media_token(&self, url: &str) -> Result<Option<String>> {
+        if super::media::needs_auth(url) {
+            Ok(Some(self.skype_token()?))
         } else {
-            Vec::new()
-        };
-        Self::media_fetch(&self.http, url, &headers).await
+            Ok(None)
+        }
     }
 
     /// OstMac FIXPACK F7: the first `max_bytes` of a media URL (HTTP
@@ -657,22 +709,17 @@ impl TeamsClient {
         max_bytes: usize,
         timeout: Duration,
     ) -> Result<super::media::MediaBytes> {
-        let mut headers = if super::media::needs_auth(url) {
-            let token = self.skype_token()?;
-            super::media::auth_headers(url, &token)
-        } else {
-            Vec::new()
-        };
-        headers.push(("Range", format!("bytes=0-{}", max_bytes.saturating_sub(1))));
-        let mut req = self.http.get(url);
-        for (name, value) in &headers {
-            req = req.header(*name, value.as_str());
-        }
-        tracing::debug!("Media head GET {}", url);
-        let resp = req
-            .send_observed("GET", url, Some(timeout))
-            .await
-            .with_context(|| format!("Media head GET {} failed", url))?;
+        let token = self.media_token(url)?;
+        let range = [("Range", format!("bytes=0-{}", max_bytes.saturating_sub(1)))];
+        let resp = Self::media_send(
+            &media_http(),
+            url,
+            &media_auth(token.as_deref()),
+            &range,
+            timeout,
+        )
+        .await
+        .with_context(|| format!("Media head GET {} failed", url))?;
         let mut resp = check_response(resp, url).await?;
         let content_type = resp
             .headers()
@@ -690,21 +737,18 @@ impl TeamsClient {
         Ok(super::media::MediaBytes { data, content_type })
     }
 
-    /// Transport core behind [`Self::media_get`]: GET with exactly the
-    /// given headers, status-checked, body capped. Split out so the
-    /// om-imgfix repro matrix can drive it against a local stub.
-    async fn media_fetch(
+    /// Transport core behind [`Self::media_get`]: GET with the headers
+    /// `auth` gives for each hop, status-checked, body capped. Split out
+    /// so the om-imgfix repro matrix can drive it against a local stub.
+    async fn media_fetch<F>(
         http: &reqwest::Client,
         url: &str,
-        headers: &[(&'static str, String)],
-    ) -> Result<super::media::MediaBytes> {
-        let mut req = http.get(url);
-        for (name, value) in headers {
-            req = req.header(*name, value.as_str());
-        }
-        tracing::debug!("Media GET {}", url);
-        let resp = req
-            .send_observed("GET", url, Some(MEDIA_TIMEOUT))
+        auth: &F,
+    ) -> Result<super::media::MediaBytes>
+    where
+        F: Fn(&str) -> Vec<(&'static str, String)> + Sync,
+    {
+        let resp = Self::media_send(http, url, auth, &[], MEDIA_TIMEOUT)
             .await
             .with_context(|| format!("Media GET {} failed", url))?;
         let resp = check_response(resp, url).await?;
@@ -728,6 +772,46 @@ impl TeamsClient {
             data: bytes.to_vec(),
             content_type,
         })
+    }
+
+    /// GET `url`, following up to [`MAX_MEDIA_REDIRECTS`] redirects by
+    /// hand. `http` must not follow redirects itself ([`media_http`]):
+    /// each hop gets the headers `auth` gives for that hop's own URL, so a
+    /// redirect off a Microsoft host carries no token. `extra` headers go
+    /// on every hop. Returns the first response that is not a redirect.
+    async fn media_send<F>(
+        http: &reqwest::Client,
+        url: &str,
+        auth: &F,
+        extra: &[(&'static str, String)],
+        timeout: Duration,
+    ) -> Result<reqwest::Response>
+    where
+        F: Fn(&str) -> Vec<(&'static str, String)> + Sync,
+    {
+        let mut current = url::Url::parse(url.trim()).context("unparseable media URL")?;
+        for _ in 0..=MAX_MEDIA_REDIRECTS {
+            let mut req = http.get(current.as_str());
+            for (name, value) in auth(current.as_str()).iter().chain(extra) {
+                req = req.header(*name, value.as_str());
+            }
+            tracing::debug!("Media GET {}", current);
+            let resp = req
+                .send_observed("GET", current.as_str(), Some(timeout))
+                .await?;
+            if !resp.status().is_redirection() {
+                return Ok(resp);
+            }
+            let Some(location) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            else {
+                return Ok(resp);
+            };
+            current = next_media_hop(&current, location)?;
+        }
+        bail!("too many redirects")
     }
 
     /// POST using `Authentication: skypetoken=...` header (native chat API).
@@ -939,14 +1023,15 @@ mod tests {
     #[tokio::test]
     async fn media_asm_headers_reach_server() {
         let (base, hits, task) = start_stub(vec![plain("200 OK", "image/png", b"PNG!")]).await;
-        let http = reqwest::Client::new();
+        let http = media_http();
         let headers = super::super::media::auth_headers(
             "https://us-api.asm.skype.com/v1/objects/0-eus-d1-abc/views/imgo",
             "T",
         );
-        let mb = TeamsClient::media_fetch(&http, &(base + "/views/imgo"), &headers)
-            .await
-            .expect("stub fetch");
+        let mb =
+            TeamsClient::media_fetch(&http, &(base + "/views/imgo"), &|_: &str| headers.clone())
+                .await
+                .expect("stub fetch");
         assert_eq!(mb.data, b"PNG!");
         task.await.expect("stub drains");
         let hits = hits.lock().expect("hit log");
@@ -963,12 +1048,12 @@ mod tests {
     #[tokio::test]
     async fn media_chat_headers_reach_server() {
         let (base, hits, task) = start_stub(vec![plain("200 OK", "image/png", b"PNG!")]).await;
-        let http = reqwest::Client::new();
+        let http = media_http();
         let headers = super::super::media::auth_headers(
             "https://amer.ng.msg.teams.microsoft.com/v1/objects/0-abc/views/imgo",
             "T",
         );
-        TeamsClient::media_fetch(&http, &(base + "/views/imgo"), &headers)
+        TeamsClient::media_fetch(&http, &(base + "/views/imgo"), &|_: &str| headers.clone())
             .await
             .expect("stub fetch");
         task.await.expect("stub drains");
@@ -993,8 +1078,8 @@ mod tests {
             plain("200 OK", "image/jpeg", b"JPEG!"),
         ])
         .await;
-        let http = reqwest::Client::new();
-        let mb = TeamsClient::media_fetch(&http, &(base + "/start"), &[])
+        let http = media_http();
+        let mb = TeamsClient::media_fetch(&http, &(base + "/start"), &no_auth)
             .await
             .expect("redirect followed");
         assert_eq!(mb.data, b"JPEG!");
@@ -1010,8 +1095,8 @@ mod tests {
     async fn media_401_surfaces_status() {
         let (base, _, task) =
             start_stub(vec![plain("401 Unauthorized", "text/plain", b"nope")]).await;
-        let http = reqwest::Client::new();
-        let err = TeamsClient::media_fetch(&http, &(base + "/views/imgo"), &[])
+        let http = media_http();
+        let err = TeamsClient::media_fetch(&http, &(base + "/views/imgo"), &no_auth)
             .await
             .expect_err("401 must fail");
         assert!(format!("{err:#}").contains("401"), "says 401: {err:#}");
@@ -1028,8 +1113,8 @@ mod tests {
             br#"{"error":"gone"}"#,
         )])
         .await;
-        let http = reqwest::Client::new();
-        let mb = TeamsClient::media_fetch(&http, &(base + "/views/imgo"), &[])
+        let http = media_http();
+        let mb = TeamsClient::media_fetch(&http, &(base + "/views/imgo"), &no_auth)
             .await
             .expect("shape passes through");
         assert_eq!(mb.data, br#"{"error":"gone"}"#);
@@ -1043,8 +1128,8 @@ mod tests {
         let big = vec![b'x'; super::super::media::MAX_BYTES + 1];
         let (base, _, task) =
             start_stub(vec![plain("200 OK", "image/png", &big)]).await;
-        let http = reqwest::Client::new();
-        let err = TeamsClient::media_fetch(&http, &(base + "/big"), &[])
+        let http = media_http();
+        let err = TeamsClient::media_fetch(&http, &(base + "/big"), &no_auth)
             .await
             .expect_err("over-cap must fail");
         assert!(
@@ -1052,5 +1137,94 @@ mod tests {
             "says exceeds: {err:#}"
         );
         task.await.expect("stub drains");
+    }
+
+    /// No token headers: public media and the stub legs that send none.
+    fn no_auth(_: &str) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+
+    /// A redirect to another host drops the token. reqwest alone strips
+    /// only `Authorization`, so `Authentication`/`X-SkypeToken` used to
+    /// follow a redirect anywhere; now each hop gets its own headers.
+    #[tokio::test]
+    async fn media_cross_host_redirect_drops_token() {
+        let (other, other_hits, other_task) =
+            start_stub(vec![plain("200 OK", "image/png", b"PNG!")]).await;
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {other}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (base, hits, task) = start_stub(vec![redirect.into_bytes()]).await;
+        let first = base.clone();
+        let auth = move |u: &str| {
+            if u.starts_with(&first) {
+                vec![
+                    ("Authentication", "skypetoken=T".to_string()),
+                    ("X-SkypeToken", "T".to_string()),
+                ]
+            } else {
+                Vec::new()
+            }
+        };
+        let mb = TeamsClient::media_fetch(&media_http(), &(base + "/views/imgo"), &auth)
+            .await
+            .expect("redirect followed");
+        assert_eq!(mb.data, b"PNG!");
+        task.await.expect("stub drains");
+        other_task.await.expect("stub drains");
+        let hits = hits.lock().expect("hit log");
+        assert_eq!(
+            hits[0].headers.get("x-skypetoken").map(String::as_str),
+            Some("T")
+        );
+        let other_hits = other_hits.lock().expect("hit log");
+        assert_eq!(other_hits.len(), 1);
+        assert_eq!(other_hits[0].path, "/stolen");
+        assert!(!other_hits[0].headers.contains_key("authentication"));
+        assert!(!other_hits[0].headers.contains_key("x-skypetoken"));
+        assert!(!other_hits[0].headers.contains_key("authorization"));
+    }
+
+    /// The real per-hop policy: a Microsoft host keeps the token, a hop
+    /// to anywhere else gets none.
+    #[test]
+    fn media_auth_follows_each_hop() {
+        let auth = media_auth(Some("T"));
+        assert!(
+            !auth("https://amer.ng.msg.teams.microsoft.com/v1/objects/0/views/imgo").is_empty()
+        );
+        assert!(auth("https://attacker.example/stolen").is_empty());
+        assert!(auth("https://x.teams.microsoft.com@attacker.example/p.png").is_empty());
+        assert!(media_auth(None)("https://amer.ng.msg.teams.microsoft.com/x").is_empty());
+    }
+
+    #[test]
+    fn media_redirects_never_downgrade() {
+        let https = url::Url::parse("https://us-api.asm.skype.com/v1/objects/0").expect("url");
+        assert_eq!(
+            next_media_hop(&https, "/v1/objects/1")
+                .expect("relative")
+                .as_str(),
+            "https://us-api.asm.skype.com/v1/objects/1"
+        );
+        assert!(next_media_hop(&https, "https://blob.example/x").is_ok());
+        assert!(next_media_hop(&https, "http://blob.example/x").is_err());
+        assert!(next_media_hop(&https, "file:///etc/passwd").is_err());
+        let http = url::Url::parse("http://127.0.0.1:1/a").expect("url");
+        assert!(next_media_hop(&http, "https://blob.example/x").is_ok());
+        assert!(next_media_hop(&http, "ftp://blob.example/x").is_err());
+    }
+
+    /// Too many hops fail instead of looping.
+    #[tokio::test]
+    async fn media_redirect_loop_stops() {
+        let hop = b"HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (base, hits, task) = start_stub(vec![hop; MAX_MEDIA_REDIRECTS + 1]).await;
+        let err = TeamsClient::media_fetch(&media_http(), &(base + "/start"), &no_auth)
+            .await
+            .expect_err("loop must fail");
+        assert!(format!("{err:#}").contains("too many redirects"), "{err:#}");
+        task.await.expect("stub drains");
+        assert_eq!(hits.lock().expect("hit log").len(), MAX_MEDIA_REDIRECTS + 1);
     }
 }
