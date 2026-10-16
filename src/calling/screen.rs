@@ -4,10 +4,10 @@
 //! module consumes the portal's PipeWire stream and emits planar I420
 //! [`VideoFrame`]s for the video send loop.
 //!
-//! SPIKE NOTES (honest): stop is cooperative — the capture thread parks in
-//! the PipeWire main loop until the app exits after `stop()` (frames cease
-//! within one frame; the thread itself is left to the OS). Clean main-loop
-//! teardown needs a quit handle threaded into the listener.
+//! Teardown: `stop()` flips a flag the consumer watches on a 150ms loop
+//! timer, so the pw main loop quits even if frames stop flowing; the
+//! consumer signals completion and `ScreenShareSession::drop` joins the
+//! thread (1.5s budget, then falls back to the old bounded leak).
 
 use crate::calling::video::VideoFrame;
 use anyhow::{anyhow, Context, Result};
@@ -16,11 +16,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 
+/// The pipewire-consumer thread plus its completion signal.
+struct PwThread {
+    handle: std::thread::JoinHandle<()>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
 /// A running screen-capture session. Frames cease within ~1 frame of
-/// `stop()`/drop.
+/// `stop()`/drop; the consumer thread joins on drop.
 pub struct ScreenShareSession {
     stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    pw: Option<PwThread>,
 }
 
 impl ScreenShareSession {
@@ -32,9 +38,20 @@ impl ScreenShareSession {
 impl Drop for ScreenShareSession {
     fn drop(&mut self) {
         self.stop();
-        // The pw thread parks in its main loop; leak it (bounded, one per
-        // share) rather than join a loop that never returns. See module doc.
-        let _ = self.thread.take();
+        if let Some(pw) = self.pw.take() {
+            // One watcher tick plus margin for the loop teardown. If the
+            // consumer misses the budget ( wedged stream), fall back to the
+            // old bounded leak rather than blocking the caller.
+            if pw
+                .done
+                .recv_timeout(std::time::Duration::from_millis(1500))
+                .is_ok()
+            {
+                let _ = pw.handle.join();
+                return;
+            }
+            tracing::debug!("screenshare: consumer missed the stop budget; leaking the thread");
+        }
     }
 }
 
@@ -46,7 +63,7 @@ pub fn start_screen_capture(
 ) -> Result<ScreenShareSession> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<PwThread>>();
     let thread = std::thread::Builder::new()
         .name("screenshare".into())
         .spawn(move || {
@@ -60,18 +77,20 @@ pub fn start_screen_capture(
         })
         .context("spawn screenshare thread")?;
 
-    ready_rx
+    let pw = ready_rx
         .recv()
         .map_err(|e| anyhow!("screenshare thread died: {e}"))??;
+    // The portal thread exits after handing over; only the consumer runs.
+    let _ = thread;
 
-    Ok(ScreenShareSession { stop, thread: Some(thread) })
+    Ok(ScreenShareSession { stop, pw: Some(pw) })
 }
 
 async fn portal_setup(
     with_cursor: bool,
     stop: Arc<AtomicBool>,
     tx: SyncSender<VideoFrame>,
-) -> Result<()> {
+) -> Result<PwThread> {
     use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 
     let proxy = Screencast::new()
@@ -114,17 +133,21 @@ async fn portal_setup(
         .context("open pipewire remote")?;
 
     let (pw_ready_tx, pw_ready_rx) = std::sync::mpsc::channel::<Result<()>>();
-    std::thread::Builder::new()
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::Builder::new()
         .name("pipewire-consumer".into())
         .spawn(move || {
             let res = pipewire_consume(fd, node_id, stop, tx);
+            // Initial handshake to the portal thread, then the completion
+            // signal to the session (join happens on its drop).
             let _ = pw_ready_tx.send(res);
+            let _ = done_tx.send(());
         })
         .context("spawn pipewire thread")?;
     pw_ready_rx
         .recv()
         .map_err(|e| anyhow!("pipewire thread died: {e}"))??;
-    Ok(())
+    Ok(PwThread { handle, done: done_rx })
 }
 
 struct PwData {
@@ -146,6 +169,22 @@ fn pipewire_consume(
 
     pw::init();
     let mainloop = pw::main_loop::MainLoopBox::new(None).context("pw main loop")?;
+    // Stop watcher: a quit from the PROCESS callback alone would miss the
+    // case where frames stop flowing (paused stream) — a loop timer checks
+    // the flag even then, so run() always returns after stop().
+    let watcher_stop = stop.clone();
+    // The box's heap object outlives the timer (dropped last); pw_main_loop
+    // quit is callable from any thread — it marshals onto the loop.
+    let mainloop_ptr: *const pw::main_loop::MainLoop = &*mainloop;
+    let watcher = mainloop.loop_().add_timer(move |_| {
+        if watcher_stop.load(Ordering::SeqCst) {
+            unsafe { (*mainloop_ptr).quit() };
+        }
+    });
+    watcher.update_timer(
+        Some(std::time::Duration::from_millis(150)),
+        Some(std::time::Duration::from_millis(150)),
+    );
     let context = pw::context::ContextBox::new(mainloop.loop_(), None).context("pw context")?;
     let core = context.connect_fd(fd, None).context("pw connect_fd")?;
 
@@ -294,6 +333,9 @@ fn pipewire_consume(
         .context("connect stream")?;
 
     mainloop.run();
+    // Watcher, listener, stream, core, context, mainloop drop in reverse
+    // declaration order — the C objects tear down on their home thread.
+    drop(watcher);
     Ok(())
 }
 
