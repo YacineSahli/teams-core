@@ -1866,8 +1866,17 @@ pub fn parse_created_chat(value: &serde_json::Value) -> Result<ChatInfo> {
 /// order (every 1:1 id on the owner's account has this shape). The same
 /// pair always names the same thread, so an existing 1:1 re-opens and a
 /// new one is created by the chat service on its first post.
+/// Inputs may be bare ids or full MRIs ("8:orgid:<id>") — the MRI prefix
+/// is stripped; embedded it makes the chat service 404 the thread
+/// (LocationLookupFailed).
 pub fn one_to_one_thread_id(a: &str, b: &str) -> String {
-    let (a, b) = (a.trim().to_ascii_lowercase(), b.trim().to_ascii_lowercase());
+    fn strip(s: &str) -> &str {
+        match s.trim().rsplit_once(':') {
+            Some((_, id)) if !id.is_empty() => id,
+            _ => s.trim(),
+        }
+    }
+    let (a, b) = (strip(a).to_ascii_lowercase(), strip(b).to_ascii_lowercase());
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
     format!("19:{}_{}@unq.gbl.spaces", lo, hi)
 }
@@ -4400,6 +4409,14 @@ mod sendfix_tests {
         let want = "19:01d90000-0000-0000-0000-000000000002_527a0000-0000-0000-0000-000000000001@unq.gbl.spaces";
         assert_eq!(one_to_one_thread_id(a, b), want);
         assert_eq!(one_to_one_thread_id(b, a), want);
+        // Full MRIs strip to the bare ids (a mention chip's "chat" button
+        // passes roster MRIs; embedding them 404s the thread lookup).
+        let me_mri = "8:orgid:22222222-3333-4444-5555-666666666666";
+        let peer_mri = "8:orgid:33333333-4444-5555-6666-777777777777";
+        assert_eq!(
+            one_to_one_thread_id(me_mri, peer_mri),
+            "19:22222222-3333-4444-5555-666666666666_33333333-4444-5555-6666-777777777777@unq.gbl.spaces"
+        );
         assert!(looks_like_guid(b));
         assert!(!looks_like_guid("someone@example.org"));
     }
