@@ -1479,6 +1479,39 @@ mod tests {
     }
 
     #[test]
+    fn video_join_declares_video_modality() {
+        // Group/meeting legs placed with a camera must JOIN with
+        // ["Audio","Video"] callModalities — the label that makes the leg
+        // video-capable (screen share, camera tiles). run_call_with_controls
+        // threads use_camera here since the join-branch fix.
+        let eu = TeamsRegion::default();
+        let params = ConversationCallParams {
+            ic3_token: "",
+            trouter_surl: "",
+            caller_mri: "",
+            caller_display_name: "",
+            endpoint_id: "",
+            participant_id: "",
+            thread_id: "",
+            chain_id: "",
+            message_id: "0123456789abcdef",
+            caller_oid: "",
+            tenant_id: "",
+            region: &eu,
+        };
+        let video = join_conversation_payload(&params, "v=0", true);
+        assert_eq!(
+            video["callInvitation"]["callModalities"],
+            serde_json::json!(["Audio", "Video"])
+        );
+        let audio = join_conversation_payload(&params, "v=0", false);
+        assert_eq!(
+            audio["callInvitation"]["callModalities"],
+            serde_json::json!(["Audio"])
+        );
+    }
+
+    #[test]
     fn params_region_threads_into_headers() {
         let eu =
             TeamsRegion::with_overrides(Some("euwe01".to_string()), Some("euwe".to_string()), None);
