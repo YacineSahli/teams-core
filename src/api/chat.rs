@@ -334,6 +334,16 @@ fn html_escape(text: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Prose escape for `<p>` bodies: escape, then turn newlines into `<br>`.
+/// A literal `\n` inside `<p>` is whitespace per HTML — other clients
+/// (and our own block-noise collapsing) flatten it to a space — so the
+/// wire must carry explicit breaks. `<pre>` interiors keep raw newlines.
+fn prose_html(text: &str) -> String {
+    html_escape(text)
+        .replace("\r\n", "\n")
+        .replace('\n', "<br>")
+}
+
 /// Max fenced code blocks parsed per outbound message (hostile-input
 /// cap, mirrors Swift `CodeBlocks.maxBlocks`); extra fences stay prose.
 pub const WIRE_FENCE_MAX_BLOCKS: usize = 50;
@@ -381,7 +391,7 @@ fn wire_fence_closer(line: &str, ch: char, len: usize) -> bool {
 /// end of text (Swift `CodeBlocks` parity).
 pub fn build_message_html(message: &str) -> String {
     if !message.lines().any(|l| wire_fence_opener(l).is_some()) {
-        return format!("<p>{}</p>", html_escape(message));
+        return format!("<p>{}</p>", prose_html(message));
     }
     enum Seg {
         Prose(String),
@@ -428,7 +438,7 @@ pub fn build_message_html(message: &str) -> String {
                 // Whitespace-only prose renders blank either way; skip it
                 // so whole-message fences emit a lone <pre>.
                 if !t.trim().is_empty() {
-                    out.push_str(&format!("<p>{}</p>", html_escape(&t)));
+                    out.push_str(&format!("<p>{}</p>", prose_html(&t)));
                 }
             }
             Seg::Code(t) => out.push_str(&format!("<pre>{}</pre>", html_escape(&t))),
@@ -3856,23 +3866,34 @@ src="x">"#));
     }
 
     // wire-pre lane: fenced blocks go out as <pre> (other clients keep
-    // indents); prose keeps the legacy single-<p> shape bit-identical.
+    // indents); prose keeps the legacy single-<p> shape with explicit
+    // <br> breaks (a raw \n inside <p> is whitespace per HTML).
 
     #[test]
     fn wire_prose_unchanged_single_p() {
         assert_eq!(build_message_html("hi"), "<p>hi</p>");
         assert_eq!(
             build_message_html("a<b>&\"'\nline2  indented"),
-            "<p>a&lt;b&gt;&amp;&quot;&#39;\nline2  indented</p>"
+            "<p>a&lt;b&gt;&amp;&quot;&#39;<br>line2  indented</p>"
         );
         // Inline backticks and short runs are not fences.
         assert_eq!(build_message_html("use `x` here"), "<p>use `x` here</p>");
-        assert_eq!(build_message_html("a\n``\nb"), "<p>a\n``\nb</p>");
+        assert_eq!(build_message_html("a\n``\nb"), "<p>a<br>``<br>b</p>");
         // Info string containing the fence char: not a fence (CommonMark).
         assert_eq!(
             build_message_html("``` `x` ```\nstill prose"),
-            "<p>``` `x` ```\nstill prose</p>"
+            "<p>``` `x` ```<br>still prose</p>"
         );
+    }
+
+    #[test]
+    fn wire_prose_newlines_become_br() {
+        // Multi-line sends: each line break is explicit on the wire.
+        assert_eq!(build_message_html("one\ntwo"), "<p>one<br>two</p>");
+        // CRLF pastes collapse to one break.
+        assert_eq!(build_message_html("one\r\ntwo"), "<p>one<br>two</p>");
+        // Empty line = two breaks (renders as a blank row, like Teams).
+        assert_eq!(build_message_html("one\n\ntwo"), "<p>one<br><br>two</p>");
     }
 
     #[test]
@@ -3921,7 +3942,7 @@ src="x">"#));
         let html = build_message_html(&msg);
         assert_eq!(html.matches("<pre>").count(), WIRE_FENCE_MAX_BLOCKS);
         // 51st block never parsed: its fences stay literal prose, nothing lost.
-        assert!(html.contains("```\nc50\n```"), "{}", html);
+        assert!(html.contains("```<br>c50<br>```"), "{}", html);
     }
 
     #[test]
