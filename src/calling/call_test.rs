@@ -593,11 +593,17 @@ pub async fn run_call_with_controls(
         );
 
         tracing::info!("Phase 2: Joining conversation with SDP...");
-        let joined = signaling::join_conversation_with_sdp(
+        // Honor the camera flag for group/meeting legs too: the join
+        // declares ["Audio","Video"] modalities when use_camera, so the
+        // leg is video-capable (screen share + camera tiles) instead of
+        // audio-labelled. The SDP offer already carries the video m-line
+        // either way.
+        let joined = signaling::join_conversation_with_sdp_video(
             &http,
             &created.conversation_controller,
             &conv_params,
             &offer_result.sdp,
+            use_camera,
         )
         .await?;
         tracing::info!(
