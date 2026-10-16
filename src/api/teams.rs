@@ -313,32 +313,42 @@ pub async fn list_teams_data(client: &TeamsClient) -> Result<Vec<TeamInfo>> {
         .await
         .context("Failed to parse joinedTeams response")?;
 
-    let mut result = Vec::new();
-
-    for team in &teams.value {
-        let team_name = team.display_name.as_deref().unwrap_or(&team.id).to_string();
-        tracing::debug!("Fetching channels for team: {} ({})", team_name, team.id);
-
-        let path = format!("/teams/{}/channels", team.id);
-        let channels = match client.graph_get(&path).await {
-            Ok(resp) => {
-                let channels_resp: ChannelsResponse = resp
-                    .json()
-                    .await
-                    .context("Failed to parse channels response")?;
-                channels_resp.value.into_iter().map(channel_info).collect()
+    // Channel lists are independent GETs — fetch them concurrently in
+    // chunks of 8: N teams used to mean N serial round-trips on the
+    // caller's worker, and every caller of this function paid it.
+    let mut result: Vec<TeamInfo> = Vec::with_capacity(teams.value.len());
+    for chunk in teams.value.chunks(8) {
+        let fetched = futures::future::join_all(chunk.iter().map(|team| async move {
+            let team_name = team.display_name.as_deref().unwrap_or(&team.id).to_string();
+            tracing::debug!("Fetching channels for team: {} ({})", team_name, team.id);
+            let path = format!("/teams/{}/channels", team.id);
+            let channels = match client.graph_get(&path).await {
+                Ok(resp) => match resp.json::<ChannelsResponse>().await {
+                    Ok(channels_resp) => {
+                        channels_resp.value.into_iter().map(channel_info).collect()
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse channels for {}: {:#}",
+                            team_name,
+                            e
+                        );
+                        Vec::new()
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to fetch channels for {}: {:#}", team_name, e);
+                    Vec::new()
+                }
+            };
+            TeamInfo {
+                id: team.id.clone(),
+                name: team_name,
+                channels,
             }
-            Err(e) => {
-                tracing::warn!("Failed to fetch channels for {}: {:#}", team_name, e);
-                Vec::new()
-            }
-        };
-
-        result.push(TeamInfo {
-            id: team.id.clone(),
-            name: team_name,
-            channels,
-        });
+        }))
+        .await;
+        result.extend(fetched);
     }
 
     Ok(result)

@@ -2307,38 +2307,83 @@ async fn fill_member_names(client: &TeamsClient, members: &mut [ChatMemberInfo])
 /// Mate resolution is best-effort: roster/history/whoami failures
 /// keep the sender/label fallback, never fail the list.
 pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<ChatInfo>> {
-    // Strategy 1: CSA AFD endpoint with Bearer auth
-    let csa_url = format!(
-        "https://teams.microsoft.com/api/csa/api/v1/teams/users/ME/conversations?view=mychats&pageSize={}",
-        limit
-    );
-    tracing::debug!("Trying CSA endpoint: {}", csa_url);
-    let resp = match client.csa_get(&csa_url).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("CSA endpoint failed: {:#}, trying chatsvcagg", e);
-            // Strategy 2: chatsvcagg with skypetoken auth
-            let base = client.chatsvcagg_url();
-            let url = format!(
-                "{}/api/v2/users/ME/conversations?view=mychats&pageSize={}",
-                base, limit
-            );
-            tracing::debug!("Trying chatsvcagg: {}", url);
-            match client.chat_get(&url).await {
-                Ok(r) => r,
-                Err(e2) => {
-                    tracing::debug!("chatsvcagg failed: {:#}, trying chat service", e2);
-                    // Strategy 3: chat service (amer.ng.msg) with skypetoken auth
-                    let base = client.chat_service_url();
-                    let url = format!(
-                        "{}/v1/users/ME/conversations?view=mychats&pageSize={}",
-                        base, limit
-                    );
-                    client.chat_get(&url).await?
+    /// Last successful endpoint for the chat list: 1 = CSA AFD (Bearer),
+    /// 2 = chatsvcagg (skypetoken), 3 = chat service (skypetoken).
+    /// Per tenant exactly one of the three usually works — the other two
+    /// 401 — so without memory every chat-list load paid ~2 dead
+    /// round-trips before the real request.
+    static CHATS_ENDPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    async fn fetch_chats(
+        client: &TeamsClient,
+        strategy: u8,
+        limit: usize,
+    ) -> Result<reqwest::Response> {
+        match strategy {
+            1 => {
+                let url = format!(
+                    "https://teams.microsoft.com/api/csa/api/v1/teams/users/ME/conversations?view=mychats&pageSize={}",
+                    limit
+                );
+                client.csa_get(&url).await
+            }
+            2 => {
+                let url = format!(
+                    "{}/api/v2/users/ME/conversations?view=mychats&pageSize={}",
+                    client.chatsvcagg_url(),
+                    limit
+                );
+                client.chat_get(&url).await
+            }
+            _ => {
+                let url = format!(
+                    "{}/v1/users/ME/conversations?view=mychats&pageSize={}",
+                    client.chat_service_url(),
+                    limit
+                );
+                client.chat_get(&url).await
+            }
+        }
+    }
+
+    // Try the last winner first; fall back to the full chain in order and
+    // remember what worked.
+    let sticky = CHATS_ENDPOINT.load(std::sync::atomic::Ordering::Relaxed);
+    let (resp, used) = if sticky != 0 {
+        match fetch_chats(client, sticky, limit).await {
+            Ok(r) => (r, sticky),
+            Err(_) => {
+                let mut used = 3;
+                let mut resp = None;
+                for strategy in [1u8, 2, 3] {
+                    if let Ok(r) = fetch_chats(client, strategy, limit).await {
+                        resp = Some(r);
+                        used = strategy;
+                        break;
+                    }
+                }
+                (resp.ok_or_else(|| anyhow::anyhow!("all chat-list endpoints failed"))?, used)
+            }
+        }
+    } else {
+        let mut used = 3;
+        let mut resp = None;
+        for strategy in [1u8, 2, 3] {
+            tracing::debug!("Trying chat-list endpoint strategy {strategy}");
+            match fetch_chats(client, strategy, limit).await {
+                Ok(r) => {
+                    resp = Some(r);
+                    used = strategy;
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!("chat-list strategy {strategy} failed: {:#}", e);
                 }
             }
         }
+        (resp.ok_or_else(|| anyhow::anyhow!("all chat-list endpoints failed"))?, used)
     };
+    CHATS_ENDPOINT.store(used, std::sync::atomic::Ordering::Relaxed);
 
     let body: ConversationsResponse = resp
         .json()
