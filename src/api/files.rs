@@ -830,7 +830,12 @@ pub async fn upload_file_data_idem(
     client_message_id: &str,
     verify_first: bool,
 ) -> Result<SharedFile> {
-    let bytes = std::fs::read(local_path)
+    // Read OFF the async runtime: a multi-MB sync read here stalled the
+    // caller's whole worker (current-thread tokio + trouter on it).
+    let path = local_path.to_string();
+    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&path))
+        .await
+        .map_err(|e| anyhow::anyhow!("upload read task failed: {e}"))?
         .with_context(|| format!("Failed to read {}", local_path))?;
     let report = |sent: u64, total: u64| {
         if let Some(cb) = progress {
