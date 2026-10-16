@@ -2346,9 +2346,45 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
         }
     }
 
+    /// Machine-local memory of the winning chat-list endpoint (a single
+    /// digit 1-3 in the config dir). Without it every PROCESS re-paid the
+    /// two dead 401 round-trips; a stale hint costs one failed RTT once,
+    /// then the full chain re-runs below and rewrites the file.
+    fn chats_endpoint_hint_path() -> Option<std::path::PathBuf> {
+        directories::ProjectDirs::from("com", "teams-cli", "teams-cli")
+            .map(|d| d.config_dir().to_path_buf().join("chats_endpoint"))
+    }
+    fn load_chats_endpoint_hint() -> u8 {
+        let Some(p) = chats_endpoint_hint_path() else {
+            return 0;
+        };
+        match std::fs::read_to_string(p) {
+            Ok(s) => match s.trim().as_bytes().first().copied() {
+                Some(b) if (b'1'..=b'3').contains(&b) => b - b'0',
+                _ => 0,
+            },
+            Err(_) => 0,
+        }
+    }
+    fn save_chats_endpoint_hint(used: u8) {
+        if let Some(p) = chats_endpoint_hint_path() {
+            if let Some(dir) = p.parent() {
+                if std::fs::create_dir_all(dir).is_ok() {
+                    let _ = std::fs::write(p, used.to_string());
+                }
+            }
+        }
+    }
+
     // Try the last winner first; fall back to the full chain in order and
     // remember what worked.
-    let sticky = CHATS_ENDPOINT.load(std::sync::atomic::Ordering::Relaxed);
+    let mut sticky = CHATS_ENDPOINT.load(std::sync::atomic::Ordering::Relaxed);
+    if sticky == 0 {
+        sticky = load_chats_endpoint_hint();
+        if sticky != 0 {
+            tracing::debug!("chat-list endpoint hint from disk: strategy {sticky}");
+        }
+    }
     let (resp, used) = if sticky != 0 {
         match fetch_chats(client, sticky, limit).await {
             Ok(r) => (r, sticky),
@@ -2384,6 +2420,7 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
         (resp.ok_or_else(|| anyhow::anyhow!("all chat-list endpoints failed"))?, used)
     };
     CHATS_ENDPOINT.store(used, std::sync::atomic::Ordering::Relaxed);
+    save_chats_endpoint_hint(used);
 
     let body: ConversationsResponse = resp
         .json()
