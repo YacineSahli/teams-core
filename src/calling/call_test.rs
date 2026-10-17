@@ -102,6 +102,9 @@ pub struct CallControls {
     /// camera; the camera gate does NOT gate the share (they are separate
     /// toggles, like the native client).
     pub screen_source: ScreenShareSlot,
+    /// Mid-call camera source (camera-on-later); takes precedence over
+    /// the pre-spawn capture when set.
+    pub camera_source: CameraSlot,
 }
 
 /// The UI-side twin of [`CallControls`].
@@ -112,6 +115,7 @@ pub struct CallControlsHandle {
     pub remote_frames: std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>,
     pub local_preview: Option<std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>>,
     pub screen_source: ScreenShareSlot,
+    pub camera_source: CameraSlot,
 }
 
 /// Shared slot carrying the call's screen-share frame source. The embedder
@@ -123,7 +127,29 @@ pub type ScreenShareSlot = std::sync::Arc<
     std::sync::Mutex<Option<std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>>>,
 >;
 
+/// Shared slot for a camera source swapped in MID-CALL (camera-on-later
+/// for audio-placed legs): every AV offer carries the video m-line, so
+/// the send loop already runs — with no source it keeps the leg alive
+/// with black keyframes. The embedder starts a [`camera::CameraCapture`]
+/// when the user flips the camera on and swaps its receiver in; the loop
+/// initializes the encoder on the first real frame (same machinery as
+/// the share's resolution-change re-init). No modality renegotiation.
+pub type CameraSlot =
+    std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>>>>;
+
 impl CallControlsHandle {
+    /// Swap the mid-call camera source (camera-on-later for audio-placed
+    /// legs). `Some(rx)` starts sending live frames; `None` returns to
+    /// black keyframes (the gate does the same for the lens toggle).
+    pub fn set_camera_source(
+        &self,
+        rx: Option<std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>>,
+    ) {
+        if let Ok(mut slot) = self.camera_source.lock() {
+            *slot = rx;
+        }
+    }
+
     /// Swap the screen-share source. `Some(rx)` starts sharing (the send
     /// loop re-initializes the encoder at the stream's resolution);
     /// `None` stops and returns to the camera (or black keyframes).
@@ -152,6 +178,7 @@ pub fn call_controls(local_preview: bool) -> (CallControls, CallControlsHandle) 
     };
     let (phase_tx, phase_rx) = tokio::sync::watch::channel(CallPhase::Connecting);
     let screen_source: ScreenShareSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let camera_source: CameraSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
     (
         CallControls {
             mic_on: mic_rx,
@@ -160,6 +187,7 @@ pub fn call_controls(local_preview: bool) -> (CallControls, CallControlsHandle) 
             local_preview: prev_tx,
             phase: phase_tx,
             screen_source: screen_source.clone(),
+            camera_source: camera_source.clone(),
         },
         CallControlsHandle {
             mic_on: mic_tx,
@@ -168,6 +196,7 @@ pub fn call_controls(local_preview: bool) -> (CallControls, CallControlsHandle) 
             remote_frames: rmt_rx,
             local_preview: prev_rx,
             screen_source,
+            camera_source,
         },
     )
 }
@@ -286,18 +315,26 @@ pub async fn run_call_with_controls(
     // Live controls: split the pair up front (mic gate → audio send,
     // camera gate + preview tee → video send, remote sink → video
     // receive, phase → the embedder's UI).
-    let (mic_gate, camera_gate, remote_frames_tx, preview_tx, phase_tx, screen_slot) =
-        match controls.take() {
-            Some(c) => (
-                Some(c.mic_on),
-                Some(c.camera_on),
-                Some(c.remote_frames),
-                c.local_preview,
-                Some(c.phase),
-                Some(c.screen_source),
-            ),
-            None => (None, None, None, None, None, None),
-        };
+    let (
+        mic_gate,
+        camera_gate,
+        remote_frames_tx,
+        preview_tx,
+        phase_tx,
+        screen_slot,
+        camera_slot,
+    ) = match controls.take() {
+        Some(c) => (
+            Some(c.mic_on),
+            Some(c.camera_on),
+            Some(c.remote_frames),
+            c.local_preview,
+            Some(c.phase),
+            Some(c.screen_source),
+            Some(c.camera_source),
+        ),
+        None => (None, None, None, None, None, None, None),
+    };
 
     // Extract caller MRI from skype token (JWT)
     let caller_mri = extract_mri_from_skype_token(skype_token_str)
@@ -707,6 +744,7 @@ pub async fn run_call_with_controls(
     outgoing_leg.remote_tx = remote_frames_tx;
     outgoing_leg.preview_tx = preview_tx;
     outgoing_leg.screen_source = screen_slot;
+    outgoing_leg.camera_source = camera_slot;
 
     // 9. Initialize audio FIRST — before SDL2 display, which can interfere with
     // audio device enumeration on Linux (PulseAudio/ALSA).
@@ -1028,6 +1066,8 @@ struct MediaLeg {
     /// Embedder-injected screen-share source; see [`ScreenShareSlot`].
     /// Set on the outgoing leg only (sharing is OUR send path).
     screen_source: Option<ScreenShareSlot>,
+    /// Mid-call camera source (camera-on-later); outgoing leg only.
+    camera_source: Option<CameraSlot>,
 }
 
 /// Handles to spawned media tasks and shared stats for one leg.
@@ -1183,6 +1223,7 @@ async fn setup_media_leg(
     };
 
     Ok(MediaLeg {
+        camera_source: None,
         label: label.to_string(),
         audio_socket,
         audio_srtp_ctx,
@@ -1529,6 +1570,7 @@ fn spawn_media_leg(
         let camera_rx: Option<()> = None;
         let preview_tx = leg.preview_tx.take();
         let screen_source = leg.screen_source.take();
+        let camera_slot = leg.camera_source.take();
 
         handles.push(tokio::spawn(async move {
             let mut packetizer = video::VideoPacketizer::new(video_ssrc);
@@ -1612,23 +1654,54 @@ fn spawn_media_leg(
                         } else {
                             let camera_active =
                                 camera_gate.as_ref().map(|g| *g.borrow()).unwrap_or(true);
-                            camera_rx.as_ref().filter(|_| camera_active).and_then(|rx| {
-                                match rx.try_recv() {
-                                    Ok(mut latest) => {
-                                        // Latest-wins (same as the screen
-                                        // path): never encode a backlog.
-                                        while let Ok(newer) = rx.try_recv() {
-                                            latest = newer;
+                            // Mid-call camera (camera-on-later): the slot
+                            // takes precedence over the pre-spawn capture;
+                            // a disconnected swapped source clears the slot
+                            // and falls through (black keyframes).
+                            let mut swapped: Option<video::VideoFrame> = None;
+                            if let Some(slot) = camera_slot.as_ref() {
+                                if let Ok(mut guard) = slot.lock() {
+                                    if let Some(rx) = guard.as_mut() {
+                                    match rx.try_recv() {
+                                        Ok(mut latest) => {
+                                            while let Ok(newer) = rx.try_recv() {
+                                                latest = newer;
+                                            }
+                                            swapped = Some(latest);
                                         }
-                                        Some(video::VideoFrame {
-                                            width: latest.width,
-                                            height: latest.height,
-                                            data: latest.data,
-                                        })
+                                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                            tracing::info!(
+                                                "[{}] swapped camera source disconnected",
+                                                label
+                                            );
+                                            *guard = None;
+                                        }
+                                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                                        }
                                     }
-                                    _ => None,
                                 }
-                            })
+                            }
+                            if let Some(frame) = swapped.filter(|_| camera_active) {
+                                Some(frame)
+                            } else {
+                                camera_rx.as_ref().filter(|_| camera_active).and_then(|rx| {
+                                    match rx.try_recv() {
+                                        Ok(mut latest) => {
+                                            // Latest-wins (same as the screen
+                                            // path): never encode a backlog.
+                                            while let Ok(newer) = rx.try_recv() {
+                                                latest = newer;
+                                            }
+                                            Some(video::VideoFrame {
+                                                width: latest.width,
+                                                height: latest.height,
+                                                data: latest.data,
+                                            })
+                                        }
+                                        _ => None,
+                                    }
+                                })
+                            }
                         };
                         match pick {
                             Some(frame) if frame.width > 0 && frame.height > 0 => {
