@@ -1765,6 +1765,7 @@ fn spawn_media_leg(
                         // it): screen frames can't be encoded here; keep
                         // the stream alive with black keyframes.
                         let _ = &camera_rx;
+                        let _ = &camera_slot;
                         let _ = &preview_tx;
                         let _ = screen_frame;
                         video::generate_black_iframe()
