@@ -1198,13 +1198,24 @@ pub fn reaction_emoji_for_key(key: &str) -> Option<String> {
     let mut cps = String::new();
     for seg in key.split('_') {
         if (4..=5).contains(&seg.len()) && seg.chars().all(|c| c.is_ascii_hexdigit()) {
-            let cp = u32::from_str_radix(seg, 16).ok()?;
-            cps.push(char::from_u32(cp)?);
+            match u32::from_str_radix(seg, 16).ok().and_then(char::from_u32) {
+                // A surrogate/invalid segment is skipped, not fatal —
+                // aborting the whole key dropped a valid 🎉 when a later
+                // segment went bad (review P3).
+                Some(c) => cps.push(c),
+                None => continue,
+            }
         } else {
             break;
         }
     }
-    (!cps.is_empty()).then_some(cps)
+    // Emoji-range guard: any 4-hex word parses as a codepoint ("beef" →
+    // Hangul 벯) — require at least one char in the symbol/emoji planes
+    // so garbage words drop instead of rendering a bogus chip (P3).
+    let emojiish = cps
+        .chars()
+        .any(|c| ('\u{2190}'..='\u{2bff}').contains(&c) || c >= '\u{1f000}');
+    (emojiish).then_some(cps)
 }
 
 /// Loose validity for a reaction the user wants to SEND: the wire takes
@@ -1216,6 +1227,9 @@ pub fn reaction_emoji_valid(emoji: &str) -> bool {
         && t.chars().count() <= 32
         && !t.chars().any(char::is_whitespace)
         && t.chars().next().is_some_and(|c| !c.is_ascii_alphanumeric())
+        // At least one non-ASCII char: pure-ASCII punctuation ("?!")
+        // passed the shape gate and only failed at the server (P3).
+        && t.chars().any(|c| !c.is_ascii())
 }
 
 /// Graph POST path for adding a reaction to one message. The native
@@ -3806,6 +3820,18 @@ src="x">"#));
         // No leading hex runs → unknown.
         assert_eq!(reaction_emoji_for_key("partypopper"), None);
         assert_eq!(reaction_emoji_for_key(""), None);
+        // Emoji-range guard: hex WORDS that parse as Hangul/CJK drop.
+        assert_eq!(reaction_emoji_for_key("beef"), None);
+        assert_eq!(reaction_emoji_for_key("face"), None);
+        // BMP symbol-plane emoji pass the guard (heart without VS16).
+        assert_eq!(reaction_emoji_for_key("2764").as_deref(), Some("\u{2764}"));
+        // Regional pair composes a flag.
+        assert_eq!(
+            reaction_emoji_for_key("1f1eb_1f1f7"),
+            Some("\u{1f1eb}\u{1f1f7}".to_string())
+        );
+        // A bad segment is skipped, not fatal.
+        assert_eq!(reaction_emoji_for_key("1f389_d800_x").as_deref(), Some("\u{1f389}"));
     }
 
     #[test]
@@ -3815,6 +3841,7 @@ src="x">"#));
         assert!(!reaction_emoji_valid(""));
         assert!(!reaction_emoji_valid("like")); // ascii words rejected
         assert!(!reaction_emoji_valid("a b"));
+        assert!(!reaction_emoji_valid("?!"), "pure ASCII punctuation rejects");
         // Trim-then-validate: whitespace around a cluster is fine (the
         // send path trims before building the body).
         assert!(reaction_emoji_valid(" \u{1f44d} "));
