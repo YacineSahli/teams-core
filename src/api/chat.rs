@@ -344,6 +344,158 @@ fn prose_html(text: &str) -> String {
         .replace('\n', "<br>")
 }
 
+/// Inline composer markers → wire HTML, one LINE at a time (markers do
+/// not span lines; an unclosed run stays literal so the author sees it).
+/// Supported shapes, chosen to round-trip with the client renderer AND
+/// native Teams:
+///   `**bold**`   → `<strong>`
+///   `_italic_`   → `<em>`   (single `*` is NOT an italic marker: the
+///                            tenant's dominant incoming shape reads
+///                            `*x*` as Jira-wiki BOLD)
+///   `~~strike~~` → `<s>`
+///   `` `code` `` → `<code>` (interiors exempt from every other marker)
+///   `[t](url)`   → `<a href>` (http/https only, no spaces/quotes)
+/// `_…_` additionally requires word boundaries on both sides —
+/// `snake_case_ident` must stay literal.
+fn markdown_inline_html(line: &str) -> String {
+    // Escaped plain run between markers (nothing further to convert).
+    fn plain(out: &mut String, s: &str) {
+        out.push_str(&html_escape(s));
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::new();
+    let mut run = String::new(); // plain chars before the next marker
+    let mut i = 0usize; // CHAR index
+    macro_rules! flush {
+        () => {
+            plain(&mut out, &std::mem::take(&mut run));
+        };
+    }
+    while i < chars.len() {
+        let c = chars[i];
+        let line_end = i + 1 >= chars.len();
+        // Inline code: the only marker that may hide the others.
+        if c == '`' {
+            // Closing backtick later on this line (skip ``` fence-lookalikes:
+            // they are prose here; fences were consumed upstream).
+            let rest_str: String = chars[i + 1..].iter().collect();
+            if let Some(close_rel) = rest_str.find('`') {
+                let interior: String = chars[i + 1..i + 1 + close_rel].iter().collect();
+                if !chars[i + 1].eq(&'`') && !interior.trim().is_empty() {
+                    flush!();
+                    out.push_str("<code>");
+                    plain(&mut out, &interior);
+                    out.push_str("</code>");
+                    i += close_rel + 2;
+                    continue;
+                }
+            }
+            run.push('`');
+            i += 1;
+            continue;
+        }
+        // Link [text](url)
+        if c == '[' {
+            let rest: String = chars[i..].iter().collect();
+            if let Some(close) = rest.find("](") {
+                if let Some(end_rel) = rest[close + 2..].find(')') {
+                    let text: String = rest[1..close].to_string();
+                    let url: &str = &rest[close + 2..close + 2 + end_rel];
+                    let url_ok = (url.starts_with("https://") || url.starts_with("http://"))
+                        && !url.contains(char::is_whitespace)
+                        && !url.contains(['"', '<', '>']);
+                    if url_ok && !text.contains('[') && !text.contains(']') {
+                        flush!();
+                        out.push_str(&format!(
+                            "<a href=\"{}\">",
+                            url.replace('&', "&amp;").replace('"', "&quot;")
+                        ));
+                        plain(&mut out, &text);
+                        out.push_str("</a>");
+                        i += rest[..close + 2 + end_rel + 1].chars().count();
+                        continue;
+                    }
+                }
+            }
+            run.push('[');
+            i += 1;
+            continue;
+        }
+        // Emphasis runs: **bold**, _italic_, ~~strike~~
+        let run_of = |two: &str| -> bool { !line_end && chars[i + 1].to_string() == two };
+        if c == '*' && run_of("*") {
+            let rest: String = chars[i + 2..].iter().collect();
+            if let Some(close) = rest.find("**") {
+                let inner = &rest[..close];
+                if !inner.trim().is_empty() && !inner.starts_with(char::is_whitespace) {
+                    flush!();
+                    out.push_str("<strong>");
+                    plain(&mut out, inner);
+                    out.push_str("</strong>");
+                    i += 2 + inner.chars().count() + 2;
+                    continue;
+                }
+            }
+            run.push_str("**");
+            i += 2;
+            continue;
+        }
+        if c == '~' && run_of("~") {
+            let rest: String = chars[i + 2..].iter().collect();
+            if let Some(close) = rest.find("~~") {
+                let inner = &rest[..close];
+                if !inner.trim().is_empty() && !inner.starts_with(char::is_whitespace) {
+                    flush!();
+                    out.push_str("<s>");
+                    plain(&mut out, inner);
+                    out.push_str("</s>");
+                    i += 2 + inner.chars().count() + 2;
+                    continue;
+                }
+            }
+            run.push_str("~~");
+            i += 2;
+            continue;
+        }
+        if c == '_' && !line_end && chars[i + 1] != '_' {
+            // Word boundaries on both sides of the whole _…_ span.
+            let before_word = i
+                .checked_sub(1)
+                .map(|p| chars[p].is_alphanumeric())
+                .unwrap_or(false);
+            let rest: String = chars[i + 1..].iter().collect();
+            let mut matched = false;
+            if !before_word {
+                if let Some(close) = rest.find('_') {
+                    let inner = &rest[..close];
+                    let after = rest[close + 1..].chars().next();
+                    let after_word = after.map(|a| a.is_alphanumeric()).unwrap_or(false);
+                    if !inner.trim().is_empty()
+                        && !after_word
+                        && !inner.starts_with(char::is_whitespace)
+                    {
+                        flush!();
+                        out.push_str("<em>");
+                        plain(&mut out, inner);
+                        out.push_str("</em>");
+                        i += 1 + inner.chars().count() + 1;
+                        matched = true;
+                    }
+                }
+            }
+            if !matched {
+                run.push('_');
+                i += 1;
+            }
+            continue;
+        }
+        run.push(c);
+        i += 1;
+    }
+    flush!();
+    out
+}
+
 /// Max fenced code blocks parsed per outbound message (hostile-input
 /// cap, mirrors Swift `CodeBlocks.maxBlocks`); extra fences stay prose.
 pub const WIRE_FENCE_MAX_BLOCKS: usize = 50;
@@ -390,9 +542,10 @@ fn wire_fence_closer(line: &str, ch: char, len: usize) -> bool {
 /// interiors byte-exact modulo HTML-escaping. Unclosed fences run to
 /// end of text (Swift `CodeBlocks` parity).
 pub fn build_message_html(message: &str) -> String {
-    if !message.lines().any(|l| wire_fence_opener(l).is_some()) {
-        return format!("<p>{}</p>", prose_html(message));
-    }
+    // (Historical early return: fence-less messages once took a literal
+    // single-<p> shape. The inline-marker pass now runs for every prose
+    // chunk; marker-free text still emits the byte-identical legacy
+    // shape, verified by wire_prose_unchanged_single_p.)
     enum Seg {
         Prose(String),
         Code(String),
@@ -437,9 +590,52 @@ pub fn build_message_html(message: &str) -> String {
             Seg::Prose(t) => {
                 // Whitespace-only prose renders blank either way; skip it
                 // so whole-message fences emit a lone <pre>.
-                if !t.trim().is_empty() {
-                    out.push_str(&format!("<p>{}</p>", prose_html(&t)));
+                if t.trim().is_empty() {
+                    continue;
                 }
+                // Bullet runs: consecutive "- " lines become one <ul>
+                // (native Teams list markup); plain lines keep the legacy
+                // <p>+<br> shape. A lone "-" or "-x" stays prose.
+                let mut pending_list: Vec<String> = Vec::new();
+                let mut para: Vec<&str> = Vec::new();
+                let flush_para = |para: &mut Vec<&str>, out: &mut String| {
+                    if !para.is_empty() {
+                        let converted: Vec<String> =
+                            para.iter().map(|l| markdown_inline_html(l)).collect();
+                        out.push_str(&format!("<p>{}</p>", converted.join("<br>")));
+                        para.clear();
+                    }
+                };
+                let flush_list = |pending: &mut Vec<String>, out: &mut String| {
+                    if !pending.is_empty() {
+                        let items: Vec<String> = pending
+                            .iter()
+                            .map(|item| format!("<li>{}</li>", markdown_inline_html(item)))
+                            .collect();
+                        out.push_str(&format!("<ul>{}</ul>", items.join("")));
+                        pending.clear();
+                    }
+                };
+                for line in t.split('\n') {
+                    // prose_html normalized \r\n first; keep that here.
+                    let line = line.strip_suffix('\r').unwrap_or(line);
+                    let bullet = line
+                        .strip_prefix("- ")
+                        .filter(|item| !item.trim().is_empty());
+                    if let Some(item) = bullet {
+                        // Close only the running paragraph — the list
+                        // stays open for the next bullet line.
+                        flush_para(&mut para, &mut out);
+                        pending_list.push(item.to_string());
+                    } else {
+                        // Non-bullet line: close any open list, then the
+                        // line joins the running paragraph.
+                        flush_list(&mut pending_list, &mut out);
+                        para.push(line);
+                    }
+                }
+                flush_para(&mut para, &mut out);
+                flush_list(&mut pending_list, &mut out);
             }
             Seg::Code(t) => out.push_str(&format!("<pre>{}</pre>", html_escape(&t))),
         }
@@ -3876,13 +4072,83 @@ src="x">"#));
             build_message_html("a<b>&\"'\nline2  indented"),
             "<p>a&lt;b&gt;&amp;&quot;&#39;<br>line2  indented</p>"
         );
-        // Inline backticks and short runs are not fences.
-        assert_eq!(build_message_html("use `x` here"), "<p>use `x` here</p>");
+        // Short runs are not fences; single backticks are now INLINE CODE
+        // (run-7 composer formatting — the wire carries <code>).
         assert_eq!(build_message_html("a\n``\nb"), "<p>a<br>``<br>b</p>");
-        // Info string containing the fence char: not a fence (CommonMark).
+        // Info string containing the fence char: not a fence (CommonMark)
+        // — the line stays prose, where inline `code` rules then apply.
         assert_eq!(
             build_message_html("``` `x` ```\nstill prose"),
-            "<p>``` `x` ```<br>still prose</p>"
+            "<p>``` <code>x</code> ```<br>still prose</p>"
+        );
+        // Marker-free text stays byte-identical to the legacy shape.
+        assert_eq!(build_message_html("plain prose only"), "<p>plain prose only</p>");
+    }
+
+    #[test]
+    fn wire_inline_markers_become_html() {
+        // Bold / italic / strike round-trip: **→<strong>, _→<em>
+        // (single * stays literal — incoming Jira-wiki reads *x* as bold),
+        // ~~→<s>.
+        assert_eq!(
+            build_message_html("a **bold** b"),
+            "<p>a <strong>bold</strong> b</p>"
+        );
+        assert_eq!(
+            build_message_html("_it_ and ~~gone~~"),
+            "<p><em>it</em> and <s>gone</s></p>"
+        );
+        assert_eq!(build_message_html("2 * 3 * 4"), "<p>2 * 3 * 4</p>");
+        // Word boundaries: snake_case and trailing_ stay literal.
+        assert_eq!(
+            build_message_html("snake_case_ident stays"),
+            "<p>snake_case_ident stays</p>"
+        );
+        // Inline code hides markers; unbalanced runs stay literal.
+        assert_eq!(
+            build_message_html("use `**x**` and `y` ok"),
+            "<p>use <code>**x**</code> and <code>y</code> ok</p>"
+        );
+        assert_eq!(
+            build_message_html("a **unclosed b"),
+            "<p>a **unclosed b</p>"
+        );
+        // Links: http(s) only, text and URL escaped.
+        assert_eq!(
+            build_message_html("see [docs](https://x.io/a?b=1&c=2) now"),
+            "<p>see <a href=\"https://x.io/a?b=1&amp;c=2\">docs</a> now</p>"
+        );
+        assert_eq!(
+            build_message_html("[x](javascript:alert(1)) stays"),
+            "<p>[x](javascript:alert(1)) stays</p>"
+        );
+        // Markers never span lines.
+        assert_eq!(
+            build_message_html("**a\nb**"),
+            "<p>**a<br>b**</p>"
+        );
+        // Escaping applies inside marker bodies.
+        assert_eq!(
+            build_message_html("**a<b>&c**"),
+            "<p><strong>a&lt;b&gt;&amp;c</strong></p>"
+        );
+    }
+
+    #[test]
+    fn wire_bullet_runs_become_ul() {
+        assert_eq!(
+            build_message_html("- one\n- two **b**"),
+            "<ul><li>one</li><li>two <strong>b</strong></li></ul>"
+        );
+        // Prose before/after the list keeps its <p> shape and order.
+        assert_eq!(
+            build_message_html("intro:\n- a\n- b\noutro"),
+            "<p>intro:</p><ul><li>a</li><li>b</li></ul><p>outro</p>"
+        );
+        // Lone dash / "-x" / trailing "- " stay prose.
+        assert_eq!(
+            build_message_html("- \n-x\n-"),
+            "<p>- <br>-x<br>-</p>"
         );
     }
 
