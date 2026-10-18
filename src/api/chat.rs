@@ -377,17 +377,22 @@ fn markdown_inline_html(line: &str) -> String {
         // Inline code: the only marker that may hide the others.
         if c == '`' {
             // Closing backtick later on this line (skip ``` fence-lookalikes:
-            // they are prose here; fences were consumed upstream).
-            let rest_str: String = chars[i + 1..].iter().collect();
-            if let Some(close_rel) = rest_str.find('`') {
-                let interior: String = chars[i + 1..i + 1 + close_rel].iter().collect();
-                if !chars[i + 1].eq(&'`') && !interior.trim().is_empty() {
-                    flush!();
-                    out.push_str("<code>");
-                    plain(&mut out, &interior);
-                    out.push_str("</code>");
-                    i += close_rel + 2;
-                    continue;
+            // they are prose here; fences were consumed upstream). The
+            // close position is a CHAR index (byte offsets from str::find
+            // panic the char cursor on multi-byte interiors — `éé` killed
+            // the whole backend thread; adversarial review P1).
+            let close_rel = chars[i + 1..].iter().position(|&ch| ch == '`');
+            if let Some(close_rel) = close_rel {
+                if chars[i + 1] != '`' {
+                    let interior: String = chars[i + 1..i + 1 + close_rel].iter().collect();
+                    if !interior.trim().is_empty() {
+                        flush!();
+                        out.push_str("<code>");
+                        plain(&mut out, &interior);
+                        out.push_str("</code>");
+                        i += close_rel + 2;
+                        continue;
+                    }
                 }
             }
             run.push('`');
@@ -4126,6 +4131,17 @@ src="x">"#));
         assert_eq!(
             build_message_html("**a\nb**"),
             "<p>**a<br>b**</p>"
+        );
+        // Multi-byte interiors: byte offsets from str::find used to
+        // panic the char cursor (`éé` killed the backend thread).
+        assert_eq!(build_message_html("`éé`"), "<p><code>éé</code></p>");
+        assert_eq!(
+            build_message_html("`café` tail"),
+            "<p><code>café</code> tail</p>"
+        );
+        assert_eq!(
+            build_message_html("`😀😀` ok"),
+            "<p><code>😀😀</code> ok</p>"
         );
         // Escaping applies inside marker bodies.
         assert_eq!(
