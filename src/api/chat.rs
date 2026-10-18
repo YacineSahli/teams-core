@@ -1186,6 +1186,38 @@ pub fn emoji_for_reaction_type(reaction_type: &str) -> Option<&'static str> {
         .map(|(e, _)| *e)
 }
 
+/// Emoji for any server reaction KEY: a classic word ("like") maps
+/// through the table; anything else parses leading 4-5 hex codepoint
+/// runs ("1f389_partypopper" → 🎉, "2764_fe0f_heart" → ❤️ — VS16 is hex
+/// too, so composed clusters survive). Live-verified storage shape for
+/// unicode reactions (run-8 probe).
+pub fn reaction_emoji_for_key(key: &str) -> Option<String> {
+    if let Some(e) = emoji_for_reaction_type(key) {
+        return Some(e.to_string());
+    }
+    let mut cps = String::new();
+    for seg in key.split('_') {
+        if (4..=5).contains(&seg.len()) && seg.chars().all(|c| c.is_ascii_hexdigit()) {
+            let cp = u32::from_str_radix(seg, 16).ok()?;
+            cps.push(char::from_u32(cp)?);
+        } else {
+            break;
+        }
+    }
+    (!cps.is_empty()).then_some(cps)
+}
+
+/// Loose validity for a reaction the user wants to SEND: the wire takes
+/// any unicode emoji (probed live); reject whitespace/garbage/essays so
+/// typos fail locally with a clear error instead of a server 400.
+pub fn reaction_emoji_valid(emoji: &str) -> bool {
+    let t = emoji.trim();
+    !t.is_empty()
+        && t.chars().count() <= 32
+        && !t.chars().any(char::is_whitespace)
+        && t.chars().next().is_some_and(|c| !c.is_ascii_alphanumeric())
+}
+
 /// Graph POST path for adding a reaction to one message. The native
 /// chat-service `/reactions` sub-resource 404s for every type — probed
 /// live (even 'like' on an own 1:1 message), and better-teams' vendored
@@ -1258,10 +1290,12 @@ pub async fn send_reaction_with_client(
     message_id: &str,
     emoji: &str,
 ) -> Result<()> {
-    let reaction_type = reaction_type_for_emoji(emoji)
-        .with_context(|| format!("unsupported reaction emoji: {}", emoji))?;
+    let emoji = emoji.trim();
+    if !reaction_emoji_valid(emoji) {
+        bail!("unsupported reaction emoji: {}", emoji);
+    }
     let path = reaction_set_path(chat_id, message_id);
-    tracing::debug!("Adding {} reaction via Graph {}", reaction_type, path);
+    tracing::debug!("Adding {} reaction via Graph {}", emoji, path);
     client.graph_post(&path, &reaction_body(emoji)).await?;
     Ok(())
 }
@@ -1274,10 +1308,12 @@ pub async fn remove_reaction_with_client(
     message_id: &str,
     emoji: &str,
 ) -> Result<()> {
-    let reaction_type = reaction_type_for_emoji(emoji)
-        .with_context(|| format!("unsupported reaction emoji: {}", emoji))?;
+    let emoji = emoji.trim();
+    if !reaction_emoji_valid(emoji) {
+        bail!("unsupported reaction emoji: {}", emoji);
+    }
     let path = reaction_unset_path(chat_id, message_id);
-    tracing::debug!("Removing {} reaction via Graph {}", reaction_type, path);
+    tracing::debug!("Removing {} reaction via Graph {}", emoji, path);
     client.graph_post(&path, &reaction_body(emoji)).await?;
     Ok(())
 }
@@ -1681,29 +1717,55 @@ pub fn reaction_counts_from_values(
             }
         }
     };
+    // Dynamic (non-classic) reactions: unicode emoji stored under
+    // codepoint-name keys ("1f389_partypopper") — appended after the
+    // classics in first-seen order.
+    let mut extra: Vec<(String, usize, Vec<Reactor>)> = Vec::new();
+    let mut extra_push = |emoji: String, r: Option<Reactor>| {
+        if let Some(slot) = extra.iter_mut().find(|(e, _, _)| *e == emoji) {
+            slot.1 += 1;
+            if let Some(r) = r {
+                if !slot.2.iter().any(|x| x.id.eq_ignore_ascii_case(&r.id)) {
+                    slot.2.push(r);
+                }
+            }
+        } else {
+            extra.push((emoji, 1, r.into_iter().collect()));
+        }
+    };
     if let Some(list) = reactions.and_then(as_array_lenient) {
         for e in &list {
             let Some(o) = e.as_object() else { continue };
             let Some(t) = obj_str_ci(o, "reactionType") else { continue };
             if let Some(i) = reaction_index(&t) {
                 push(i, graph_reactor(o));
+            } else if let Some(emoji) = reaction_emoji_for_key(&t) {
+                extra_push(emoji, graph_reactor(o));
             }
         }
     } else if let Some(list) = emotions.and_then(as_array_lenient) {
         for e in &list {
             let Some(o) = e.as_object() else { continue };
             let Some(t) = obj_str_ci(o, "key") else { continue };
-            let Some(i) = reaction_index(&t) else { continue };
             let users = obj_get_ci(o, "users").and_then(as_array_lenient).unwrap_or_default();
-            for u in &users {
-                let Some(uo) = u.as_object() else { continue };
-                let id = obj_str_ci(uo, "mri").or_else(|| obj_str_ci(uo, "id"));
-                let name = obj_str_ci(uo, "displayName").unwrap_or_default();
-                push(i, id.map(|id| Reactor { id, name }));
+            if let Some(i) = reaction_index(&t) {
+                for u in &users {
+                    let Some(uo) = u.as_object() else { continue };
+                    let id = obj_str_ci(uo, "mri").or_else(|| obj_str_ci(uo, "id"));
+                    let name = obj_str_ci(uo, "displayName").unwrap_or_default();
+                    push(i, id.map(|id| Reactor { id, name }));
+                }
+            } else if let Some(emoji) = reaction_emoji_for_key(&t) {
+                for u in &users {
+                    let Some(uo) = u.as_object() else { continue };
+                    let id = obj_str_ci(uo, "mri").or_else(|| obj_str_ci(uo, "id"));
+                    let name = obj_str_ci(uo, "displayName").unwrap_or_default();
+                    extra_push(emoji.clone(), id.map(|id| Reactor { id, name }));
+                }
             }
         }
     }
-    REACTION_EMOJI
+    let mut out: Vec<ReactionCount> = REACTION_EMOJI
         .iter()
         .zip(counts.into_iter().zip(reactors))
         .filter(|(_, (c, _))| *c > 0)
@@ -1712,7 +1774,13 @@ pub fn reaction_counts_from_values(
             count,
             reactors,
         })
-        .collect()
+        .collect();
+    out.extend(
+        extra
+            .into_iter()
+            .map(|(emoji, count, reactors)| ReactionCount { emoji, count, reactors }),
+    );
+    out
 }
 
 /// Reaction entries for one message: top-level `reactions` wins, then
@@ -3721,6 +3789,54 @@ src="x">"#));
         assert_eq!(reaction_type_for_emoji(""), None);
         assert_eq!(emoji_for_reaction_type("party"), None);
         assert_eq!(emoji_for_reaction_type("LIKE"), Some("👍"));
+    }
+
+    #[test]
+    fn unicode_reaction_keys_parse() {
+        // Live storage shape for unicode reactions (run-8 probe).
+        assert_eq!(
+            reaction_emoji_for_key("1f389_partypopper").as_deref(),
+            Some("\u{1f389}")
+        );
+        // VS16 is hex too — composed clusters survive.
+        assert_eq!(reaction_emoji_for_key("2764_fe0f_heart").as_deref(), Some("\u{2764}\u{fe0f}"));
+        // Classic words map through the table.
+        assert_eq!(reaction_emoji_for_key("heart").as_deref(), Some("\u{2764}\u{fe0f}"));
+        assert_eq!(reaction_emoji_for_key("LIKE").as_deref(), Some("\u{1f44d}"));
+        // No leading hex runs → unknown.
+        assert_eq!(reaction_emoji_for_key("partypopper"), None);
+        assert_eq!(reaction_emoji_for_key(""), None);
+    }
+
+    #[test]
+    fn reaction_send_gate_is_loose_but_sane() {
+        assert!(reaction_emoji_valid("\u{1f389}"));
+        assert!(reaction_emoji_valid("  \u{1f44d}  ")); // trimmed
+        assert!(!reaction_emoji_valid(""));
+        assert!(!reaction_emoji_valid("like")); // ascii words rejected
+        assert!(!reaction_emoji_valid("a b"));
+        // Trim-then-validate: whitespace around a cluster is fine (the
+        // send path trims before building the body).
+        assert!(reaction_emoji_valid(" \u{1f44d} "));
+        assert!(!reaction_emoji_valid("\u{1f44d} x"), "inner whitespace rejects");
+    }
+
+    #[test]
+    fn emotions_with_unicode_key_group_dynamically() {
+        let emotions = serde_json::json!([
+            {"key": "like", "users": [{"mri": "8:orgid:a"}]},
+            {"key": "1f389_partypopper", "users": [{"mri": "8:orgid:b"}, {"mri": "8:orgid:c"}]},
+            {"key": "like", "users": []}
+        ]);
+        let counts = reaction_counts_from_values(None, Some(&emotions));
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts[0].emoji, "\u{1f44d}");
+        assert_eq!(counts[0].count, 1);
+        assert_eq!(counts[1].emoji, "\u{1f389}");
+        assert_eq!(counts[1].count, 2, "both users grouped under the parsed emoji");
+        // Classic canonical order stays ahead of dynamic entries.
+        assert_eq!(counts[0].reactors.len(), 1);
+        assert_eq!(counts[1].reactors.len(), 2);
     }
 
     #[test]

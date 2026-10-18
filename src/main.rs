@@ -83,7 +83,7 @@ enum Commands {
         reply_to: Option<String>,
     },
 
-    /// Add an emoji reaction to a message (one of 👍 ❤️ 😂 😮 😢 😠)
+    /// Add an emoji reaction to a message (any single emoji, e.g. 👍 ❤️ 🎉)
     React {
         /// Chat thread ID (from `chats` output)
         #[arg(short, long)]

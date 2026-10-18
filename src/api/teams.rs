@@ -739,7 +739,7 @@ pub async fn set_channel_reaction_data(
     check_id("team_id", team_id)?;
     check_id("channel_id", channel_id)?;
     check_id("message_id", message_id)?;
-    if super::chat::reaction_type_for_emoji(emoji.trim()).is_none() {
+    if !super::chat::reaction_emoji_valid(emoji) {
         bail!("unsupported reaction emoji: {}", emoji);
     }
     let path = match reply_id {
@@ -766,7 +766,7 @@ pub async fn unset_channel_reaction_data(
     check_id("team_id", team_id)?;
     check_id("channel_id", channel_id)?;
     check_id("message_id", message_id)?;
-    if super::chat::reaction_type_for_emoji(emoji.trim()).is_none() {
+    if !super::chat::reaction_emoji_valid(emoji) {
         bail!("unsupported reaction emoji: {}", emoji);
     }
     let path = match reply_id {
