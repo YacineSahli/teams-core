@@ -1186,11 +1186,17 @@ pub fn emoji_for_reaction_type(reaction_type: &str) -> Option<&'static str> {
         .map(|(e, _)| *e)
 }
 
-/// POST target for adding a reaction to one message.
-pub fn reaction_add_url(base: &str, chat_id: &str, message_id: &str) -> String {
+/// Graph POST path for adding a reaction to one message. The native
+/// chat-service `/reactions` sub-resource 404s for every type — probed
+/// live (even 'like' on an own 1:1 message), and better-teams' vendored
+/// ost carries the same unverified Graph-mirrored guess (their
+/// OSTMAC-PATCHES ledger #28 says so). Graph `setReaction`/`unsetReaction`
+/// (v1.0, delegated `ChatMessage.Send`) is the documented write path.
+pub fn reaction_set_path(chat_id: &str, message_id: &str) -> String {
     format!(
-        "{}/v1/users/ME/conversations/{}/messages/{}/reactions",
-        base, chat_id, message_id
+        "/chats/{}/messages/{}/setReaction",
+        encode_uri_component(chat_id),
+        message_id
     )
 }
 
@@ -1227,21 +1233,20 @@ pub fn message_delete_url(base: &str, chat_id: &str, message_id: &str) -> String
     )
 }
 
-/// POST body for adding a reaction.
-pub fn reaction_add_body(reaction_type: &str) -> serde_json::Value {
-    serde_json::json!({ "reactionType": reaction_type })
+/// Body for both Graph reaction endpoints (set and unset take the same
+/// `reactionType` field). The value is the UNICODE EMOJI, not the word:
+/// the live endpoint rejects ASCII words with "Unicode 'like' in the
+/// payload is not supported" (probed 2026-10-18).
+pub fn reaction_body(emoji: &str) -> serde_json::Value {
+    serde_json::json!({ "reactionType": emoji })
 }
 
-/// DELETE target for removing one reaction type from a message.
-pub fn reaction_remove_url(
-    base: &str,
-    chat_id: &str,
-    message_id: &str,
-    reaction_type: &str,
-) -> String {
+/// Graph POST path for removing one reaction type from a message.
+pub fn reaction_unset_path(chat_id: &str, message_id: &str) -> String {
     format!(
-        "{}/v1/users/ME/conversations/{}/messages/{}/reactions/{}",
-        base, chat_id, message_id, reaction_type
+        "/chats/{}/messages/{}/unsetReaction",
+        encode_uri_component(chat_id),
+        message_id
     )
 }
 
@@ -1255,11 +1260,9 @@ pub async fn send_reaction_with_client(
 ) -> Result<()> {
     let reaction_type = reaction_type_for_emoji(emoji)
         .with_context(|| format!("unsupported reaction emoji: {}", emoji))?;
-    let base = client.chat_service_url();
-    let url = reaction_add_url(&base, chat_id, message_id);
-    let body = reaction_add_body(reaction_type);
-    tracing::debug!("Adding {} reaction to {}", reaction_type, url);
-    client.chat_post(&url, &body).await?;
+    let path = reaction_set_path(chat_id, message_id);
+    tracing::debug!("Adding {} reaction via Graph {}", reaction_type, path);
+    client.graph_post(&path, &reaction_body(emoji)).await?;
     Ok(())
 }
 
@@ -1273,10 +1276,9 @@ pub async fn remove_reaction_with_client(
 ) -> Result<()> {
     let reaction_type = reaction_type_for_emoji(emoji)
         .with_context(|| format!("unsupported reaction emoji: {}", emoji))?;
-    let base = client.chat_service_url();
-    let url = reaction_remove_url(&base, chat_id, message_id, reaction_type);
-    tracing::debug!("Removing {} reaction from {}", reaction_type, url);
-    client.chat_delete(&url, None).await?;
+    let path = reaction_unset_path(chat_id, message_id);
+    tracing::debug!("Removing {} reaction via Graph {}", reaction_type, path);
+    client.graph_post(&path, &reaction_body(emoji)).await?;
     Ok(())
 }
 
@@ -3723,18 +3725,20 @@ src="x">"#));
 
     #[test]
     fn reaction_endpoint_shapes() {
-        let base = "https://h";
+        // Graph setReaction/unsetReaction paths; the chat id must be
+        // URI-encoded (a raw ':' would break the path) but the numeric
+        // message id passes through.
         assert_eq!(
-            reaction_add_url(base, "19:thread", "42"),
-            "https://h/v1/users/ME/conversations/19:thread/messages/42/reactions"
+            reaction_set_path("19:meeting_x@thread.v2", "42"),
+            "/chats/19%3Ameeting_x%40thread.v2/messages/42/setReaction"
         );
         assert_eq!(
-            reaction_add_body("like"),
-            serde_json::json!({ "reactionType": "like" })
+            reaction_unset_path("19:thread", "42"),
+            "/chats/19%3Athread/messages/42/unsetReaction"
         );
         assert_eq!(
-            reaction_remove_url(base, "19:thread", "42", "like"),
-            "https://h/v1/users/ME/conversations/19:thread/messages/42/reactions/like"
+            reaction_body("👍"),
+            serde_json::json!({ "reactionType": "👍" })
         );
     }
 
