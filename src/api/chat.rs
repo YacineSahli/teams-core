@@ -357,7 +357,63 @@ fn prose_html(text: &str) -> String {
 ///   `[t](url)`   → `<a href>` (http/https only, no spaces/quotes)
 /// `_…_` additionally requires word boundaries on both sides —
 /// `snake_case_ident` must stay literal.
+///
+/// TENANT CUSTOM EMOJI pass through verbatim: the edit path re-emits the
+/// wire's CustomEmoji img tag as the marker form (segs_to_markers), and
+/// an edit must not eat the emoji. Only the exact safe shape passes
+/// (CustomEmoji itemtype, https src, conservative charsets); every other
+/// raw tag keeps escaping as text.
 fn markdown_inline_html(line: &str) -> String {
+    if !line.contains("<img ") {
+        return markdown_inline_html_inner(line);
+    }
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(pos) = rest.find("<img ") {
+        let close = match rest[pos..].find('>') {
+            Some(c) => pos + c,
+            None => break,
+        };
+        let tag = &rest[pos..=close];
+        if custom_emoji_tag_safe(tag) {
+            out.push_str(&markdown_inline_html_inner(&rest[..pos]));
+            out.push_str(tag);
+        } else {
+            // Unsafe tag: convert its text prefix; the tag itself goes
+            // through the inner converter, which escapes it.
+            out.push_str(&markdown_inline_html_inner(&rest[..pos]));
+            out.push_str(&markdown_inline_html_inner(tag));
+        }
+        rest = &rest[close + 1..];
+    }
+    out.push_str(&markdown_inline_html_inner(rest));
+    out
+}
+
+/// Strict CustomEmoji img shape check for the passthrough above.
+fn custom_emoji_tag_safe(tag: &str) -> bool {
+    let attr = |key: &str| -> Option<String> {
+        let pat = format!("{key}=\"");
+        let p = tag.find(&pat)? + pat.len();
+        let e = tag[p..].find('"')? + p;
+        Some(tag[p..e].to_string())
+    };
+    let alt = attr("alt").unwrap_or_default();
+    let src = attr("src").unwrap_or_default();
+    let itemtype_ok = tag.contains("itemtype=\"http://schema.skype.com/CustomEmoji\"");
+    let alt_ok = !alt.is_empty()
+        && alt.len() <= 64
+        && alt
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' '));
+    let src_ok = src.starts_with("https://")
+        && src
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~'));
+    itemtype_ok && alt_ok && src_ok
+}
+
+fn markdown_inline_html_inner(line: &str) -> String {
     // Escaped plain run between markers (nothing further to convert).
     fn plain(out: &mut String, s: &str) {
         out.push_str(&html_escape(s));
@@ -4394,6 +4450,28 @@ src="x">"#));
     // wire-pre lane: fenced blocks go out as <pre> (other clients keep
     // indents); prose keeps the legacy single-<p> shape with explicit
     // <br> breaks (a raw \n inside <p> is whitespace per HTML).
+
+    /// CustomEmoji img tags survive the composer round-trip verbatim
+    /// (edit path); every other raw tag still escapes.
+    #[test]
+    fn custom_emoji_tag_passthrough() {
+        let tag = "<img alt=\"sadcat1\" itemid=\"sadcat1;0-csea-x\" itemtype=\"http://schema.skype.com/CustomEmoji\" src=\"https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-csea-x/views/imgt2_anim\" style=\"width:20px; height:20px\">";
+        let html = super::build_message_html(&format!("hi {tag} there"));
+        assert!(
+            html.contains(tag),
+            "custom emoji tag must pass through verbatim, got: {html}"
+        );
+        // Markers still convert around it.
+        assert!(html.starts_with("<p>") || html.contains("hi"));
+        // Non-custom img tags do NOT pass through.
+        let evil = "<img src=\"javascript:alert(1)\" onerror=\"x\">";
+        let html2 = super::build_message_html(&format!("a {evil} b"));
+        assert!(!html2.contains("<img"), "unsafe img escapes: {html2}");
+        // Broken/custom-shaped-but-bad-src also escapes.
+        let bad = "<img alt=\"ok name\" itemtype=\"http://schema.skype.com/CustomEmoji\" src=\"http://x/y\">";
+        let html3 = super::build_message_html(bad);
+        assert!(!html3.contains("<img"), "non-https src escapes: {html3}");
+    }
 
     #[test]
     fn wire_prose_unchanged_single_p() {
