@@ -2109,6 +2109,15 @@ fn is_onetoone_id(chat_id: &str) -> bool {
     chat_id.starts_with("19:") && !chat_id.contains("@thread") && !chat_id.contains("meeting")
 }
 
+/// Consumer 1:1s: 19:…@thread.v2 with threadType "chat" (personal
+/// profiles only — work @thread.v2 ids are channels/meetings).
+fn is_onetoone(chat_id: &str, thread_type: Option<&str>, personal: bool) -> bool {
+    if !personal {
+        return is_onetoone_id(chat_id);
+    }
+    is_onetoone_id(chat_id) || thread_type == Some("chat")
+}
+
 /// Mate display name for a 1:1 chat, resolved via MRI (om-chatnames):
 /// roster MRIs minus self leaves the mate; the mate's name is the
 /// newest message attributed to that MRI. `None` unless the roster
@@ -2134,13 +2143,19 @@ async fn resolve_mate_name(
     }
     let mate = mates[0].to_lowercase();
     let page = read_messages_page(client, chat_id, 25, None).await.ok()?;
-    page.messages
+    if let Some(name) = page
+        .messages
         .iter()
         .rev()
         .filter(|m| m.sender_mri.to_lowercase() == mate)
         .map(|m| m.sender.clone())
-        .filter(|s| !s.trim().is_empty() && s != "?")
-        .next()
+        .find(|s| !s.trim().is_empty() && s != "?")
+    {
+        return Some(name);
+    }
+    // Consumer messages attribute no display names — the MRI-derived
+    // roster name is the mate label.
+    consumer_display_name(&mate)
 }
 
 // ---------------------------------------------------------------------------
@@ -3010,20 +3025,18 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
             .and_then(|p| p.topic.as_deref())
             .map(|t| t.trim().is_empty())
             .unwrap_or(true);
-        if topic_missing && is_onetoone_id(&id) {
+        let thread_type = conv
+            .thread_properties
+            .as_ref()
+            .and_then(|p| p.thread_type.as_deref());
+        if topic_missing && is_onetoone(&id, thread_type, personal) {
             needs_mate.push((chats.len(), ci));
         }
         // Consumer 1:1s live under @thread.v2 ids — the work-era
         // "contains thread" heuristic would read every consumer chat as
         // a group. threadType "chat" on a personal profile = 1:1.
-        let is_group = if personal
-            && conv.thread_properties.as_ref().and_then(|p| p.thread_type.as_deref())
-                == Some("chat")
-        {
-            false
-        } else {
-            id.contains("thread") || id.contains("meeting")
-        };
+        let is_group = !is_onetoone(&id, thread_type, personal)
+            && (id.contains("thread") || id.contains("meeting"));
 
         let (last_time, last_sender, last_preview) = if let Some(ref msg) = conv.last_message {
             let time = msg
@@ -3090,7 +3103,13 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
         let me_id = if cached_only {
             Some(String::new())
         } else {
-            whoami_data(client).await.ok().map(|m| m.id)
+            // Consumer: identity is the 8:live: MRI (Graph whoami is
+            // absent there); mri_is_self matches on the full string.
+            whoami_data(client)
+                .await
+                .ok()
+                .map(|m| m.id)
+                .or_else(|| client.skypeid().map(|id| format!("8:{id}")))
         };
         if let Some(me_id) = me_id {
             let names = resolve_mates_cached(client, &ids, &me_id, &cache, now, MATE_CONCURRENCY).await;
