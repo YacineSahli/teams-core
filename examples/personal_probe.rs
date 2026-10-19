@@ -1,47 +1,84 @@
-//! Teams PERSONAL (consumer) account probe — how far the consumer path
-//! gets on our stack, with ONE device-code approval from a personal
-//! Microsoft account.
+//! Teams PERSONAL (consumer) account probe — consumer-path viability.
 //!
-//! Wire facts established 2026-10-19 (all pre-approval, free probes):
-//!   - v2 device code REJECTS api.spaces.skype.com for the consumer
-//!     client/tenant (AADSTS70011 "scope does not exist"); graph,
-//!     substrate and outlook v2 scopes ARE accepted.
-//!   - The **v1** device-code endpoint (resource= form param) is ALIVE
-//!     and ACCEPTS resource=https://api.spaces.skype.com (and
-//!     https://teams.live.com) for client 8ec6bc83… — v1 is the
-//!     consumer road.
-//!   - teams.live.com/api/auth/v1.0/authz/consumer answers Skype-family
-//!     error code 40110 "Invalid access token" for junk bearers (the
-//!     exchange teams-core implements but never calls with personal=true).
+//! Wire facts (2026-10-19, live runs + the consumer web client's own JS
+//! config, mined from its bundles):
+//!   - ESTS v2 scopes reject api.spaces.skype.com for the consumer
+//!     client; v1 mints it but the authz rejects those tokens (40110).
+//!   - v1 CANNOT mint `service::` resources (AADSTS500011).
+//!   - v2 CONSUMERS + scope `service::api.fl.spaces.skype.com::MBI_SSL`
+//!     (the web client's authzResource for MSA) MINTS a working token:
+//!     /api/auth/v1.0/authz/consumer answered **HTTP 200**.
+//!   - v2 verification page is microsoft.com/link (field
+//!     verification_uri, not v1's verification_url/login.microsoft.com).
 //!
-//! Chain this runs: v1 device code -> v1 token -> consumer authz ->
-//! native conversations GET with X-SkypeToken. Success = two free
-//! personal accounts can be the A<->B E2E messaging rig.
+//! The 200's body differs from the work shape (/tokens/skypeToken) —
+//! this probe dumps the response STRUCTURE (token values never printed)
+//! and uses the longest string as the X-SkypeToken candidate against
+//! the native chat list.
 //!
-//! Privacy: token LENGTHS and claim names only — never tokens. Chat
-//! output is structure (ids), not content.
+//! The refresh token persists to /tmp/tfl_personal_rt (0600) — reruns
+//! mint without another approval. Delete the file to re-provision.
 //!
-//! Run:  cargo run --example personal_probe
-//!       PERSONAL_RESOURCE=https://teams.live.com cargo run ...  (alt)
+//! Run: cargo run --example personal_probe
 
 use serde_json::Value;
 
 const CLIENT_ID: &str = "8ec6bc83-69c8-4392-8f08-b3c986009232";
-/// The consumer web client's MSA-native authz resource (from its JS
-/// config): authzResource = service::api.fl.spaces.skype.com::MBI_SSL.
+/// The consumer web client's MSA-native authz resource (its JS config:
+/// authzResource = service::api.fl.spaces.skype.com::MBI_SSL).
 const RESOURCE_DEFAULT: &str = "service::api.fl.spaces.skype.com::MBI_SSL";
+const RT_PATH: &str = "/tmp/tfl_personal_rt";
 
-/// JWT payload claims (aud/tid/iss only — no signature, no token body).
-fn jwt_claims(token: &str) -> Value {
-    use base64::Engine;
-    let payload = token.split('.').nth(1).unwrap_or("");
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .or_else(|_| {
-            base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload)
-        })
-        .unwrap_or_default();
-    serde_json::from_slice(&decoded).unwrap_or(Value::Null)
+const AUTHZ_ENDPOINTS: [&str; 3] = [
+    "https://teams.live.com/api/auth/v1.0/authz/consumer",
+    "https://teams.live.com/api/auth/v2.0/authz/consumer",
+    "https://teams.live.com/api/auth/v1.0/authzcore/consumer",
+];
+
+/// Recursive structure dump: keys, types, long strings as lengths only.
+fn dump_structure(indent: &str, v: &Value) {
+    match v {
+        Value::Object(m) => {
+            for (k, val) in m {
+                match val {
+                    Value::String(s) if s.len() > 80 => {
+                        println!("{indent}{k}: <string {} bytes>", s.len())
+                    }
+                    Value::String(s) => println!("{indent}{k}: {s:?}"),
+                    Value::Array(a) => println!("{indent}{k}: [array {}]", a.len()),
+                    Value::Object(_) => {
+                        println!("{indent}{k}: {{");
+                        dump_structure(&format!("{indent}  "), val);
+                        println!("{indent}}}");
+                    }
+                    other => println!("{indent}{k}: {other}"),
+                }
+            }
+        }
+        other => println!("{indent}(root) {other}"),
+    }
+}
+
+/// Longest string anywhere in the JSON (skype-token candidate).
+fn longest_string(v: &Value) -> Option<(String, String)> {
+    fn walk(v: &Value, path: &str, best: &mut Option<(usize, String, String)>) {
+        match v {
+            Value::Object(m) => {
+                for (k, val) in m {
+                    walk(val, &format!("{path}/{k}"), best);
+                }
+            }
+            Value::String(s) => {
+                if best.as_ref().is_none_or(|(l, _, _)| s.len() > *l) {
+                    *best = Some((s.len(), path.to_string(), s.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut best = None;
+    walk(v, "", &mut best);
+    best.map(|(_, p, s)| (p, s))
 }
 
 #[tokio::main]
@@ -50,32 +87,50 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("PERSONAL_RESOURCE").unwrap_or_else(|_| RESOURCE_DEFAULT.to_string());
     let http = reqwest::Client::new();
 
-    // v2 consumers is the endpoint that fronts MSA: it accepted the
-    // service:: scope at device-code time AND v1 cannot mint service::
-    // resources (AADSTS500011, live-run finding) — so the MSA-native
-    // token has to come from here (v1 fallback via PERSONAL_V1=1).
-    let v1 = std::env::var("PERSONAL_V1").is_ok();
-    println!("== 1. device code ({}: {resource}) ==", if v1 { "v1 common" } else { "v2 consumers" });
-    let dev: Value = if v1 {
-        http
-            .post("https://login.microsoftonline.com/common/oauth2/devicecode")
-            .form(&[("client_id", CLIENT_ID), ("resource", resource.as_str())])
-            .send()
-            .await?
-            .json()
-            .await?
-    } else {
-        http
-            .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode")
-            .form(&[
-                ("client_id", CLIENT_ID),
-                ("scope", &format!("{resource} offline_access")),
-            ])
-            .send()
-            .await?
-            .json()
-            .await?
-    };
+    // Saved RT: mint without another approval.
+    if let Ok(rt) = std::fs::read_to_string(RT_PATH) {
+        let rt = rt.trim().to_string();
+        if !rt.is_empty() {
+            println!("== 0. refreshing from saved RT ({RT_PATH}) ==");
+            let resp = http
+                .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+                .form(&[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", rt.as_str()),
+                    ("client_id", CLIENT_ID),
+                    ("scope", &format!("{resource} offline_access")),
+                ])
+                .send()
+                .await?;
+            let tok: Value = resp.json().await.unwrap_or(Value::Null);
+            if let Some(t) = tok.get("access_token").and_then(|v| v.as_str()) {
+                let new_rt = tok
+                    .get("refresh_token")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&rt)
+                    .to_string();
+                let _ = std::fs::write(RT_PATH, new_rt);
+                println!("  token refreshed ({} bytes)", t.len());
+                return authz_and_chat(&http, t.to_string()).await;
+            }
+            println!(
+                "  refresh failed ({}), falling back to device code",
+                tok.get("error").and_then(|v| v.as_str()).unwrap_or("?")
+            );
+        }
+    }
+
+    println!("== 1. device code (v2 consumers: {resource}) ==");
+    let dev: Value = http
+        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode")
+        .form(&[
+            ("client_id", CLIENT_ID),
+            ("scope", &format!("{resource} offline_access")),
+        ])
+        .send()
+        .await?
+        .json()
+        .await?;
     let user_code = dev.get("user_code").and_then(|v| v.as_str()).unwrap_or("?").to_string();
     let device_code = dev
         .get("device_code")
@@ -97,36 +152,20 @@ async fn main() -> anyhow::Result<()> {
     println!("  (approve with a PERSONAL Microsoft account, then wait…)");
     println!();
 
-    // Poll the v1 token endpoint until approved (or expired).
     let mut aad = String::new();
     let mut refresh_token = String::new();
     for _ in 0..(900 / interval.max(1)) {
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-        let resp = if v1 {
-            // v1 shape (AADSTS900144): grant_type=device_code, code=…
-            http
-                .post("https://login.microsoftonline.com/common/oauth2/token")
-                .form(&[
-                    ("grant_type", "device_code"),
-                    ("code", device_code.as_str()),
-                    ("client_id", CLIENT_ID),
-                    ("resource", resource.as_str()),
-                ])
-                .send()
-                .await?
-        } else {
-            // v2 shape: standard urn grant + device_code param, consumers.
-            http
-                .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
-                .form(&[
-                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                    ("client_id", CLIENT_ID),
-                    ("scope", &format!("{resource} offline_access")),
-                    ("device_code", device_code.as_str()),
-                ])
-                .send()
-                .await?
-        };
+        let resp = http
+            .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("client_id", CLIENT_ID),
+                ("scope", &format!("{resource} offline_access")),
+                ("device_code", device_code.as_str()),
+            ])
+            .send()
+            .await?;
         let tok: Value = resp.json().await.unwrap_or(Value::Null);
         if let Some(t) = tok.get("access_token").and_then(|v| v.as_str()) {
             aad = t.to_string();
@@ -145,108 +184,62 @@ async fn main() -> anyhow::Result<()> {
     if aad.is_empty() {
         anyhow::bail!("no token (code expired without approval?)");
     }
-    println!(
-        "  MSA token acquired ({} bytes), refresh token: {}",
-        aad.len(),
-        !refresh_token.is_empty()
-    );
-    let claims = jwt_claims(&aad);
-    println!(
-        "  claims: aud={:?} tid={:?} iss={:?}",
-        claims.get("aud").and_then(|v| v.as_str()),
-        claims.get("tid").and_then(|v| v.as_str()),
-        claims.get("iss").and_then(|v| v.as_str()),
-    );
+    if !refresh_token.is_empty() {
+        let _ = std::fs::write(RT_PATH, &refresh_token);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(RT_PATH, std::fs::Permissions::from_mode(0o600));
+        }
+        println!("  refresh token saved to {RT_PATH} (0600) — future runs need no approval");
+    }
+    authz_and_chat(&http, aad).await
+}
 
+/// Authz + native chat-list attempt with one minted token.
+async fn authz_and_chat(http: &reqwest::Client, aad: String) -> anyhow::Result<()> {
     println!();
-    println!("== 2. consumer authz — audience matrix (v1 RT is multi-resource) ==");
-    // v1 refresh tokens can mint tokens for other resources WITHOUT a
-    // new approval: one sign-in tests every candidate audience.
-    let candidates = [
-        resource.clone(),
-        "https://api.fl.spaces.skype.com".to_string(),
-        "https://api.spaces.skype.com".to_string(),
-        "https://teams.microsoft.com".to_string(),
-        "https://graph.microsoft.com".to_string(),
-    ];
-    let authz_endpoints = [
-        "https://teams.live.com/api/auth/v1.0/authz/consumer",
-        "https://teams.live.com/api/auth/v2.0/authz/consumer",
-        "https://teams.live.com/api/auth/v1.0/authzcore/consumer",
-    ];
+    println!("== 2. consumer authz (v1.0 endpoint first — the live 200) ==");
     let mut skype = String::new();
     let mut gtms = Value::Null;
-    let mut working: Option<String> = None;
-    'outer: for aud in &candidates {
-        // Mint (or reuse) a token for this audience.
-        let tok_for_aud: String = if *aud == resource {
-            aad.clone()
-        } else if refresh_token.is_empty() {
-            continue;
-        } else {
-            let resp = if v1 {
-                http
-                    .post("https://login.microsoftonline.com/common/oauth2/token")
-                    .form(&[
-                        ("grant_type", "refresh_token"),
-                        ("refresh_token", refresh_token.as_str()),
-                        ("client_id", CLIENT_ID),
-                        ("resource", aud.as_str()),
-                    ])
-                    .send()
-                    .await?
-            } else {
-                http
-                    .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
-                    .form(&[
-                        ("grant_type", "refresh_token"),
-                        ("refresh_token", refresh_token.as_str()),
-                        ("client_id", CLIENT_ID),
-                        ("scope", aud.as_str()),
-                    ])
-                    .send()
-                    .await?
-            };
-            let v: Value = resp.json().await.unwrap_or(Value::Null);
-            match v.get("access_token").and_then(|t| t.as_str()) {
-                Some(t) => t.to_string(),
-                None => {
-                    println!("  {aud:<45} mint failed ({})", v.get("error").and_then(|e| e.as_str()).unwrap_or("?"));
-                    continue;
+    for ep in AUTHZ_ENDPOINTS {
+        let resp = http
+            .post(ep)
+            .bearer_auth(&aad)
+            .header("Content-Length", "0")
+            .header("Origin", "https://teams.live.com")
+            .header("Referer", "https://teams.live.com/")
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        let tag = ep.split("teams.live.com").nth(1).unwrap_or(ep);
+        println!("  {tag:<34} HTTP {status}");
+        if status.is_success() {
+            println!("    response structure:");
+            dump_structure("      ", &body);
+            if let Some(t) = body.pointer("/tokens/skypeToken").and_then(|v| v.as_str()) {
+                skype = t.to_string();
+            } else if let Some((path, t)) = longest_string(&body) {
+                if t.len() >= 100 {
+                    println!("    skype-token candidate: {path} ({} bytes)", t.len());
+                    skype = t;
                 }
             }
-        };
-        for ep in authz_endpoints {
-            let resp = http
-                .post(ep)
-                .bearer_auth(&tok_for_aud)
-                .header("Content-Length", "0")
-                .header("Origin", "https://teams.live.com")
-                .header("Referer", "https://teams.live.com/")
-                .send()
-                .await?;
-            let status = resp.status();
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            let ok = status.is_success()
-                && body.pointer("/tokens/skypeToken").and_then(|v| v.as_str()).is_some();
-            let tag = ep.split("teams.live.com").nth(1).unwrap_or(ep);
-            println!("  {aud:<46} {tag:<34} HTTP {status} {}", if ok { "=> SKYPE TOKEN" } else { "" });
-            if ok {
-                skype = body.pointer("/tokens/skypeToken").and_then(|v| v.as_str()).unwrap().to_string();
-                gtms = body.get("regionGtms").cloned().unwrap_or(Value::Null);
-                working = Some(format!("{aud} @ {ep}"));
-                break 'outer;
-            }
+            gtms = body
+                .get("regionGtms")
+                .or_else(|| body.get("regiongtms"))
+                .or_else(|| body.pointer("/regionGtms"))
+                .or_else(|| body.pointer("/region/regionGtms"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            break;
         }
     }
-    let Some(_aud) = working else {
-        println!("=> no audience accepted by authz/consumer. Capture needed:");
-        println!("   F12 on teams.live.com web, filter 'authz', copy the request's");
-        println!("   Authorization header AUDIENCE (jwt aud claim) — that unblocks this.");
+    if skype.is_empty() {
+        println!("=> no usable skype token in any 2xx response.");
         return Ok(());
-    };
-    println!("  skype token: {} bytes", skype.len());
-    println!("  regionGtms: {gtms}");
+    }
 
     println!();
     println!("== 3. native chat list (X-SkypeToken) ==");
