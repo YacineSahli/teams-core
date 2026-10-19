@@ -277,29 +277,29 @@ pub async fn run_call_with_controls(
     let config = Config::load_cached().context("Failed to load config")?;
     let skype_token = config
         .get_skype_token()
-        .context("No skype token. Run `teams-cli login` first.")?;
+        .context("No skype token. Sign in first.")?;
     anyhow::ensure!(
         !skype_token.is_expired(),
-        "Skype token expired. Run `teams-cli login`."
+        "Skype token expired. Sign in again."
     );
     let skype_token_str = &skype_token.token;
 
     let ic3_token = config
         .get_ic3_token()
-        .context("No IC3 token. Run `teams-cli login` first.")?;
+        .context("No IC3 token. Sign in first.")?;
     anyhow::ensure!(
         !ic3_token.is_expired(),
-        "IC3 token expired. Run `teams-cli login`."
+        "IC3 token expired. Sign in again."
     );
     let ic3_token_str = &ic3_token.token;
 
     let recorder_token_str = if record {
         let recorder_token = config
             .get_recorder_token()
-            .context("No recorder token. Run `teams-cli login` first.")?;
+            .context("No recorder token. Sign in first.")?;
         anyhow::ensure!(
             !recorder_token.is_expired(),
-            "Recorder token expired. Run `teams-cli login`."
+            "Recorder token expired. Sign in again."
         );
         Some(recorder_token.token)
     } else {
@@ -309,7 +309,7 @@ pub async fn run_call_with_controls(
     let graph_token = config.get_graph_token();
     let region_gtms = config
         .get_region_gtms()
-        .context("No region_gtms in config. Run `teams-cli login` first.")?;
+        .context("No region_gtms in config. Sign in first.")?;
     let http = reqwest::Client::new();
 
     // Live controls: split the pair up front (mic gate → audio send,

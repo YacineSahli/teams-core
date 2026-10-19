@@ -29,7 +29,7 @@ pub async fn decline_call(notification: &CallNotification) -> Result<()> {
     let config = Config::load_cached().context("Failed to load config")?;
     let skype_token = config
         .get_skype_token()
-        .context("No skype token. Run `teams-cli login` first.")?;
+        .context("No skype token. Sign in first.")?;
     let http = crate::api::client::shared_http();
     signaling::end_call(&http, &skype_token.token, notification).await
 }
@@ -55,10 +55,10 @@ pub async fn answer_call_with_stop(
     let config = Config::load_cached().context("Failed to load config")?;
     let skype_token = config
         .get_skype_token()
-        .context("No skype token. Run `teams-cli login` first.")?;
+        .context("No skype token. Sign in first.")?;
     anyhow::ensure!(
         !skype_token.is_expired(),
-        "Skype token expired. Run `teams-cli login`."
+        "Skype token expired. Sign in again."
     );
     let skype_token_str = &skype_token.token;
     let http = crate::api::client::shared_http();

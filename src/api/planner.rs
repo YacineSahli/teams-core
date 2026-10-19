@@ -334,7 +334,7 @@ async fn check_status(resp: reqwest::Response, url: &str) -> Result<reqwest::Res
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         bail!(
-            "401 Unauthorized for {}. Token may be invalid -- run 'teams-cli login'.",
+            "401 Unauthorized for {}. The session may have expired -- sign in again.",
             url
         );
     }
@@ -405,9 +405,9 @@ async fn patch_task(
     let config = crate::config::Config::load_cached()?;
     let token = config
         .get_graph_token()
-        .context("No Graph token. Run 'teams-cli login' first.")?;
+        .context("No Graph token. Sign in first.")?;
     if token.is_expired() {
-        bail!("Graph token expired. Run 'teams-cli login'.");
+        bail!("Graph token expired. Sign in again.");
     }
     patch_task_with_token(token.token.clone(), task_id, etag, body).await
 }

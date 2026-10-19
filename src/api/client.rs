@@ -159,14 +159,14 @@ impl TeamsClient {
                         tracing::info!("Token refreshed");
                     }
                     Ok(false) => {
-                        bail!("No refresh token available. Run 'teams-cli login'.");
+                        bail!("No refresh token available. Sign in to continue.");
                     }
                     Err(e) => {
-                        bail!("Token refresh failed: {:#}. Run 'teams-cli login'.", e);
+                        bail!("Token refresh failed: {:#}. Sign in again.", e);
                     }
                 }
             } else {
-                bail!("Token expired and no refresh token. Run 'teams-cli login'.");
+                bail!("Session expired and no refresh token. Sign in again.");
             }
         }
 
@@ -237,9 +237,9 @@ impl TeamsClient {
         let token = self
             .config
             .get_graph_token()
-            .context("No Graph token. Run 'teams-cli login' first.")?;
+            .context("No Graph token. Sign in first.")?;
         if token.is_expired() {
-            bail!("Graph token expired. Run 'teams-cli login'.");
+            bail!("Graph token expired. Sign in again.");
         }
         Ok(token.token)
     }
@@ -248,9 +248,9 @@ impl TeamsClient {
         let token = self
             .config
             .get_skype_token()
-            .context("No Skype token. Run 'teams-cli login' first.")?;
+            .context("No Skype token. Sign in first.")?;
         if token.is_expired() {
-            bail!("Skype token expired. Run 'teams-cli login'.");
+            bail!("Skype token expired. Sign in again.");
         }
         Ok(token.token)
     }
@@ -536,9 +536,9 @@ impl TeamsClient {
         let aad = self
             .config
             .get_access_token()
-            .context("No AAD token. Run 'teams-cli login' first.")?;
+            .context("No AAD token. Sign in first.")?;
         if aad.is_expired() {
-            bail!("AAD token expired. Run 'teams-cli login'.");
+            bail!("AAD token expired. Sign in again.");
         }
         Ok(req
             .bearer_auth(&aad.token)
@@ -828,7 +828,7 @@ async fn check_response(resp: reqwest::Response, url: &str) -> Result<reqwest::R
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         bail!(
-            "401 Unauthorized for {}. Token may be invalid -- run 'teams-cli login'.",
+            "401 Unauthorized for {}. Token may be invalid -- sign in again.",
             url
         );
     }

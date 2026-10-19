@@ -82,10 +82,10 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
 
     let skype_token = config
         .get_skype_token()
-        .context("No skype token found. Run `teams-cli login` first.")?;
+        .context("No skype token found. Sign in first.")?;
     anyhow::ensure!(
         !skype_token.is_expired(),
-        "Skype token expired. Run `teams-cli login` to refresh."
+        "Skype token expired. Sign in again to refresh."
     );
 
     let skype_token_str = &skype_token.token;
