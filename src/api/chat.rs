@@ -45,6 +45,10 @@ struct ThreadProperties {
     members: Option<String>,
     #[serde(rename = "consumptionhorizon")]
     consumption_horizon: Option<String>,
+    /// "chat" for 1:1/group chats; channels/meetings differ. Consumer
+    /// ids are all @thread.v2, so classification keys on this.
+    #[serde(rename = "threadType")]
+    thread_type: Option<String>,
 }
 
 /// First `;` component of a `"<ms>;<ms>;<messageId>"` horizon.
@@ -2720,6 +2724,20 @@ pub fn parse_graph_chat_members(value: &serde_json::Value) -> Result<Vec<ChatMem
 /// Parse a chat-service `GET /v1/threads/{id}/members` body. Roles
 /// lowercase (`admin`/`user`); `admin` is the owner. Blank ids skip.
 /// Pure so tests pin it.
+/// Display name derived from a consumer MRI (8:live:<skypeid>):
+/// the handle, or `cid <hex head>` for unmigrated .cid. ids. None for
+/// non-consumer MRIs (work names come from the roster/Graph).
+pub fn consumer_display_name(mri: &str) -> Option<String> {
+    let id = mri.trim().strip_prefix("8:live:")?;
+    if let Some(hex) = id.strip_prefix(".cid.") {
+        if hex.len() >= 8 {
+            return Some(format!("cid…{}", &hex[..8]));
+        }
+        return Some(format!("cid {hex}"));
+    }
+    Some(id.to_string())
+}
+
 pub fn parse_thread_members(value: &serde_json::Value) -> Result<Vec<ChatMemberInfo>> {
     let body: ThreadMembersResponse = serde_json::from_value(value.clone())
         .context("Failed to parse thread members response")?;
@@ -2736,10 +2754,18 @@ pub fn parse_thread_members(value: &serde_json::Value) -> Result<Vec<ChatMemberI
                 .into_iter()
                 .collect();
             let is_owner = roles.iter().any(|r| r == "admin");
+            // Consumer rosters carry no names at all (live-verified):
+            // derive from the 8:live:<skypeid> MRI so rows never read
+            // "Unknown" — the handle, or a short form for .cid. ids.
+            let display_name = m
+                .friendly_name
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| consumer_display_name(&mri));
             Some(ChatMemberInfo {
                 user_id: oid_from_orgid_mri(&mri),
                 mri,
-                display_name: m.friendly_name.map(|s| s.trim().to_string()).unwrap_or_default(),
+                display_name: display_name.unwrap_or_default(),
                 email: None,
                 roles,
                 is_owner,
@@ -2965,6 +2991,7 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
         .context("Failed to parse conversations response")?;
 
     let conversations = body.conversations.unwrap_or_default();
+    let personal = client.skypeid().is_some();
 
     let mut chats = Vec::new();
     // (chat index, conversation index) for 1:1 chats without a topic:
@@ -2986,7 +3013,17 @@ pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<C
         if topic_missing && is_onetoone_id(&id) {
             needs_mate.push((chats.len(), ci));
         }
-        let is_group = id.contains("thread") || id.contains("meeting");
+        // Consumer 1:1s live under @thread.v2 ids — the work-era
+        // "contains thread" heuristic would read every consumer chat as
+        // a group. threadType "chat" on a personal profile = 1:1.
+        let is_group = if personal
+            && conv.thread_properties.as_ref().and_then(|p| p.thread_type.as_deref())
+                == Some("chat")
+        {
+            false
+        } else {
+            id.contains("thread") || id.contains("meeting")
+        };
 
         let (last_time, last_sender, last_preview) = if let Some(ref msg) = conv.last_message {
             let time = msg

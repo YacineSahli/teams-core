@@ -52,6 +52,9 @@ pub struct Config {
     /// live:.cid.<hex>); the work profile keeps it None (self comes
     /// from Graph /me there).
     pub skypeid: Option<String>,
+    /// Consumer sign-in email (authz signinname) — the friendliest
+    /// self label personal profiles have.
+    pub signinname: Option<String>,
 }
 
 impl Config {

@@ -144,6 +144,9 @@ pub async fn refresh_for(profile: &str) -> Result<bool> {
         if let Some(id) = authz.skype_token.skypeid.clone() {
             config.skypeid = Some(id);
         }
+        if let Some(email) = authz.skype_token.signinname.clone() {
+            config.signinname = Some(email);
+        }
         if let Some(gtms) = authz.region_gtms {
             config.set_region_gtms(gtms);
         }
@@ -337,6 +340,9 @@ where
     config.set_skype_token(authz.skype_token.token.clone(), authz.skype_token.expires_in);
     if let Some(id) = authz.skype_token.skypeid.clone() {
         config.skypeid = Some(id);
+    }
+    if let Some(email) = authz.skype_token.signinname.clone() {
+        config.signinname = Some(email);
     }
     if let Some(gtms) = authz.region_gtms {
         config.set_region_gtms(gtms);

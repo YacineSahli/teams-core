@@ -94,6 +94,9 @@ pub struct PersonalSkypeToken {
     /// live:<handle> or live:.cid.<hex> — the MRI suffix (8:live:…).
     #[serde(default)]
     pub skypeid: Option<String>,
+    /// Sign-in email (yacine@…com).
+    #[serde(default)]
+    pub signinname: Option<String>,
 }
 
 /// Exchange a consumer (MSA-native, service:: scope) token at the
