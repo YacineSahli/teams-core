@@ -19,6 +19,16 @@
 //! The refresh token persists to /tmp/tfl_personal_rt (0600) — reruns
 //! mint without another approval. Delete the file to re-provision.
 //!
+//! VERDICT (live 2026-10-19): PERSONAL CHAT WORKS end-to-end —
+//! device code (v2 consumers, service:: scope, microsoft.com/link) →
+//! authz 200 → conversations 200 on msgapi.teams.live.com. Response
+//! shape: {skypeToken:{skypetoken,skypeid:"live:<handle>",signinname,
+//! expiresIn}, regionGtms{chatService: msgapi.teams.live.com,
+//! chatServiceAfd: teams.live.com/api/chatsvc/consumer,
+//! calling_callControllerServiceUrl: api.cc.skype.com, presence:
+//! presence.teams.live.com, …}, consumerLicenseDetails, regionSettings
+//! (isFederationEnabled: true)}.
+//!
 //! Run: cargo run --example personal_probe
 
 use serde_json::Value;
