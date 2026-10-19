@@ -113,6 +113,44 @@ pub async fn refresh_for(profile: &str) -> Result<bool> {
         None => return Ok(false),
     };
 
+    // Consumer profiles refresh on v2 consumers with the service::
+    // scope — the only audience the consumer authz accepts.
+    if config.personal == Some(true) {
+        let http = reqwest::Client::new();
+        let scope = format!("{PERSONAL_SCOPE} offline_access");
+        let resp = http
+            .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token_str.as_str()),
+                ("client_id", PERSONAL_CLIENT_ID),
+                ("scope", scope.as_str()),
+            ])
+            .send()
+            .await
+            .context("personal token refresh request failed")?;
+        let v: serde_json::Value = resp.json().await.unwrap_or_default();
+        let aad = v
+            .get("access_token")
+            .and_then(|t| t.as_str())
+            .context("personal token refresh failed")?
+            .to_string();
+        config.set_access_token(aad.clone(), v.get("expires_in").and_then(|e| e.as_u64()));
+        if let Some(rt) = v.get("refresh_token").and_then(|t| t.as_str()) {
+            config.set_refresh_token(rt.to_string());
+        }
+        let authz = crate::auth::skype::exchange_skype_token_personal(&aad).await?;
+        config.set_skype_token(authz.skype_token.token.clone(), authz.skype_token.expires_in);
+        if let Some(id) = authz.skype_token.skypeid.clone() {
+            config.skypeid = Some(id);
+        }
+        if let Some(gtms) = authz.region_gtms {
+            config.set_region_gtms(gtms);
+        }
+        Config::save_to(&config, profile)?;
+        return Ok(true);
+    }
+
     let auth_config = AuthConfig::default();
     let client = build_client(&auth_config)?;
 
@@ -208,6 +246,104 @@ pub async fn login(force: bool) -> Result<()> {
         println!();
     })
     .await
+}
+
+/// Consumer login constants (live-verified 2026-10-19; see
+/// examples/personal_probe.rs for the full archaeology).
+pub const PERSONAL_CLIENT_ID: &str = "8ec6bc83-69c8-4392-8f08-b3c986009232";
+pub const PERSONAL_SCOPE: &str = "service::api.fl.spaces.skype.com::MBI_SSL";
+
+/// `login_personal_with_code_sink` for CLI/printing use.
+pub async fn login_personal() -> Result<()> {
+    login_personal_with_code_sink(|url, code| {
+        println!();
+        println!("To sign in, visit: {url}");
+        println!("Enter code:        {code}");
+        println!();
+    })
+    .await
+}
+
+/// PERSONAL (consumer) device-code login: v2 `/consumers` endpoint with
+/// the MSA-native `service::` scope (ESTS v1/v2 scopes are all rejected
+/// or mint tokens the consumer authz 40110s — dead ends on record in
+/// the probe header). The v2 verification page is microsoft.com/link.
+pub async fn login_personal_with_code_sink<F>(sink: F) -> Result<()>
+where
+    F: FnOnce(&str, &str),
+{
+    let http = reqwest::Client::new();
+    let form_scope = format!("{PERSONAL_SCOPE} offline_access");
+    let dev: serde_json::Value = http
+        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode")
+        .form(&[("client_id", PERSONAL_CLIENT_ID), ("scope", form_scope.as_str())])
+        .send()
+        .await
+        .context("personal device-code request failed")?
+        .json()
+        .await
+        .context("personal device-code parse failed")?;
+    let user_code = dev.get("user_code").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+    let device_code = dev.get("device_code").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let verify = dev
+        .get("verification_uri")
+        .or_else(|| dev.get("verification_url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("https://www.microsoft.com/link")
+        .to_string();
+    let interval = dev.get("interval").and_then(|v| v.as_u64()).unwrap_or(5) as u64;
+    sink(&verify, &user_code);
+
+    let mut token: Option<serde_json::Value> = None;
+    for _ in 0..(900 / interval.max(1)) {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        let resp = http
+            .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("client_id", PERSONAL_CLIENT_ID),
+                ("scope", form_scope.as_str()),
+                ("device_code", device_code.as_str()),
+            ])
+            .send()
+            .await
+            .context("personal device-code token request failed")?;
+        let v: serde_json::Value = resp.json().await.unwrap_or_default();
+        if v.get("access_token").is_some() {
+            token = Some(v);
+            break;
+        }
+        let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("");
+        if err != "authorization_pending" && err != "slow_down" {
+            anyhow::bail!("personal device-code exchange failed: {err}");
+        }
+    }
+    let token = match token {
+        Some(t) => t,
+        None => anyhow::bail!("personal device code expired without approval"),
+    };
+
+    let aad = token.get("access_token").and_then(|t| t.as_str()).unwrap_or_default();
+    let authz = crate::auth::skype::exchange_skype_token_personal(aad).await?;
+    let mut config = Config::load_cached()?;
+    config.personal = Some(true);
+    config.set_access_token(
+        aad.to_string(),
+        token.get("expires_in").and_then(|e| e.as_u64()),
+    );
+    if let Some(rt) = token.get("refresh_token").and_then(|t| t.as_str()) {
+        config.set_refresh_token(rt.to_string());
+    }
+    config.set_skype_token(authz.skype_token.token.clone(), authz.skype_token.expires_in);
+    if let Some(id) = authz.skype_token.skypeid.clone() {
+        config.skypeid = Some(id);
+    }
+    if let Some(gtms) = authz.region_gtms {
+        config.set_region_gtms(gtms);
+    }
+    Config::save_to(&config, &crate::config::active_profile())?;
+    tracing::info!("personal login complete");
+    Ok(())
 }
 
 /// Device-code login that hands the verification URL + code to `sink`

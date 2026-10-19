@@ -250,6 +250,12 @@ impl TeamsClient {
         Ok(token.token)
     }
 
+    /// Consumer self skypeid (live:<handle> / live:.cid.<hex>), when
+    /// this profile is personal.
+    pub fn skypeid(&self) -> Option<String> {
+        self.config.skypeid.clone()
+    }
+
     pub(crate) fn skype_token(&self) -> Result<String> {
         let token = self
             .config

@@ -42,6 +42,16 @@ pub struct Config {
     pub teams_region: Option<String>,
     /// Teams-cloud `ms-teams-ring` header override. Env `TEAMS_RING` wins.
     pub teams_ring: Option<String>,
+    /// True when this profile signed in with a PERSONAL (consumer)
+    /// Microsoft account: v2-consumers device code with the MSA-native
+    /// service:: scope; authz at teams.live.com (flat skypeToken
+    /// shape); native hosts from the consumer regionGtms. Defaults
+    /// absent (= work account) so every existing profile is unchanged.
+    pub personal: Option<bool>,
+    /// Consumer self identity from the authz (live:<handle> or
+    /// live:.cid.<hex>); the work profile keeps it None (self comes
+    /// from Graph /me there).
+    pub skypeid: Option<String>,
 }
 
 impl Config {

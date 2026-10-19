@@ -2416,6 +2416,58 @@ pub fn one_to_one_thread_body(me: &str, peer: &str) -> serde_json::Value {
     })
 }
 
+/// Consumer 1:1: POST /v1/threads with 8:live:<skypeid> members and NO
+/// uniquerosterthread (errorCode 201 "Consumer users disallowed on
+/// uniquerosterthread" — live-verified); the server assigns a GUID
+/// 19:…@thread.v2 id (NOT the derived @unq.gbl.spaces form).
+/// `peer` is the peer's skypeid (live:<handle> / live:.cid.<hex>) or
+/// full 8:live: MRI.
+pub async fn create_one_to_one_personal(
+    client: &TeamsClient,
+    peer: &str,
+) -> Result<ChatInfo> {
+    let peer = peer.trim();
+    if peer.is_empty() {
+        bail!("empty user");
+    }
+    let me = client
+        .skypeid()
+        .context("personal 1:1 needs config.skypeid (re-login)")?;
+    let peer_skypeid = peer.strip_prefix("8:").unwrap_or(peer);
+    let body = serde_json::json!({
+        "members": [
+            {"id": format!("8:{peer_skypeid}"), "role": "Admin"},
+            {"id": format!("8:{me}"), "role": "Admin"},
+        ],
+        "properties": {
+            "threadType": "chat",
+            "fixedRoster": "true",
+        },
+    });
+    let base = client.chat_service_url();
+    let resp = client
+        .chat_post(&format!("{base}/v1/threads"), &body)
+        .await
+        .context("consumer 1:1 thread create failed")?;
+    let thread = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|l| l.split('?').next())
+        .and_then(|l| l.rsplit('/').next())
+        .map(|id| id.replace("%3A", ":").replace("%3a", ":").replace("%40", "@"))
+        .context("consumer 1:1 create answered no thread id")?;
+    Ok(ChatInfo {
+        id: thread,
+        name: String::new(),
+        is_group: false,
+        last_message_time: None,
+        last_message_sender: None,
+        last_message_preview: None,
+        last_read_ms: None,
+    })
+}
+
 /// Create (or re-open) the 1:1 chat with `user` (AAD id or UPN) and
 /// return the thread. Empty refs are rejected before any network.
 /// OstMac §106: Graph `POST /me/chats` answers 405 (not a create

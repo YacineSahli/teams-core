@@ -73,3 +73,49 @@ pub async fn exchange_skype_token(
 
     Ok((skype_token, tokens.expires_in, authz.region_gtms))
 }
+
+/// Consumer (personal) authz response — the FLAT shape, verified live
+/// 2026-10-19: {skypeToken: {skypetoken, expiresIn, skypeid,
+/// signinname}, regionGtms, consumerLicenseDetails, regionSettings}.
+#[derive(Debug, Deserialize)]
+pub struct PersonalAuthz {
+    #[serde(rename = "skypeToken")]
+    pub skype_token: PersonalSkypeToken,
+    #[serde(rename = "regionGtms", default)]
+    pub region_gtms: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PersonalSkypeToken {
+    #[serde(rename = "skypetoken")]
+    pub token: String,
+    #[serde(rename = "expiresIn", default)]
+    pub expires_in: Option<u64>,
+    /// live:<handle> or live:.cid.<hex> — the MRI suffix (8:live:…).
+    #[serde(default)]
+    pub skypeid: Option<String>,
+}
+
+/// Exchange a consumer (MSA-native, service:: scope) token at the
+/// consumer authz. Distinct from the work exchange: different endpoint
+/// AND a flat response shape.
+pub async fn exchange_skype_token_personal(
+    aad_token: &str,
+) -> Result<PersonalAuthz> {
+    let client = crate::api::client::shared_http();
+    let resp = client
+        .post(AUTHZ_URL_PERSONAL)
+        .bearer_auth(aad_token)
+        .header("Content-Length", "0")
+        .send()
+        .await
+        .context("consumer authz request failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("consumer authz failed (HTTP {}): {}", status.as_u16(), body);
+    }
+    resp.json()
+        .await
+        .context("consumer authz response parse failed")
+}

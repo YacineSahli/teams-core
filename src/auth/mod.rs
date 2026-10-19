@@ -7,7 +7,7 @@ pub mod oauth;
 pub mod skype;
 pub mod tokens;
 
-pub use oauth::{login, login_with_code_sink, logout, status};
+pub use oauth::{login, login_personal, login_personal_with_code_sink, login_with_code_sink, logout, status};
 pub use tokens::{StoredToken, TokenStore};
 
 /// Azure AD client configuration for Teams
