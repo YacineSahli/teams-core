@@ -50,14 +50,32 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("PERSONAL_RESOURCE").unwrap_or_else(|_| RESOURCE_DEFAULT.to_string());
     let http = reqwest::Client::new();
 
-    println!("== 1. v1 device code (client={CLIENT_ID}, resource={resource}) ==");
-    let dev: Value = http
-        .post("https://login.microsoftonline.com/common/oauth2/devicecode")
-        .form(&[("client_id", CLIENT_ID), ("resource", resource.as_str())])
-        .send()
-        .await?
-        .json()
-        .await?;
+    // v2 consumers is the endpoint that fronts MSA: it accepted the
+    // service:: scope at device-code time AND v1 cannot mint service::
+    // resources (AADSTS500011, live-run finding) — so the MSA-native
+    // token has to come from here (v1 fallback via PERSONAL_V1=1).
+    let v1 = std::env::var("PERSONAL_V1").is_ok();
+    println!("== 1. device code ({}: {resource}) ==", if v1 { "v1 common" } else { "v2 consumers" });
+    let dev: Value = if v1 {
+        http
+            .post("https://login.microsoftonline.com/common/oauth2/devicecode")
+            .form(&[("client_id", CLIENT_ID), ("resource", resource.as_str())])
+            .send()
+            .await?
+            .json()
+            .await?
+    } else {
+        http
+            .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode")
+            .form(&[
+                ("client_id", CLIENT_ID),
+                ("scope", &format!("{resource} offline_access")),
+            ])
+            .send()
+            .await?
+            .json()
+            .await?
+    };
     let user_code = dev.get("user_code").and_then(|v| v.as_str()).unwrap_or("?").to_string();
     let device_code = dev
         .get("device_code")
@@ -81,18 +99,31 @@ async fn main() -> anyhow::Result<()> {
     let mut refresh_token = String::new();
     for _ in 0..(900 / interval.max(1)) {
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-        // v1 shape (AADSTS900144 named it): grant_type=device_code with
-        // the device code under the parameter name `code`.
-        let resp = http
-            .post("https://login.microsoftonline.com/common/oauth2/token")
-            .form(&[
-                ("grant_type", "device_code"),
-                ("code", device_code.as_str()),
-                ("client_id", CLIENT_ID),
-                ("resource", resource.as_str()),
-            ])
-            .send()
-            .await?;
+        let resp = if v1 {
+            // v1 shape (AADSTS900144): grant_type=device_code, code=…
+            http
+                .post("https://login.microsoftonline.com/common/oauth2/token")
+                .form(&[
+                    ("grant_type", "device_code"),
+                    ("code", device_code.as_str()),
+                    ("client_id", CLIENT_ID),
+                    ("resource", resource.as_str()),
+                ])
+                .send()
+                .await?
+        } else {
+            // v2 shape: standard urn grant + device_code param, consumers.
+            http
+                .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+                .form(&[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("client_id", CLIENT_ID),
+                    ("scope", &format!("{resource} offline_access")),
+                    ("device_code", device_code.as_str()),
+                ])
+                .send()
+                .await?
+        };
         let tok: Value = resp.json().await.unwrap_or(Value::Null);
         if let Some(t) = tok.get("access_token").and_then(|v| v.as_str()) {
             aad = t.to_string();
@@ -150,16 +181,29 @@ async fn main() -> anyhow::Result<()> {
         } else if refresh_token.is_empty() {
             continue;
         } else {
-            let resp = http
-                .post("https://login.microsoftonline.com/common/oauth2/token")
-                .form(&[
-                    ("grant_type", "refresh_token"),
-                    ("refresh_token", refresh_token.as_str()),
-                    ("client_id", CLIENT_ID),
-                    ("resource", aud.as_str()),
-                ])
-                .send()
-                .await?;
+            let resp = if v1 {
+                http
+                    .post("https://login.microsoftonline.com/common/oauth2/token")
+                    .form(&[
+                        ("grant_type", "refresh_token"),
+                        ("refresh_token", refresh_token.as_str()),
+                        ("client_id", CLIENT_ID),
+                        ("resource", aud.as_str()),
+                    ])
+                    .send()
+                    .await?
+            } else {
+                http
+                    .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+                    .form(&[
+                        ("grant_type", "refresh_token"),
+                        ("refresh_token", refresh_token.as_str()),
+                        ("client_id", CLIENT_ID),
+                        ("scope", aud.as_str()),
+                    ])
+                    .send()
+                    .await?
+            };
             let v: Value = resp.json().await.unwrap_or(Value::Null);
             match v.get("access_token").and_then(|t| t.as_str()) {
                 Some(t) => t.to_string(),
