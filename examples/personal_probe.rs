@@ -27,7 +27,9 @@
 use serde_json::Value;
 
 const CLIENT_ID: &str = "8ec6bc83-69c8-4392-8f08-b3c986009232";
-const RESOURCE_DEFAULT: &str = "https://api.spaces.skype.com";
+/// The consumer web client's MSA-native authz resource (from its JS
+/// config): authzResource = service::api.fl.spaces.skype.com::MBI_SSL.
+const RESOURCE_DEFAULT: &str = "service::api.fl.spaces.skype.com::MBI_SSL";
 
 /// JWT payload claims (aud/tid/iss only — no signature, no token body).
 fn jwt_claims(token: &str) -> Value {
@@ -128,19 +130,20 @@ async fn main() -> anyhow::Result<()> {
     // new approval: one sign-in tests every candidate audience.
     let candidates = [
         resource.clone(),
-        "https://teams.live.com".to_string(),
-        "https://api.interfaces.teams.live.com".to_string(),
-        "https://teams.microsoft.com".to_string(),
+        "https://api.fl.spaces.skype.com".to_string(),
         "https://api.spaces.skype.com".to_string(),
-        "https://skype.com".to_string(),
-        "https://api.skype.com".to_string(),
-        "https://substrate.office.com".to_string(),
+        "https://teams.microsoft.com".to_string(),
         "https://graph.microsoft.com".to_string(),
+    ];
+    let authz_endpoints = [
+        "https://teams.live.com/api/auth/v1.0/authz/consumer",
+        "https://teams.live.com/api/auth/v2.0/authz/consumer",
+        "https://teams.live.com/api/auth/v1.0/authzcore/consumer",
     ];
     let mut skype = String::new();
     let mut gtms = Value::Null;
     let mut working: Option<String> = None;
-    for aud in &candidates {
+    'outer: for aud in &candidates {
         // Mint (or reuse) a token for this audience.
         let tok_for_aud: String = if *aud == resource {
             aad.clone()
@@ -166,24 +169,27 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         };
-        let resp = http
-            .post("https://teams.live.com/api/auth/v1.0/authz/consumer")
-            .bearer_auth(&tok_for_aud)
-            .header("Content-Length", "0")
-            .header("Origin", "https://teams.live.com")
-            .header("Referer", "https://teams.live.com/")
-            .send()
-            .await?;
-        let status = resp.status();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
-        let ok = status.is_success()
-            && body.pointer("/tokens/skypeToken").and_then(|v| v.as_str()).is_some();
-        println!("  {aud:<45} HTTP {status} {}", if ok { "=> SKYPE TOKEN" } else { "" });
-        if ok {
-            skype = body.pointer("/tokens/skypeToken").and_then(|v| v.as_str()).unwrap().to_string();
-            gtms = body.get("regionGtms").cloned().unwrap_or(Value::Null);
-            working = Some(aud.clone());
-            break;
+        for ep in authz_endpoints {
+            let resp = http
+                .post(ep)
+                .bearer_auth(&tok_for_aud)
+                .header("Content-Length", "0")
+                .header("Origin", "https://teams.live.com")
+                .header("Referer", "https://teams.live.com/")
+                .send()
+                .await?;
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            let ok = status.is_success()
+                && body.pointer("/tokens/skypeToken").and_then(|v| v.as_str()).is_some();
+            let tag = ep.split("teams.live.com").nth(1).unwrap_or(ep);
+            println!("  {aud:<46} {tag:<34} HTTP {status} {}", if ok { "=> SKYPE TOKEN" } else { "" });
+            if ok {
+                skype = body.pointer("/tokens/skypeToken").and_then(|v| v.as_str()).unwrap().to_string();
+                gtms = body.get("regionGtms").cloned().unwrap_or(Value::Null);
+                working = Some(format!("{aud} @ {ep}"));
+                break 'outer;
+            }
         }
     }
     let Some(_aud) = working else {
