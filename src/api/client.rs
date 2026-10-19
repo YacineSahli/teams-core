@@ -165,6 +165,12 @@ impl TeamsClient {
                         bail!("Token refresh failed: {:#}. Sign in again.", e);
                     }
                 }
+            } else if config.get_access_token().is_none()
+                && config.get_graph_token().is_none()
+            {
+                // Never signed in on this profile (fresh QA profile,
+                // new install) — not an expiry.
+                bail!("Not signed in. Sign in to continue.");
             } else {
                 bail!("Session expired and no refresh token. Sign in again.");
             }
