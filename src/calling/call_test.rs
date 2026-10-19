@@ -347,10 +347,18 @@ pub async fn run_call_with_controls(
         .context("Cannot extract MRI from skype token")?;
     tracing::info!("Caller MRI: {}", caller_mri);
 
-    // Extract OID from MRI (e.g. "8:orgid:{guid}" -> "{guid}")
-    let caller_oid = caller_mri
-        .strip_prefix("8:orgid:")
-        .context("MRI does not have expected 8:orgid: prefix")?;
+    // Extract OID from MRI (e.g. "8:orgid:{guid}" -> "{guid}").
+    // Consumer MRIs are 8:live:<skypeid> — no orgid; the OID slot just
+    // needs a stable caller-owned string (thread derivation, payloads).
+    let caller_oid_owned;
+    let caller_oid: &str = if let Some(oid) = caller_mri.strip_prefix("8:orgid:") {
+        oid
+    } else if caller_mri.starts_with("8:live:") {
+        caller_oid_owned = caller_mri.trim_start_matches("8:").replace([':', '.'], "-");
+        &caller_oid_owned
+    } else {
+        anyhow::bail!("MRI does not have expected 8:orgid:/8:live: prefix");
+    };
 
     // Determine thread ID and call mode based on options:
     // 1. --echo: call the Echo bot
@@ -359,10 +367,29 @@ pub async fn run_call_with_controls(
     let (thread_id, callee_mri) = if echo {
         (signaling::echo_thread_id(caller_oid), None)
     } else if let Some(ref tid) = thread_override {
-        // Extract callee OID from 1:1 thread format: 19:{oid1}_{oid2}@unq.gbl.spaces
-        let callee_oid = extract_callee_oid_from_thread(tid, caller_oid);
-        let callee_mri = callee_oid.map(|oid| format!("8:orgid:{}", oid));
-        (tid.clone(), callee_mri)
+        // Extract callee OID from 1:1 thread format: 19:{oid1}_{oid2}@unq.gbl.spaces.
+        // Consumer 1:1s are server-assigned GUID threads — the callee
+        // comes from the roster (the one non-self member).
+        if tid.contains("@unq.gbl.spaces") {
+            let callee_oid = extract_callee_oid_from_thread(tid, caller_oid);
+            let callee_mri = callee_oid.map(|oid| format!("8:orgid:{}", oid));
+            (tid.clone(), callee_mri)
+        } else {
+            let callee_mri = consumer_thread_peer(
+                &http,
+                &chat_service_base(&config),
+                skype_token_str,
+                tid,
+                &caller_mri,
+            )
+                .await
+                .map_err(|e| {
+                    tracing::warn!("consumer peer resolve failed: {e:#}");
+                    e
+                })
+                .ok();
+            (tid.clone(), callee_mri)
+        }
     } else {
         let tid = std::env::var("TEAMS_AV_TEST_THREAD_ID").context(
             "TEAMS_AV_TEST_THREAD_ID env var not set. Set it to the thread ID of the av-test channel.",
@@ -2365,6 +2392,55 @@ fn extract_claim_from_skype_token(token: &str, claim: &str) -> Option<String> {
         .ok()?;
     let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
     json.get(claim).and_then(|v| v.as_str()).map(String::from)
+}
+
+/// The one non-self member of a consumer 1:1 thread (8:live: MRI),
+/// read from the chat service with the skype token.
+async fn consumer_thread_peer(
+    http: &reqwest::Client,
+    chat_service: &str,
+    skype_token: &str,
+    thread_id: &str,
+    self_mri: &str,
+) -> anyhow::Result<String> {
+    let url = format!("{chat_service}/v1/threads/{thread_id}/members");
+    let resp = http
+        .get(&url)
+        .header("X-SkypeToken", skype_token)
+        .send()
+        .await
+        .context("consumer peer roster read failed")?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "peer roster HTTP {}",
+        resp.status()
+    );
+    let v: serde_json::Value = resp.json().await?;
+    let members: Vec<String> = v
+        .get("members")
+        .and_then(|m| m.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut peers: Vec<String> = members
+        .into_iter()
+        .filter(|m| m != self_mri && !m.starts_with("28:"))
+        .collect();
+    anyhow::ensure!(peers.len() == 1, "expected one peer, got {}", peers.len());
+    Ok(peers.remove(0))
+}
+
+/// Chat-service base from config (regionGtms.chatService), consumer
+/// default fallback.
+fn chat_service_base(config: &crate::config::Config) -> String {
+    config
+        .get_region_gtms()
+        .and_then(|g| g.get("chatService").and_then(|v| v.as_str()).map(String::from))
+        .unwrap_or_else(|| "https://msgapi.teams.live.com".to_string())
 }
 
 fn extract_mri_from_skype_token(token: &str) -> Option<String> {

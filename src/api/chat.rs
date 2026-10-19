@@ -2030,6 +2030,14 @@ struct ThreadMembersResponse {
 /// Member MRIs for one thread (read-only). Errors (404 on system
 /// threads like `48:notes`, network) propagate to the caller, which
 /// falls back to sender/label naming — never fatal to the list.
+/// Public roster read (the call stack's consumer peer resolver).
+pub async fn thread_member_mris_pub(
+    client: &TeamsClient,
+    thread_id: &str,
+) -> Result<Vec<String>> {
+    thread_member_mris(client, thread_id).await
+}
+
 async fn thread_member_mris(client: &TeamsClient, thread_id: &str) -> Result<Vec<String>> {
     let base = client.chat_service_url();
     let url = format!("{}/v1/threads/{}/members", base, thread_id);
