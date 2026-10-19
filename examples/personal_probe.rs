@@ -82,10 +82,13 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    // v1 names it verification_url, v2 verification_uri (RFC) — a v2
+    // code shown on the v1 page reads "did not work".
     let verify = dev
-        .get("verification_url")
+        .get("verification_uri")
+        .or_else(|| dev.get("verification_url"))
         .and_then(|v| v.as_str())
-        .unwrap_or("https://login.microsoft.com/device")
+        .unwrap_or("https://www.microsoft.com/link")
         .to_string();
     let interval = dev.get("interval").and_then(|v| v.as_u64()).unwrap_or(5) as u64;
     println!();
