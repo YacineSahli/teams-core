@@ -312,6 +312,29 @@ impl TeamsClient {
         check_response(resp, url).await
     }
 
+    /// POST a JSON body to an absolute Graph URL (beta endpoints —
+    /// `graph_base` is v1.0 and some actions only parse their fields
+    /// there on beta, e.g. custom-emoji reactions).
+    pub async fn graph_post_url(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        let token = self.graph_token()?;
+        tracing::debug!("Graph POST {}", url);
+
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(&token)
+            .json(body)
+            .send_observed("POST", url, self.timeout)
+            .await
+            .with_context(|| format!("Graph POST {} failed", url))?;
+
+        check_response(resp, url).await
+    }
+
     pub async fn graph_post(
         &self,
         path: &str,

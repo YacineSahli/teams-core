@@ -31,8 +31,8 @@ use anyhow::Result;
 
 // Re-export data types for TUI integration
 pub use chat::{
-    ChatInfo, ChatMemberInfo, MessageInfo, MessagesPage, ReactionCount, Reactor, ReadReceipt,
-    RosterSource, REACTION_EMOJI,
+    ChatInfo, ChatMemberInfo, CustomReaction, MessageInfo, MessagesPage, ReactionCount, Reactor,
+    ReadReceipt, RosterSource, REACTION_EMOJI,
 };
 pub use calendar::{
     JoinIdResolve, JoinTarget, LobbyEvent, LobbyState, MeetingInfo, ResolvedJoinId,
@@ -79,14 +79,16 @@ pub use teams::ChannelInfo;
 pub use chat::{
     build_message_html, build_reply_html, consumptionhorizon_body, consumptionhorizon_url,
     consumptionhorizon_value, consumptionhorizons_url, create_one_to_one_chat_data,
-    delete_message_with_client,
+    delete_message_with_client, custom_reaction_body, remove_custom_reaction_with_client,
     edit_message_body, edit_message_with_client, emoji_for_reaction_type, leave_chat_with_client,
     leave_member_url, list_chats_data, mark_read_with_client, message_url, one_to_one_create_body,
     one_to_one_create_path, own_member_mri, parse_created_chat,
-    parse_consumptionhorizons, reaction_body, reaction_set_path, reaction_type_for_emoji,
+    parse_consumptionhorizons, parse_custom_emotion_key, reaction_body, reaction_set_path,
+    reaction_type_for_emoji,
     reaction_unset_path, read_messages_data, read_messages_page, read_receipts_data,
     receipt_message_id, remove_reaction_with_client, reply_message_with_client, reply_snippet,
-    send_message_body, send_message_with_client, send_reaction_with_client, split_reply_quote,
+    send_custom_reaction_with_client, send_message_body, send_message_with_client,
+    send_reaction_with_client, split_reply_quote,
     REPLY_SNIPPET_MAX, WIRE_FENCE_MAX_BLOCKS,
 };
 // OstMac core-a: channel thread replies, chat roster, group create, reactors.

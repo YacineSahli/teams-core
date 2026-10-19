@@ -1332,9 +1332,73 @@ pub async fn remove_reaction_with_client(
     Ok(())
 }
 
+/// Body for a tenant custom-emoji reaction (Graph BETA only — live
+/// probe 2026-10-19: beta answers 204 and the native read shows the
+/// emotion key `"{displayName};0-csea-…"`; v1.0 answers 204 but drops
+/// the custom fields, leaving no reaction).
+pub fn custom_reaction_body(display_name: &str) -> serde_json::Value {
+    serde_json::json!({ "reactionType": "custom", "displayName": display_name })
+}
+
+/// Beta absolute URL for custom-emoji set/unsetReaction.
+fn custom_reaction_beta_url(chat_id: &str, message_id: &str, action: &str) -> String {
+    format!(
+        "https://graph.microsoft.com/beta/chats/{}/messages/{}/{}",
+        encode_uri_component(chat_id),
+        message_id,
+        action
+    )
+}
+
+/// A custom-emoji display name is the write key — it must round-trip
+/// the emotion key unambiguously (no `;`, which separates name and
+/// object id on the read side).
+fn custom_reaction_name_valid(name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty() && !n.contains(';') && n.chars().count() <= 64
+}
+
+/// React with a TENANT custom emoji (by its display name, e.g.
+/// "sadcat1"). Beta-only wire; see [`custom_reaction_body`].
+pub async fn send_custom_reaction_with_client(
+    client: &TeamsClient,
+    chat_id: &str,
+    message_id: &str,
+    display_name: &str,
+) -> Result<()> {
+    let name = display_name.trim();
+    if !custom_reaction_name_valid(name) {
+        bail!("invalid custom reaction name: {}", display_name);
+    }
+    let url = custom_reaction_beta_url(chat_id, message_id, "setReaction");
+    tracing::debug!("Adding custom reaction {name} via Graph beta");
+    client
+        .graph_post_url(&url, &custom_reaction_body(name))
+        .await?;
+    Ok(())
+}
+
+/// Remove a tenant custom-emoji reaction (same body as the set).
+pub async fn remove_custom_reaction_with_client(
+    client: &TeamsClient,
+    chat_id: &str,
+    message_id: &str,
+    display_name: &str,
+) -> Result<()> {
+    let name = display_name.trim();
+    if !custom_reaction_name_valid(name) {
+        bail!("invalid custom reaction name: {}", display_name);
+    }
+    let url = custom_reaction_beta_url(chat_id, message_id, "unsetReaction");
+    tracing::debug!("Removing custom reaction {name} via Graph beta");
+    client
+        .graph_post_url(&url, &custom_reaction_body(name))
+        .await?;
+    Ok(())
+}
+
 /// Add or remove a reaction (prints to stdout). CLI entry point.
-pub async fn react(chat_id: &str, message_id: &str, emoji: &str, remove: bool) -> Result<()> {
-    let client = TeamsClient::new().await?;
+pub async fn react(chat_id: &str, message_id: &str, emoji: &str, remove: bool) -> Result<()> {    let client = TeamsClient::new().await?;
     if remove {
         remove_reaction_with_client(&client, chat_id, message_id, emoji).await?;
         println!("Reaction removed.");
@@ -1651,6 +1715,10 @@ pub struct MessageInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReactionCount {
     pub emoji: String,
+    /// Tenant custom-emoji reaction (emotion key `name;0-csea-…`).
+    /// `emoji` is "" for these — renderers must fetch the asset by
+    /// object id, never draw a font glyph.
+    pub custom: Option<CustomReaction>,
     pub count: usize,
     pub reactors: Vec<Reactor>,
 }
@@ -1664,6 +1732,34 @@ pub struct ReactionCount {
 pub struct Reactor {
     pub id: String,
     pub name: String,
+}
+
+/// A tenant custom-emoji reaction. Live-verified 2026-10-19: the native
+/// emotions key is `"{displayName};{object_id}"` — the same shape as a
+/// message-body CustomEmoji img's `itemid` — and Graph BETA
+/// setReaction/unsetReaction with `{"reactionType":"custom",
+/// "displayName":…}` writes it (v1.0 answers 204 but silently drops the
+/// custom fields; its own 400 names displayName/reactionId).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomReaction {
+    /// Tenant display name ("sadcat1") — the reaction write key.
+    pub name: String,
+    /// `0-csea-…` object id; the asset URL is
+    /// `https://{tenant-objects-host}/v1/objects/{object_id}/views/imgt2_anim`
+    /// (host learned from CustomEmoji imgs in message HTML).
+    pub object_id: String,
+}
+
+/// Parse a custom-emotion key (`"sadcat1;0-csea-d6-…"`). The object id
+/// MUST carry the `0-csea-` prefix — plain `name;whatever` strings are
+/// not custom emoji. Anything else → None.
+pub fn parse_custom_emotion_key(key: &str) -> Option<CustomReaction> {
+    let (name, id) = key.split_once(';')?;
+    let (name, id) = (name.trim(), id.trim());
+    if name.is_empty() || !id.starts_with("0-csea-") || id.contains(';') {
+        return None;
+    }
+    Some(CustomReaction { name: name.to_string(), object_id: id.to_string() })
 }
 
 /// Picker index for a wire reaction type (case-insensitive).
@@ -1732,21 +1828,24 @@ pub fn reaction_counts_from_values(
         }
     };
     // Dynamic (non-classic) reactions: unicode emoji stored under
-    // codepoint-name keys ("1f389_partypopper") — appended after the
-    // classics in first-seen order.
-    let mut extra: Vec<(String, usize, Vec<Reactor>)> = Vec::new();
-    let mut extra_push = |emoji: String, r: Option<Reactor>| {
-        if let Some(slot) = extra.iter_mut().find(|(e, _, _)| *e == emoji) {
-            slot.1 += 1;
-            if let Some(r) = r {
-                if !slot.2.iter().any(|x| x.id.eq_ignore_ascii_case(&r.id)) {
-                    slot.2.push(r);
+    // codepoint-name keys ("1f389_partypopper") and tenant custom emoji
+    // (`name;0-csea-…`) — appended after the classics in first-seen
+    // order. `key` is the dedup slot (the emoji, or the full emotion
+    // key for customs).
+    let mut extra: Vec<(String, Option<CustomReaction>, usize, Vec<Reactor>)> = Vec::new();
+    let mut extra_push =
+        |key: String, custom: Option<CustomReaction>, r: Option<Reactor>| {
+            if let Some(slot) = extra.iter_mut().find(|(k, _, _, _)| *k == key) {
+                slot.2 += 1;
+                if let Some(r) = r {
+                    if !slot.3.iter().any(|x| x.id.eq_ignore_ascii_case(&r.id)) {
+                        slot.3.push(r);
+                    }
                 }
+            } else {
+                extra.push((key, custom, 1, r.into_iter().collect()));
             }
-        } else {
-            extra.push((emoji, 1, r.into_iter().collect()));
-        }
-    };
+        };
     if let Some(list) = reactions.and_then(as_array_lenient) {
         for e in &list {
             let Some(o) = e.as_object() else { continue };
@@ -1754,7 +1853,22 @@ pub fn reaction_counts_from_values(
             if let Some(i) = reaction_index(&t) {
                 push(i, graph_reactor(o));
             } else if let Some(emoji) = reaction_emoji_for_key(&t) {
-                extra_push(emoji, graph_reactor(o));
+                extra_push(emoji, None, graph_reactor(o));
+            } else if t == "custom" {
+                // Graph-like custom entry: displayName (+ optionally
+                // reactionId = the 0-csea object id). Shape unverified —
+                // the native emotions path is the live-verified source.
+                let name = obj_str_ci(o, "displayName");
+                let object_id = obj_str_ci(o, "reactionId")
+                    .filter(|id| id.starts_with("0-csea-"))
+                    .unwrap_or_default();
+                if let Some(name) = name {
+                    extra_push(
+                        format!("{name};{object_id}"),
+                        Some(CustomReaction { name, object_id }),
+                        graph_reactor(o),
+                    );
+                }
             }
         }
     } else if let Some(list) = emotions.and_then(as_array_lenient) {
@@ -1774,7 +1888,18 @@ pub fn reaction_counts_from_values(
                     let Some(uo) = u.as_object() else { continue };
                     let id = obj_str_ci(uo, "mri").or_else(|| obj_str_ci(uo, "id"));
                     let name = obj_str_ci(uo, "displayName").unwrap_or_default();
-                    extra_push(emoji.clone(), id.map(|id| Reactor { id, name }));
+                    extra_push(emoji.clone(), None, id.map(|id| Reactor { id, name }));
+                }
+            } else if let Some(custom) = parse_custom_emotion_key(&t) {
+                for u in &users {
+                    let Some(uo) = u.as_object() else { continue };
+                    let id = obj_str_ci(uo, "mri").or_else(|| obj_str_ci(uo, "id"));
+                    let name = obj_str_ci(uo, "displayName").unwrap_or_default();
+                    extra_push(
+                        t.clone(),
+                        Some(custom.clone()),
+                        id.map(|id| Reactor { id, name }),
+                    );
                 }
             }
         }
@@ -1785,15 +1910,15 @@ pub fn reaction_counts_from_values(
         .filter(|(_, (c, _))| *c > 0)
         .map(|((emoji, _), (count, reactors))| ReactionCount {
             emoji: emoji.to_string(),
+            custom: None,
             count,
             reactors,
         })
         .collect();
-    out.extend(
-        extra
-            .into_iter()
-            .map(|(emoji, count, reactors)| ReactionCount { emoji, count, reactors }),
-    );
+    out.extend(extra.into_iter().map(|(key, custom, count, reactors)| {
+        let emoji = if custom.is_some() { String::new() } else { key };
+        ReactionCount { emoji, custom, count, reactors }
+    }));
     out
 }
 
@@ -3866,6 +3991,56 @@ src="x">"#));
         assert_eq!(counts[1].reactors.len(), 2);
     }
 
+    /// Custom-emotion keys (live shape 2026-10-19: the native read of a
+    /// beta custom setReaction showed `"sadcat1;0-csea-d6-…"` with the
+    /// reactor MRI; message-body CustomEmoji imgs carry the same shape
+    /// in `itemid`).
+    #[test]
+    fn custom_emotion_keys_group_as_custom_reactions() {
+        let c = parse_custom_emotion_key("sadcat1;0-csea-d6-11111111222233334444555566667777")
+            .expect("live shape parses");
+        assert_eq!(c.name, "sadcat1");
+        assert_eq!(c.object_id, "0-csea-d6-11111111222233334444555566667777");
+        // Not custom: no object id, wrong prefix, empty name.
+        assert!(parse_custom_emotion_key("like").is_none());
+        assert!(parse_custom_emotion_key("sadcat1;1-csea-x").is_none());
+        assert!(parse_custom_emotion_key(";0-csea-x").is_none());
+        assert!(parse_custom_emotion_key("a;0-csea-x;junk").is_none());
+
+        let emotions = serde_json::json!([
+            {"key": "like", "users": [{"mri": "8:orgid:a"}]},
+            {"key": "sadcat1;0-csea-d6-11111111222233334444555566667777",
+             "users": [{"mri": "8:orgid:a"}, {"mri": "8:orgid:b"}]}
+        ]);
+        let counts = reaction_counts_from_values(None, Some(&emotions));
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts[0].emoji, "\u{1f44d}");
+        let cust = counts[1].custom.as_ref().expect("custom payload");
+        assert_eq!(counts[1].emoji, "");
+        assert_eq!(cust.name, "sadcat1");
+        assert_eq!(cust.object_id, "0-csea-d6-11111111222233334444555566667777");
+        assert_eq!(counts[1].count, 2);
+        assert_eq!(counts[1].reactors.len(), 2);
+    }
+
+    /// The custom reaction wire: documented beta body, name validation
+    /// (the `;` separator must not be smuggled into a write key).
+    #[test]
+    fn custom_reaction_wire_shapes() {
+        assert_eq!(
+            custom_reaction_body("sadcat1"),
+            serde_json::json!({ "reactionType": "custom", "displayName": "sadcat1" })
+        );
+        assert_eq!(
+            super::custom_reaction_beta_url("19:meeting_x@thread.v2", "42", "setReaction"),
+            "https://graph.microsoft.com/beta/chats/19%3Ameeting_x%40thread.v2/messages/42/setReaction"
+        );
+        assert!(super::custom_reaction_name_valid("sadcat1"));
+        assert!(!super::custom_reaction_name_valid(""));
+        assert!(!super::custom_reaction_name_valid("a;b"));
+        assert!(!super::custom_reaction_name_valid("  "));
+    }
+
     #[test]
     fn reaction_endpoint_shapes() {
         // Graph setReaction/unsetReaction paths; the chat id must be
@@ -3914,11 +4089,13 @@ src="x">"#));
             vec![
                 ReactionCount {
                     emoji: "👍".to_string(),
+                    custom: None,
                     count: 2,
                     reactors: vec![]
                 },
                 ReactionCount {
                     emoji: "😂".to_string(),
+                    custom: None,
                     count: 1,
                     reactors: vec![]
                 },
@@ -3938,6 +4115,7 @@ src="x">"#));
             message_reactions(&msg),
             vec![ReactionCount {
                 emoji: "❤️".to_string(),
+                custom: None,
                 count: 1,
                 reactors: vec![]
             }]
