@@ -427,6 +427,8 @@ pub async fn start_call_recording(
             // Build ConversationCallParams for acknowledging callAcceptance frames
             let conv_params = ConversationCallParams {
                 ic3_token,
+                skype_token: "",
+                consumer: false,
                 trouter_surl,
                 caller_mri,
                 caller_display_name: display_name,

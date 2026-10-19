@@ -88,6 +88,121 @@ impl Session {
 async fn main() -> anyhow::Result<()> {
     let a = open(A_RT, "A").await?;
     let b = open(B_RT, "B").await?;
+    if std::env::var("PAIR_PROBE_CALLAUTH").is_ok() {
+        let url = "https://api.flightproxy.skype.com/api/v2/epconv";
+        for (label, builder) in [
+            ("bearer-skype", a.http.post(url).header("Authorization", format!("Bearer {}", a.skype)).header("Content-Type", "application/json")),
+            ("x-skypetoken", a.http.post(url).header("X-Skypetoken", &*a.skype).header("Content-Type", "application/json")),
+        ] {
+            let resp = builder.body("{}").timeout(std::time::Duration::from_secs(10)).send().await?;
+            println!("{label}: HTTP {} {}", resp.status(), resp.text().await.unwrap_or_default().chars().take(100).collect::<String>());
+        }
+        // The web client's ic3 resources (its JS config): mint the
+        // non-CAE GUID scope and try it as the epconv Bearer.
+        let rt = std::fs::read_to_string(A_RT)?.trim().to_string();
+        let resp = a.http
+            .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", rt.as_str()),
+                ("client_id", CLIENT_ID),
+                ("scope", "93aca3ff-e61e-477f-b3e7-9fe10c6b97af/.default offline_access"),
+            ])
+            .send()
+            .await?;
+        let v: Value = resp.json().await?;
+        match v.get("access_token").and_then(|t| t.as_str()) {
+            Some(ic3) => {
+                println!("ic3 GUID mint OK ({} bytes)", ic3.len());
+                let resp = a.http
+                    .post("https://api.flightproxy.skype.com/api/v2/epconv")
+                    .header("Authorization", format!("Bearer {ic3}"))
+                    .header("Content-Type", "application/json")
+                    .body("{}")
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await?;
+                println!(
+                    "epconv with ic3 bearer: HTTP {} {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default().chars().take(120).collect::<String>()
+                );
+            }
+            None => println!(
+                "ic3 GUID mint failed: {}",
+                v.get("error_description").and_then(|e| e.as_str()).unwrap_or("?")
+            ),
+        }
+        return Ok(());
+    }
+    if std::env::var("PAIR_PROBE_EPCONV").is_ok() {
+        for url in [
+            "https://api.cc.skype.com/api/v2/epconv",
+            "https://api.conv.skype.com/api/v2/epconv",
+            "https://api.cc.skype.com/cc/v1/epconv",
+            "https://api.conv.skype.com/cc/v1/epconv",
+            "https://api.cc.skype.com/api/v1/epconv",
+            "https://api.conv.skype.com/v1/epconv",
+            "https://api.cc.skype.com/v1/epconv",
+            "https://api.conv.skype.com/api/v2/conversations",
+            "https://us-api.asm.skype.com/v1/epconv",
+            "https://api.cc.skype.com:8443/api/v1/conv",
+            "https://api.conv.skype.com:8443/api/v1/conv",
+            "https://api.cc.skype.com:8443/api/v1/epconv",
+            "https://api.conv.skype.com:8443/api/v1/epconv",
+            "https://api.conv.skype.com:8443/api/v1/conv",
+            "https://api.flightproxy.skype.com/api/v2/cp/api.conv.skype.com/api/v1/conv",
+            "https://api.flightproxy.skype.com/api/v2/cp/api.cc.skype.com:8443/api/v1/conv",
+            "https://api.flightproxy.skype.com/api/v2/epconv",
+            "https://us-api.flightproxy.skype.com/api/v2/epconv",
+        ] {
+            match a
+                .http
+                .post(url)
+                .header("X-Skypetoken", &*a.skype)
+                .header("Content-Type", "application/json")
+                .body("{}")
+                .timeout(std::time::Duration::from_secs(8))
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    println!("{url:<56} HTTP {status} {}", &body.chars().take(120).collect::<String>());
+                }
+                Err(e) => println!("{url:<56} ERR {e}"),
+            }
+        }
+        return Ok(());
+    }
+    if std::env::var("PAIR_DUMP_MEMBERS").is_ok() {
+        let resp = a
+            .get(&format!("{}/v1/threads/19:11111111222233334444555566667777@thread.v2/members", a.chat_service))
+            .send()
+            .await?;
+        println!("members HTTP {}", resp.status());
+        let v: Value = resp.json().await?;
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        let resp = a
+            .get(&format!("{}/v1/users/ME/conversations?view=mychats&pageSize=3", a.chat_service))
+            .send()
+            .await?;
+        let v: Value = resp.json().await?;
+        if let Some(conv) = v.get("conversations").and_then(|c| c.as_array()).and_then(|c| c.first()) {
+            println!("first conversation object:\n{}", serde_json::to_string_pretty(conv)?);
+        }
+        for suffix in ["/properties?reason=roster", "/profile?reason=roster"] {
+            let resp = a
+                .get(&format!("{}/v1/users/8:live:rig-consumer-a{suffix}", a.chat_service))
+                .send()
+                .await?;
+            println!("GET {suffix}: HTTP {}", resp.status());
+            let v: Value = resp.json().await.unwrap_or(Value::Null);
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        return Ok(());
+    }
     println!("A skypeid: {}", a.skypeid);
     println!("B skypeid: {}", b.skypeid);
     let a_mri = format!("8:{}", a.skypeid);

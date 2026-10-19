@@ -284,14 +284,20 @@ pub async fn run_call_with_controls(
     );
     let skype_token_str = &skype_token.token;
 
-    let ic3_token = config
-        .get_ic3_token()
-        .context("No IC3 token. Sign in first.")?;
-    anyhow::ensure!(
-        !ic3_token.is_expired(),
-        "IC3 token expired. Sign in again."
-    );
-    let ic3_token_str = &ic3_token.token;
+    // Consumer: the IC3 Gateway is AAD-only (AADSTS9002332) — the
+    // skype token IS the call credential (X-Skypetoken on call control).
+    let consumer = config.personal == Some(true);
+    let ic3_token_owned;
+    let ic3_token_str: &str = if consumer {
+        // The IC3 Gateway is AAD-only (AADSTS9002332) — the skype token
+        // IS the call credential (X-Skypetoken on call control).
+        skype_token_str
+    } else {
+        let ic3 = config.get_ic3_token().context("No IC3 token. Sign in first.")?;
+        anyhow::ensure!(!ic3.is_expired(), "IC3 token expired. Sign in again.");
+        ic3_token_owned = ic3.token;
+        &ic3_token_owned
+    };
 
     let recorder_token_str = if record {
         let recorder_token = config
@@ -517,6 +523,8 @@ pub async fn run_call_with_controls(
     let teams_region = signaling::TeamsRegion::from_config_or_env(&config);
     let conv_params = signaling::ConversationCallParams {
         ic3_token: ic3_token_str,
+        skype_token: skype_token_str,
+        consumer,
         trouter_surl: &trouter_session.surl,
         caller_mri: &caller_mri,
         caller_display_name: &display_name,
@@ -1023,6 +1031,12 @@ pub fn derive_epconv_url(region_gtms: &serde_json::Value) -> Option<String> {
         .and_then(|v| v.as_str())
     {
         return Some(url.to_string());
+    }
+    // Consumer: the flightproxy twin (live-verified 400-on-empty-body =
+    // route + auth OK; every appliance/8443 and conv.skype.com path
+    // 404s or times out — probe log 2026-10-19).
+    if region_gtms.get("calling_callControllerServiceUrl").is_some() {
+        return Some("https://api.flightproxy.skype.com/api/v2/epconv".to_string());
     }
 
     // Fallback: derive from potentialCallRequestUrl

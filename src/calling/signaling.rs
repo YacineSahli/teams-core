@@ -127,8 +127,32 @@ pub struct ConversationJoined {
 }
 
 /// Parameters for the two-phase conversation call placement.
+/// Call-control auth: consumer (personal) accounts ride the
+/// X-Skypetoken (the IC3 Gateway resource is AAD-only — AADSTS9002332;
+/// the consumer epconv accepts the skype token, live-probed 400-on-
+/// empty-body vs 401 for Bearer).
+pub fn call_auth(params: &ConversationCallParams) -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    if params.consumer {
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(params.skype_token) {
+            h.insert("X-Skypetoken", v);
+        }
+    } else if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!(
+        "Bearer {}",
+        params.ic3_token
+    )) {
+        h.insert("Authorization", v);
+    }
+    h
+}
+
 pub struct ConversationCallParams<'a> {
     pub ic3_token: &'a str,
+    /// Skype token (consumer call credential; work passes it too —
+    /// recording and some endpoints want it either way).
+    pub skype_token: &'a str,
+    /// Personal (consumer) account: X-Skypetoken call auth.
+    pub consumer: bool,
     pub trouter_surl: &'a str,
     pub caller_mri: &'a str,
     pub caller_display_name: &'a str,
@@ -241,7 +265,7 @@ pub async fn create_conversation(
 
     let resp = http
         .post(epconv_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
+        .headers(call_auth(params))
         .header("Content-Type", "application/json")
         .header("x-microsoft-skype-chain-id", params.chain_id)
         .header("x-microsoft-skype-message-id", params.message_id)
@@ -365,7 +389,7 @@ pub async fn join_conversation_with_modalities(
 
     let resp = http
         .post(conversation_controller)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
+        .headers(call_auth(params))
         .header("Content-Type", "application/json")
         .header("x-microsoft-skype-chain-id", params.chain_id)
         .header("x-microsoft-skype-message-id", params.message_id)
@@ -706,7 +730,7 @@ pub async fn acknowledge_call_acceptance(
 
     let resp = http
         .post(acknowledgement_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
+        .headers(call_auth(params))
         .header("Content-Type", "application/json")
         .header("x-microsoft-skype-chain-id", params.chain_id)
         .header("x-microsoft-skype-message-id", params.message_id)
@@ -763,7 +787,7 @@ pub async fn register_cc_callbacks(
 
     let resp = http
         .post(call_leg_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
+        .headers(call_auth(params))
         .header("Content-Type", "application/json")
         .header("x-microsoft-skype-chain-id", params.chain_id)
         .header("x-microsoft-skype-message-id", params.message_id)
@@ -905,7 +929,7 @@ pub async fn create_echo_call(
 
     let resp = http
         .post(epconv_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
+        .headers(call_auth(params))
         .header("Content-Type", "application/json")
         .header("x-microsoft-skype-chain-id", params.chain_id)
         .header("x-microsoft-skype-message-id", params.message_id)
@@ -1047,7 +1071,7 @@ pub async fn invite_echo_bot(
 
     let resp = http
         .post(&add_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
+        .headers(call_auth(params))
         .header("Content-Type", "application/json")
         .header("x-microsoft-skype-chain-id", params.chain_id)
         .header("x-microsoft-skype-message-id", &echo_bot_msg_id)
@@ -1192,7 +1216,7 @@ pub async fn create_1to1_call(
 
     let resp = http
         .post(epconv_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
+        .headers(call_auth(params))
         .header("Content-Type", "application/json")
         .header("x-microsoft-skype-chain-id", params.chain_id)
         .header("x-microsoft-skype-message-id", params.message_id)
@@ -1348,7 +1372,7 @@ pub async fn invite_user(
 
     let resp = http
         .post(&add_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
+        .headers(call_auth(params))
         .header("Content-Type", "application/json")
         .header("x-microsoft-skype-chain-id", params.chain_id)
         .header("x-microsoft-skype-message-id", &invite_msg_id)
@@ -1487,6 +1511,8 @@ mod tests {
         let eu = TeamsRegion::default();
         let params = ConversationCallParams {
             ic3_token: "",
+            skype_token: "",
+            consumer: false,
             trouter_surl: "",
             caller_mri: "",
             caller_display_name: "",
@@ -1517,6 +1543,8 @@ mod tests {
             TeamsRegion::with_overrides(Some("euwe01".to_string()), Some("euwe".to_string()), None);
         let params = ConversationCallParams {
             ic3_token: "",
+            skype_token: "",
+            consumer: false,
             trouter_surl: "",
             caller_mri: "",
             caller_display_name: "",
