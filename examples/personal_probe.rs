@@ -123,34 +123,76 @@ async fn main() -> anyhow::Result<()> {
     );
 
     println!();
-    println!("== 2. consumer authz exchange (teams.live.com) ==");
-    let resp = http
-        .post("https://teams.live.com/api/auth/v1.0/authz/consumer")
-        .bearer_auth(&aad)
-        .header("Content-Length", "0")
-        .send()
-        .await?;
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or(Value::Null);
-    println!("  HTTP {status}");
-    if !status.is_success() {
-        println!("  body: {body}");
-        println!(
-            "=> authz rejected this token — retry with \
-             PERSONAL_RESOURCE=https://teams.live.com"
-        );
-        return Ok(());
+    println!("== 2. consumer authz — audience matrix (v1 RT is multi-resource) ==");
+    // v1 refresh tokens can mint tokens for other resources WITHOUT a
+    // new approval: one sign-in tests every candidate audience.
+    let candidates = [
+        resource.clone(),
+        "https://teams.live.com".to_string(),
+        "https://api.interfaces.teams.live.com".to_string(),
+        "https://teams.microsoft.com".to_string(),
+        "https://api.spaces.skype.com".to_string(),
+        "https://skype.com".to_string(),
+        "https://api.skype.com".to_string(),
+        "https://substrate.office.com".to_string(),
+        "https://graph.microsoft.com".to_string(),
+    ];
+    let mut skype = String::new();
+    let mut gtms = Value::Null;
+    let mut working: Option<String> = None;
+    for aud in &candidates {
+        // Mint (or reuse) a token for this audience.
+        let tok_for_aud: String = if *aud == resource {
+            aad.clone()
+        } else if refresh_token.is_empty() {
+            continue;
+        } else {
+            let resp = http
+                .post("https://login.microsoftonline.com/common/oauth2/token")
+                .form(&[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh_token.as_str()),
+                    ("client_id", CLIENT_ID),
+                    ("resource", aud.as_str()),
+                ])
+                .send()
+                .await?;
+            let v: Value = resp.json().await.unwrap_or(Value::Null);
+            match v.get("access_token").and_then(|t| t.as_str()) {
+                Some(t) => t.to_string(),
+                None => {
+                    println!("  {aud:<45} mint failed ({})", v.get("error").and_then(|e| e.as_str()).unwrap_or("?"));
+                    continue;
+                }
+            }
+        };
+        let resp = http
+            .post("https://teams.live.com/api/auth/v1.0/authz/consumer")
+            .bearer_auth(&tok_for_aud)
+            .header("Content-Length", "0")
+            .header("Origin", "https://teams.live.com")
+            .header("Referer", "https://teams.live.com/")
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        let ok = status.is_success()
+            && body.pointer("/tokens/skypeToken").and_then(|v| v.as_str()).is_some();
+        println!("  {aud:<45} HTTP {status} {}", if ok { "=> SKYPE TOKEN" } else { "" });
+        if ok {
+            skype = body.pointer("/tokens/skypeToken").and_then(|v| v.as_str()).unwrap().to_string();
+            gtms = body.get("regionGtms").cloned().unwrap_or(Value::Null);
+            working = Some(aud.clone());
+            break;
+        }
     }
-    let skype = body
-        .pointer("/tokens/skypeToken")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    println!(
-        "  skype token: {} bytes, expires_in={:?}",
-        skype.len(),
-        body.pointer("/tokens/expiresIn").and_then(|v| v.as_u64())
-    );
-    let gtms = body.get("regionGtms").cloned().unwrap_or(Value::Null);
+    let Some(_aud) = working else {
+        println!("=> no audience accepted by authz/consumer. Capture needed:");
+        println!("   F12 on teams.live.com web, filter 'authz', copy the request's");
+        println!("   Authorization header AUDIENCE (jwt aud claim) — that unblocks this.");
+        return Ok(());
+    };
+    println!("  skype token: {} bytes", skype.len());
     println!("  regionGtms: {gtms}");
 
     println!();
