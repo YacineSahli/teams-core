@@ -37,6 +37,8 @@ const CLIENT_ID: &str = "8ec6bc83-69c8-4392-8f08-b3c986009232";
 /// The consumer web client's MSA-native authz resource (its JS config:
 /// authzResource = service::api.fl.spaces.skype.com::MBI_SSL).
 const RESOURCE_DEFAULT: &str = "service::api.fl.spaces.skype.com::MBI_SSL";
+/// Per-account: PERSONAL_RT=<path> provisions a second account (the
+/// default holds the first).
 const RT_PATH: &str = "/tmp/tfl_personal_rt";
 
 const AUTHZ_ENDPOINTS: [&str; 3] = [
@@ -95,13 +97,15 @@ fn longest_string(v: &Value) -> Option<(String, String)> {
 async fn main() -> anyhow::Result<()> {
     let resource =
         std::env::var("PERSONAL_RESOURCE").unwrap_or_else(|_| RESOURCE_DEFAULT.to_string());
+    let rt_path =
+        std::env::var("PERSONAL_RT").unwrap_or_else(|_| RT_PATH.to_string());
     let http = reqwest::Client::new();
 
     // Saved RT: mint without another approval.
-    if let Ok(rt) = std::fs::read_to_string(RT_PATH) {
+    if let Ok(rt) = std::fs::read_to_string(&rt_path) {
         let rt = rt.trim().to_string();
         if !rt.is_empty() {
-            println!("== 0. refreshing from saved RT ({RT_PATH}) ==");
+            println!("== 0. refreshing from saved RT ({rt_path}) ==");
             let resp = http
                 .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
                 .form(&[
@@ -119,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
                     .and_then(|v| v.as_str())
                     .unwrap_or(&rt)
                     .to_string();
-                let _ = std::fs::write(RT_PATH, new_rt);
+                let _ = std::fs::write(&rt_path, new_rt);
                 println!("  token refreshed ({} bytes)", t.len());
                 return authz_and_chat(&http, t.to_string()).await;
             }
@@ -195,13 +199,13 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("no token (code expired without approval?)");
     }
     if !refresh_token.is_empty() {
-        let _ = std::fs::write(RT_PATH, &refresh_token);
+        let _ = std::fs::write(&rt_path, &refresh_token);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(RT_PATH, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&rt_path, std::fs::Permissions::from_mode(0o600));
         }
-        println!("  refresh token saved to {RT_PATH} (0600) — future runs need no approval");
+        println!("  refresh token saved to {rt_path} (0600) — future runs need no approval");
     }
     authz_and_chat(&http, aad).await
 }
