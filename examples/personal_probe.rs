@@ -79,13 +79,15 @@ async fn main() -> anyhow::Result<()> {
     let mut refresh_token = String::new();
     for _ in 0..(900 / interval.max(1)) {
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        // v1 shape (AADSTS900144 named it): grant_type=device_code with
+        // the device code under the parameter name `code`.
         let resp = http
             .post("https://login.microsoftonline.com/common/oauth2/token")
             .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("grant_type", "device_code"),
+                ("code", device_code.as_str()),
                 ("client_id", CLIENT_ID),
                 ("resource", resource.as_str()),
-                ("device_code", device_code.as_str()),
             ])
             .send()
             .await?;
@@ -100,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
         let err = tok.get("error").and_then(|v| v.as_str()).unwrap_or("");
-        if err != "authorization_pending" {
+        if err != "authorization_pending" && err != "slow_down" {
             anyhow::bail!("device-code exchange failed: {err} ({tok})");
         }
     }
