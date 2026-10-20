@@ -30,10 +30,27 @@ enum DisconnectReason {
 /// The live trouter session's push base (`…/v4/f/{key}/`), set on every
 /// (re)connect — call-answer flows build their signaling callbacks on it.
 static CURRENT_SURL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// The MAIN session's endpoint id (`epid`) — the id the registrar
+/// registrations are bound to. Call signaling payloads (epconv create
+/// from-participant, callee fork-attach, callAcceptance.acceptedBy)
+/// must DECLARE this id: the call controller resolves endpoint-addressed
+/// deliveries ("Delivering call acceptance notification") against the
+/// registrar, and a fresh random UUID has no registration → trouter
+/// 504 → the whole acceptance aborts (live: 412/430/10065). Set beside
+/// CURRENT_SURL on the main session's connect; per-call sockets never
+/// touch it (their negotiate path bypasses this module's connect).
+static CURRENT_EPID: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 /// The current trouter session's push base, if a session is connected.
 pub fn current_surl() -> Option<String> {
     let g = CURRENT_SURL.lock().ok()?;
+    let s = g.clone();
+    (!s.is_empty()).then_some(s)
+}
+
+/// The main session's registered endpoint id, if connected.
+pub fn current_epid() -> Option<String> {
+    let g = CURRENT_EPID.lock().ok()?;
     let s = g.clone();
     (!s.is_empty()).then_some(s)
 }
@@ -117,6 +134,9 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
     {
         if let Ok(mut g) = CURRENT_SURL.lock() {
             *g = session.surl.clone();
+        }
+        if let Ok(mut g) = CURRENT_EPID.lock() {
+            *g = epid.clone();
         }
     }
 

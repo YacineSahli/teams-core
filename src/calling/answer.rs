@@ -91,6 +91,24 @@ pub async fn answer_call_with_stop(
         match signaling::attach_forked_call(&http, skype_token_str, notification).await {
             Ok(merged) => {
                 let _ = signaling::send_call_progress(&http, skype_token_str, &merged).await;
+                // The fork's broker channel (GET long-poll): the CC
+                // delivers the callAcceptance ECHO to the CALLEE here,
+                // and the callee must acknowledge it quickly or the CC
+                // aborts the acceptance POST (22s hold → 430/10065
+                // "Delivering call acceptance notification"). Start the
+                // poll BEFORE the acceptance goes out.
+                if let Some(sub) = merged
+                    .call_invitation
+                    .as_ref()
+                    .and_then(|i| i.links.as_ref())
+                    .and_then(|l| l.subscribe.clone())
+                {
+                    let http2 = http.clone();
+                    let tok2 = skype_token_str.to_string();
+                    tokio::spawn(async move {
+                        broker_acceptance_echo(http2, tok2, sub).await;
+                    });
+                }
                 notification_owned = merged;
                 &notification_owned
             }
@@ -269,4 +287,103 @@ pub async fn answer_call_with_stop(
         s.stop().await;
     }
     Ok(result)
+}
+
+/// Long-poll the fork's broker message channel and acknowledge the
+/// callAcceptance echo (the web callee's `handleCallAcceptance` +
+/// quick-send acknowledgement). Exits when the channel 404s (call gone)
+/// or after 3 minutes.
+async fn broker_acceptance_echo(http: reqwest::Client, skype_token: String, url: String) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
+    while tokio::time::Instant::now() < deadline {
+        let resp = match http
+            .get(&url)
+            .header("X-Skypetoken", &skype_token)
+            .timeout(std::time::Duration::from_secs(35))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!("broker poll error (retrying): {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 404 {
+            tracing::info!("broker channel gone (404) — stopping echo poll");
+            return;
+        }
+        if body.trim().is_empty() {
+            continue;
+        }
+        tracing::info!(
+            "broker event (HTTP {}): {}",
+            status,
+            &body.chars().take(2400).collect::<String>()
+        );
+        if !body.contains("callAcceptance") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let ack_url = [
+            "/callAcceptance/links/acknowledgement",
+            "/links/acknowledgement",
+            "/callAcceptance/links/mediaAcknowledgement",
+            "/callAcceptance/acknowledgement",
+            "/mediaAcknowledgement",
+        ]
+        .iter()
+        .find_map(|p| {
+            v.pointer(p)
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+        });
+        let Some(ack_url) = ack_url else {
+            tracing::warn!("broker callAcceptance echo carried no ack URL");
+            continue;
+        };
+        // Ty-shaped body: the acknowledgement carries the callee's
+        // renegotiation-era callback links.
+        let (surl, epid) = (
+            crate::trouter::current_surl(),
+            crate::trouter::current_epid(),
+        );
+        let tc = |path: &str| -> String {
+            let ep = epid.clone().unwrap_or_default();
+            match &surl {
+                Some(s) => crate::calling::signaling::trouter_callback(s, &ep, path),
+                None => String::new(),
+            }
+        };
+        let payload = serde_json::json!({
+            "callAcceptanceAcknowledgement": {
+                "links": {
+                    "mediaRenegotiation": tc("call/mediaRenegotiation/"),
+                    "transfer": tc("call/transfer/"),
+                    "replacement": tc("call/replacement/"),
+                    "balanceUpdate": tc("call/balanceUpdate/"),
+                    "retargetCompletion": tc("call/retargetCompletion/"),
+                    "controlVideoStreaming": tc("call/controlVideoStreaming/"),
+                    "updateMediaDescriptions": tc("call/updateMediaDescriptions/")
+                }
+            }
+        });
+        match http
+            .post(&ack_url)
+            .header("X-Skypetoken", &skype_token)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(r) => tracing::info!("broker acceptance ack -> HTTP {}", r.status()),
+            Err(e) => tracing::warn!("broker acceptance ack failed: {e}"),
+        }
+    }
 }

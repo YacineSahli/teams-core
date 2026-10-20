@@ -627,9 +627,14 @@ pub async fn accept_call_with_sdp(
         let assigned_pid = to_part
             .and_then(|t| t.participant_id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // acceptedBy.endpointId must be OUR REGISTERED endpoint (the
+        // main session's epid): the CC's acceptance-notification
+        // delivery resolves it against the registrar (live: random id
+        // → 430/10065 trouter 504).
         let ep_for_links = to_part
             .and_then(|t| t.endpoint_id.clone())
             .filter(|e| !e.contains("0000-0000"))
+            .or_else(crate::trouter::current_epid)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let cb = |path: &str| {
             crate::trouter::current_surl().map(|surl| trouter_callback(&surl, &ep_for_links, path))
@@ -655,6 +660,12 @@ pub async fn accept_call_with_sdp(
                 "retargetCompletion": cb("call/retargetCompletion/"),
                 "controlVideoStreaming": cb("call/controlVideoStreaming/"),
                 "updateMediaDescriptions": cb("call/updateMediaDescriptions/")
+            },
+            // The web client's AG builder always sends the media-
+            // controller callback URLs with the acceptance.
+            "clientContentForMediaController": {
+                "controlVideoStreaming": cb("call/controlVideoStreaming/"),
+                "csrcInfo": cb("call/csrcInfo/")
             }
         });
         if let Some(sdp) = sdp_answer {
@@ -729,7 +740,12 @@ pub async fn attach_forked_call(
         .and_then(|t| t.first())
         .map(|t| t.id.clone().unwrap_or_default())
         .unwrap_or_default();
-    let endpoint_id = uuid::Uuid::new_v4().to_string();
+    // The DECLARED endpoint must be the main session's REGISTERED epid
+    // (same reason as the caller's create — the CC delivers
+    // endpoint-addressed call events via the registrar; a random id
+    // has no registration and deliveries 504).
+    let endpoint_id = crate::trouter::current_epid()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let participant_id = uuid::Uuid::new_v4().to_string();
     // attach.links.end is REQUIRED (live: 400 "The Links field is
     // required") — point it at our live trouter session's push path;
@@ -840,6 +856,9 @@ pub async fn attach_forked_call(
     }
     if resp_links.reject.is_some() {
         links.reject = resp_links.reject;
+    }
+    if resp_links.subscribe.is_some() {
+        links.subscribe = resp_links.subscribe;
     }
     if inv.media_content.is_none()
         || inv
@@ -1413,7 +1432,17 @@ pub async fn create_1to1_call(
     sdp_offer: &str,
     callee_mri: Option<&str>,
 ) -> Result<(ConversationCreated, ConversationJoined)> {
-    let tc = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
+    // Consumer: the DECLARED endpoint must be the main session's
+    // REGISTERED epid — the call controller resolves endpoint-addressed
+    // deliveries (the acceptance notification) against the registrar; a
+    // random per-call id has no registration and the acceptance aborts
+    // (live: 412/430/10065 "Delivering call acceptance notification").
+    let declared_epid = if params.consumer {
+        crate::trouter::current_epid().unwrap_or_else(|| params.endpoint_id.to_string())
+    } else {
+        params.endpoint_id.to_string()
+    };
+    let tc = |path: &str| trouter_callback(params.trouter_surl, &declared_epid, path);
     let cause_id = &params.message_id[..8.min(params.message_id.len())];
 
     let payload = serde_json::json!({
@@ -1452,7 +1481,7 @@ pub async fn create_1to1_call(
             "from": {
                 "id": params.caller_mri,
                 "displayName": params.caller_display_name,
-                "endpointId": params.endpoint_id,
+                "endpointId": declared_epid,
                 "participantId": params.participant_id,
                 "languageId": "en-US"
             },
@@ -1640,10 +1669,29 @@ pub async fn invite_user(
         // REVERSED direction ("missed call from" the callee). The
         // modalities already ride on the epconv-level callInvitation.
         "participantInvitationData": {},
+        // The callInvitation's OWN links are the CALLER's call-channel
+        // callbacks — where the call controller delivers the caller's
+        // call events. `acceptance` is the destination for the CC's
+        // "call acceptance notification" (the callee's callAcceptance
+        // fan-out); without it the CC falls back to an endpoint lookup
+        // that has no target and 504s, aborting the whole acceptance
+        // (live: 412/430/10065, 22s hold). Mined from the web client's
+        // callInvitation builder (calling-pluginless chunk).
         "callInvitation": {
             "callModalities": call_modalities,
             "replaces": null,
-            "transferor": null
+            "transferor": null,
+            "links": {
+                "progress": tc("call/progress/"),
+                "mediaAnswer": tc("call/mediaAnswer/"),
+                "acceptance": tc("call/acceptance/"),
+                "redirection": tc("call/redirection/"),
+                "end": tc("call/end/")
+            },
+            "clientContentForMediaController": {
+                "controlVideoStreaming": tc("call/controlVideoStreaming/"),
+                "csrcInfo": tc("call/csrcInfo/")
+            }
         },
         "replacementDetails": null,
         "groupContext": null,

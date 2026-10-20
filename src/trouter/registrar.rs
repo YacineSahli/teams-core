@@ -138,6 +138,67 @@ pub async fn register_life(
     register_inner(http, skype_token, LIFE_REGISTRAR, trouter_surl, None, REGISTRATIONS_LIFE).await
 }
 
+/// Experimental: register the CALLING entries with
+/// `registrationId = the declared endpoint id` — the call controller's
+/// endpoint-addressed deliveries ("Delivering call acceptance
+/// notification") plausibly resolve the caller's endpoint through the
+/// registrar, and our calling registrations otherwise carry random
+/// registrationIds with no link to the endpoint the signaling payloads
+/// declare. Registers the SkypeSpacesWeb + NextGenCalling entries of
+/// BOTH tables at both registrars under `epid`.
+pub async fn register_calling_epid(
+    http: &reqwest::Client,
+    skype_token: &str,
+    trouter_surl: &str,
+    epid: &str,
+) -> Result<()> {
+    let mut entries: Vec<(String, String, String)> = Vec::new(); // (app_id, template, suffix)
+    for t in [REGISTRATIONS_PERSONAL, REGISTRATIONS_LIFE] {
+        for e in t.iter().filter(|e| e.app_id != "TeamsCDLWebWorker") {
+            let key = format!("{}/{}", e.app_id, e.template_key);
+            if !entries.iter().any(|(a, _, _)| format!("{a}") == key) {
+                entries.push((e.app_id.to_string(), e.template_key.to_string(), e.path_suffix.to_string()));
+            }
+        }
+    }
+    for (app_id, template, suffix) in entries {
+        let path = format!("{trouter_surl}{suffix}");
+        let payload = serde_json::json!({
+            "clientDescription": {
+                "appId": app_id,
+                "aesKey": "",
+                "languageId": "en-US",
+                "platform": "edge",
+                "templateKey": template,
+                "platformUIVersion": "49/1.0.0"
+            },
+            "registrationId": epid,
+            "nodeId": "",
+            "transports": {
+                "TROUTER": [{ "context": "", "path": path, "ttl": 86400 }]
+            }
+        });
+        for url in [
+            "https://edge.skype.com/registrar/prod/V3/registrations",
+            LIFE_REGISTRAR,
+        ] {
+            let resp = http
+                .post(url)
+                .header("X-Skypetoken", skype_token)
+                .json(&payload)
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await
+                .context("Registrar POST failed")?;
+            tracing::info!(
+                "Epid registration {app_id}/{template} at {url}: HTTP {}",
+                resp.status()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// One registration call with the table chosen by the personal flag.
 pub async fn register_flagged(
     http: &reqwest::Client,

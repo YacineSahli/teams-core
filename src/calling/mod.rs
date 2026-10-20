@@ -52,6 +52,11 @@ pub struct CallLinks {
     pub attach: Option<String>,
     pub reject: Option<String>,
     pub progress: Option<String>,
+    /// Broker long-poll channel (GET) from the fork-attach response —
+    /// the web callee's incoming call-event stream. The callAcceptance
+    /// ECHO arrives here and must be acknowledged quickly or the CC
+    /// aborts the callee's acceptance POST (430/10065).
+    pub subscribe: Option<String>,
 }
 
 /// Media content (SDP blob) from the call invitation.

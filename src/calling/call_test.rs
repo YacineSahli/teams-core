@@ -2319,7 +2319,24 @@ async fn wait_for_call_acceptance(
                                 };
 
                                 let end_url = get_link("end");
-                                let acknowledgement_url = get_link("acknowledgement");
+                                // Consumer mediaAnswer events carry the
+                                // ack URL as `mediaAcknowledgement` INSIDE
+                                // the mediaAnswer object (live-captured),
+                                // not as a links entry — without POSTing
+                                // it the CC's answer state machine times
+                                // out and kills the callee's acceptance
+                                // (430/10065, 22s hold).
+                                let acknowledgement_url = get_link("acknowledgement")
+                                    .or_else(|| {
+                                        v.pointer("/mediaAnswer/links/mediaAcknowledgement")
+                                            .and_then(|u| u.as_str())
+                                            .map(str::to_string)
+                                    })
+                                    .or_else(|| {
+                                        v.pointer("/mediaAnswer/mediaAcknowledgement")
+                                            .and_then(|u| u.as_str())
+                                            .map(str::to_string)
+                                    });
                                 let call_leg_url = get_link("callLeg");
                                 let apply_channel_params_url = get_link("applyChannelParameters");
 

@@ -137,71 +137,253 @@ async fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    if std::env::var("PAIR_REG_CLEAN").is_ok() {
-        // Enumerate our registrar registrations; the CC's acceptance
-        // fan-out 504s on dead ones (430/10065). Try list + delete.
-        // Live paths per account (env: PAIR_KEEP_A / PAIR_KEEP_B) — every
-        // registration bound to a different path is stale (dead socket,
-        // 24h TTL) and gets deleted.
-        let keep_a = std::env::var("PAIR_KEEP_A").unwrap_or_default();
-        let keep_b = std::env::var("PAIR_KEEP_B").unwrap_or_default();
-        let base = "https://edge.skype.com/registrar/prod/V3/registrations";
-        for (label, sess, keep) in [("A", &a, &keep_a), ("B", &b, &keep_b)] {
-            let Ok(r) = sess
-                .http
-                .get(base)
-                .header("X-SkypeToken", &*sess.skype)
+    if std::env::var("PAIR_CONVEND").is_ok() {
+        // Un-wedge a thread whose conv-service record is stuck: the
+        // conversationEnd 5704 body carries the poisoned conversation's
+        // URL. GET it for live links/state, then try every end shape.
+        let url = std::env::var("PAIR_CONV_URL").unwrap_or_else(|_| {
+            "https://api.flightproxy.teams.microsoft.com/api/v2/ep/conv-frce-06-prod-aks.conv.skype.com/conv/b-YAmYKC80KZjA_duDa_xQ?i=10-128-240-128&e=639276213509928318".into()
+        });
+        let authed = |rb: reqwest::RequestBuilder| {
+            rb.header("X-Skypetoken", &*a.skype)
+                .header("Accept", "application/json")
                 .timeout(std::time::Duration::from_secs(10))
+        };
+        println!("=== GET {url}");
+        let resp = authed(a.http.get(&url)).send().await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        println!("GET: HTTP {status}\n{}", &body.chars().take(3000).collect::<String>());
+        // If the conversation object exposes an end link, POST it.
+        if let Ok(v) = serde_json::from_str::<Value>(&body) {
+            if let Some(end) = v
+                .get("links")
+                .and_then(|l| l.get("end"))
+                .or_else(|| v.get("end"))
+                .and_then(|e| e.as_str())
+            {
+                println!("=== POST end link {end}");
+                let resp = authed(a.http.post(end))
+                    .header("Content-Type", "application/json")
+                    .body("{}")
+                    .send()
+                    .await?;
+                println!(
+                    "POST end: HTTP {} {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default().chars().take(600).collect::<String>()
+                );
+            }
+        }
+        for (label, method) in [("POST {url}/end", "post-end"), ("DELETE {url}", "delete")] {
+            let req = if method == "post-end" {
+                authed(a.http.post(format!("{url}/end")))
+                    .header("Content-Type", "application/json")
+                    .body("{}")
+            } else {
+                authed(a.http.delete(&url))
+            };
+            match req.send().await {
+                Ok(resp) => println!(
+                    "{label}: HTTP {} {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default().chars().take(400).collect::<String>()
+                ),
+                Err(e) => println!("{label}: ERR {e}"),
+            }
+        }
+        return Ok(());
+    }
+    if let Ok(topic) = std::env::var("PAIR_MAKE_GROUP") {
+        // Mint a FRESH A+B thread (topic keeps it distinct from the
+        // server-deduped pair 1:1) so calls get an un-wedged conv record.
+        // Same native /v1/threads create as the working consumer 1:1.
+        let b_id = format!("8:{}", b.skypeid);
+        let body = serde_json::json!({
+            "members": [
+                {"id": b_id, "role": "Admin"},
+                {"id": format!("8:{}", a.skypeid), "role": "Admin"},
+            ],
+            "properties": {
+                "threadType": "chat",
+                "topic": topic,
+            },
+        });
+        let resp = a
+            .http
+            .post(format!("{}/v1/threads", a.chat_service))
+            .header("X-Skypetoken", &*a.skype)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await?;
+        let status = resp.status();
+        let loc = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = resp.text().await.unwrap_or_default();
+        println!("create: HTTP {status} location={loc:?}");
+        println!("{}", &body.chars().take(600).collect::<String>());
+        if let Some(l) = loc {
+            let id = l.split('?').next().and_then(|p| p.rsplit('/').next()).unwrap_or("");
+            println!("THREAD={}", id.replace("%3A", ":").replace("%3a", ":").replace("%40", "@"));
+        }
+        return Ok(());
+    }
+    if let Ok(url) = std::env::var("PAIR_BROKER_SUB") {
+        // Probe the broker subscribe link (from a fork-attach response):
+        // the web callee's incoming call-event channel. Learn the
+        // contract: method, body, and what streams back.
+        for (label, build) in [
+            ("POST-empty", a.http.post(&url).header("X-Skypetoken", &*a.skype).header("Content-Type", "application/json")),
+            ("GET", a.http.get(&url).header("X-Skypetoken", &*a.skype)),
+        ] {
+            match build
+                .timeout(std::time::Duration::from_secs(8))
                 .send()
                 .await
-            else {
-                println!("REGLIST {label}: GET failed");
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let headers = resp
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, String::from_utf8_lossy(v.as_bytes())))
+                        .take(6)
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let body = resp.text().await.unwrap_or_default();
+                    println!("{label}: HTTP {status}\n  hdrs: {headers}\n  body: {}", &body.chars().take(800).collect::<String>());
+                }
+                Err(e) => println!("{label}: ERR {e}"),
+            }
+        }
+        return Ok(());
+    }
+    if std::env::var("PAIR_REG_EPIDS").is_ok() {
+        // Experimental: bind the CALLING registration entries to the
+        // DECLARED endpoint ids (registrationId = main epid) so the CC
+        // can resolve endpoint-addressed deliveries. Envs:
+        //   PAIR_A_EP / PAIR_B_EP  = "<epid>|<surl>" per account.
+        for (label, sess) in [("A", &a), ("B", &b)] {
+            let spec = std::env::var(format!("PAIR_{}_EP", label)).unwrap_or_default();
+            let mut it = spec.split('|');
+            let (Some(epid), Some(surl)) = (it.next(), it.next()) else {
+                println!("EPIDS {label}: set PAIR_{label}_EP=<epid>|<surl>");
                 continue;
             };
-            let v: Value = match r.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    println!("REGLIST {label}: parse {e}");
-                    continue;
-                }
-            };
-            let mut stale = 0;
-            let mut kept = 0;
-            for b_ in v
-                .get("bindings")
-                .and_then(|x| x.as_array())
-                .cloned()
-                .unwrap_or_default()
+            match ost::trouter::registrar::register_calling_epid(
+                &sess.http, &sess.skype, surl, epid,
+            )
+            .await
             {
-                let rid = b_
-                    .get("registrationId")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let path = b_
-                    .pointer("/transports/trouter/0/path")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let is_live = !keep.is_empty() && path.starts_with(keep.as_str());
-                if is_live {
-                    kept += 1;
-                    continue;
-                }
-                stale += 1;
-                match sess
+                Ok(()) => println!("EPIDS {label}: ok"),
+                Err(e) => println!("EPIDS {label}: {e:#}"),
+            }
+        }
+        return Ok(());
+    }
+    if std::env::var("PAIR_REG_CLEAN").is_ok() || std::env::var("PAIR_REG_LIST").is_ok() {
+        // Enumerate our registrar registrations; the CC's acceptance
+        // fan-out 504s on dead ones (430/10065). Consumer call routing
+        // uses BOTH registrars: the eu V3 (messaging) and the LIFE one
+        // (teams.microsoft.com/registrar/prod/v2 — NextGenCalling/TFL,
+        // where call invites and acceptance fan-out route). Sweep both.
+        // Live paths per account (env: PAIR_KEEP_A / PAIR_KEEP_B, comma-
+        // separated) — every registration bound to a different path is
+        // stale (dead socket, 24h TTL) and gets deleted. PAIR_REG_LIST
+        // lists only.
+        let list_only = std::env::var("PAIR_REG_LIST").is_ok();
+        let keep_a = std::env::var("PAIR_KEEP_A").unwrap_or_default();
+        let keep_b = std::env::var("PAIR_KEEP_B").unwrap_or_default();
+        let registrars = [
+            ("v3", "https://edge.skype.com/registrar/prod/V3/registrations"),
+            ("life", "https://teams.microsoft.com/registrar/prod/v2/registrations"),
+        ];
+        for (label, sess, keep) in [("A", &a, &keep_a), ("B", &b, &keep_b)] {
+            let keeps: Vec<&str> = keep.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+            for (rname, base) in registrars {
+                let Ok(r) = sess
                     .http
-                    .delete(format!("{base}/{rid}"))
+                    .get(base)
                     .header("X-SkypeToken", &*sess.skype)
                     .timeout(std::time::Duration::from_secs(10))
                     .send()
                     .await
+                else {
+                    println!("REGLIST {label}/{rname}: GET failed");
+                    continue;
+                };
+                let status = r.status();
+                let v: Value = match r.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        println!("REGLIST {label}/{rname}: HTTP {status} parse {e}");
+                        continue;
+                    }
+                };
+                let mut stale = 0;
+                let mut kept = 0;
+                for b_ in v
+                    .get("bindings")
+                    .and_then(|x| x.as_array())
+                    .cloned()
+                    .unwrap_or_default()
                 {
-                    Ok(r) => println!("REGDEL {label} {rid:.8} HTTP {}", r.status()),
-                    Err(e) => println!("REGDEL {label} {rid:.8} ERR {e}"),
+                    let rid = b_
+                        .get("registrationId")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let path = b_
+                        .pointer("/transports/trouter/0/path")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let client = b_
+                        .get("clientName")
+                        .or_else(|| b_.get("appId"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    let tmpl = b_
+                        .get("templateKey")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    // Keep-match by token containment: the binding path is
+                    // a FULL URL; a bare starts_with token never matches
+                    // (this exact bug deleted LIVE registrations mid-call
+                    // once — the pair thread's conv record wedged 5704).
+                    let is_live = !keeps.is_empty() && keeps.iter().any(|k| path.contains(k));
+                    if list_only {
+                        println!("REG {label}/{rname} {rid:.10} live={is_live} {client}/{tmpl} path={path}");
+                        continue;
+                    }
+                    if is_live {
+                        kept += 1;
+                        continue;
+                    }
+                    stale += 1;
+                    match sess
+                        .http
+                        .delete(format!("{base}/{rid}"))
+                        .header("X-SkypeToken", &*sess.skype)
+                        .timeout(std::time::Duration::from_secs(10))
+                        .send()
+                        .await
+                    {
+                        Ok(r) => println!("REGDEL {label}/{rname} {rid:.8} HTTP {}", r.status()),
+                        Err(e) => println!("REGDEL {label}/{rname} {rid:.8} ERR {e}"),
+                    }
+                }
+                if !list_only {
+                    println!("REGSUM {label}/{rname}: kept {kept} live, deleted {stale} stale");
                 }
             }
-            println!("REGSUM {label}: kept {kept} live, deleted {stale} stale");
         }
         return Ok(());
     }
