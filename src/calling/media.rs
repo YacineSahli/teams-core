@@ -59,6 +59,7 @@ impl MediaSession {
         remote_creds: &ice::IceCredentials,
         local_material: &srtp::SrtpKeyingMaterial,
         remote_material: &srtp::SrtpKeyingMaterial,
+        dtls_client: Option<bool>,
     ) -> Result<Self> {
         let bind_addr = format!("0.0.0.0:{}", local_port);
         let socket = UdpSocket::bind(&bind_addr)
@@ -97,7 +98,13 @@ impl MediaSession {
             }
         };
 
-        let srtp_ctx = srtp::create_context(local_material, remote_material)?;
+        let srtp_ctx = if dtls_client.is_some() {
+            // DTLS-SRTP: wrong keys until the handshake task swaps in the
+            // exported ones; sends are gated until then.
+            super::dtls::placeholder_context()
+        } else {
+            srtp::create_context(local_material, remote_material)?
+        };
         let ssrc = {
             let id = uuid::Uuid::new_v4();
             let bytes = id.as_bytes();
@@ -124,10 +131,17 @@ impl MediaSession {
         #[cfg(not(feature = "audio"))]
         let spk_tx: Option<std::sync::mpsc::SyncSender<Vec<i16>>> = None;
 
+        // DTLS-SRTP plumbing: the recv loop demuxes RFC 5764 records into
+        // the shared queue; a background task runs the handshake and
+        // swaps the SRTP context; sends are gated until keys land.
+        let dtls_inbound = Arc::new(super::dtls::DtlsInbound::default());
+        let keys_ready = Arc::new(std::sync::atomic::AtomicBool::new(dtls_client.is_none()));
+
         let send_handle = {
             let socket = socket.clone();
             let srtp_ctx = srtp_ctx.clone();
             let stats = stats.clone();
+            let keys_ready = keys_ready.clone();
             tokio::spawn(send_loop(
                 socket,
                 remote_addr,
@@ -135,6 +149,7 @@ impl MediaSession {
                 ssrc,
                 stats,
                 mic_rx,
+                Some(keys_ready),
             ))
         };
 
@@ -143,10 +158,39 @@ impl MediaSession {
             let socket = socket.clone();
             let srtp_ctx = srtp_ctx.clone();
             let stats = stats.clone();
+            let dtls_inbound = dtls_inbound.clone();
             tokio::spawn(recv_loop_with_stun(
-                socket, srtp_ctx, stats, local_pwd, spk_tx,
+                socket, srtp_ctx, stats, local_pwd, spk_tx, dtls_inbound,
             ))
         };
+
+        if let Some(we_are_client) = dtls_client {
+            let socket = socket.clone();
+            let srtp_ctx = srtp_ctx.clone();
+            let inbound = dtls_inbound.clone();
+            let keys_ready = keys_ready.clone();
+            tokio::spawn(async move {
+                match super::dtls::handshake_srtp(
+                    socket,
+                    remote_addr,
+                    we_are_client,
+                    inbound,
+                    Duration::from_secs(15),
+                )
+                .await
+                {
+                    Ok(keys) => match super::dtls::srtp_context(&keys) {
+                        Ok(ctx) => {
+                            *srtp_ctx.lock().await = ctx;
+                            keys_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+                            tracing::info!("DTLS-SRTP keys installed; media ungated");
+                        }
+                        Err(e) => tracing::error!("DTLS key context build failed: {e:#}"),
+                    },
+                    Err(e) => tracing::error!("DTLS handshake failed (media stays gated): {e:#}"),
+                }
+            });
+        }
 
         Ok(MediaSession {
             socket,
@@ -228,6 +272,7 @@ impl MediaSession {
                 ssrc,
                 stats,
                 mic_rx,
+                None,
             ))
         };
 
@@ -309,6 +354,7 @@ async fn send_loop(
     ssrc: u32,
     stats: Arc<Mutex<MediaStats>>,
     mic_rx: Option<std::sync::mpsc::Receiver<Vec<i16>>>,
+    keys_ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let mut seq: u16 = 0;
     let mut timestamp: u32 = 0;
@@ -323,6 +369,15 @@ async fn send_loop(
 
     loop {
         interval.tick().await;
+
+        // DTLS-SRTP: hold (silence, no RTP) until the handshake lands the
+        // real keys — garbage-SRTP before that only wastes the peer's
+        // replay window.
+        if let Some(ref ready) = keys_ready {
+            if !ready.load(std::sync::atomic::Ordering::SeqCst) {
+                continue;
+            }
+        }
 
         // Try to get a frame from the microphone; fall back to silence.
         let payload = if let Some(ref rx) = mic_rx {
@@ -691,6 +746,7 @@ async fn recv_loop_with_stun(
     stats: Arc<Mutex<MediaStats>>,
     local_pwd: String,
     spk_tx: Option<std::sync::mpsc::SyncSender<Vec<i16>>>,
+    dtls_inbound: Arc<super::dtls::DtlsInbound>,
 ) {
     let mut buf = [0u8; 2048];
 
@@ -700,6 +756,12 @@ async fn recv_loop_with_stun(
         match socket.recv_from(&mut buf).await {
             Ok((len, from)) => {
                 let data = &buf[..len];
+
+                // RFC 5764 demux: DTLS records feed the handshake engine.
+                if super::dtls::is_dtls_record(data) {
+                    super::dtls::push_inbound(&dtls_inbound, data);
+                    continue;
+                }
 
                 // Handle STUN messages
                 if len >= 20 && ice::is_stun_message(data) {

@@ -802,6 +802,10 @@ pub async fn run_call_with_controls(
     }
 
     // 8. Set up media leg
+    // DTLS-SRTP when the remote answer declared a fingerprint (WebRTC
+    // peers): we offered actpass, they answered active → we are server.
+    let remote_answer_sdp = acceptance.sdp_blob.clone().unwrap_or_default();
+    let dtls_server = remote_answer_sdp.contains("a=fingerprint");
     let mut outgoing_leg = setup_media_leg(
         &offer_result.audio_crypto_line,
         &offer_result.video_crypto_line,
@@ -809,13 +813,14 @@ pub async fn run_call_with_controls(
         &our_audio_pwd,
         &our_video_ufrag,
         &our_video_pwd,
-        &acceptance.sdp_blob.clone().unwrap_or_default(),
+        &remote_answer_sdp,
         audio_socket,
         video_socket,
         "outgoing",
         true,
         video_ssrc,
         audio_ssrc,
+        dtls_server,
     )
     .await
     .context("Failed to set up outgoing media leg")?;
@@ -1224,6 +1229,9 @@ struct MediaLeg {
     audio_srtp_ctx: Arc<Mutex<srtp::SrtpContext>>,
     audio_remote_addr: std::net::SocketAddr,
     audio_local_pwd: String,
+    /// DTLS-SRTP (WebRTC peers): inbound record queue + send gate.
+    audio_dtls_inbound: Arc<super::dtls::DtlsInbound>,
+    audio_keys_ready: Arc<std::sync::atomic::AtomicBool>,
     video_socket: Arc<tokio::net::UdpSocket>,
     video_srtp_ctx: Option<Arc<Mutex<srtp::SrtpContext>>>,
     video_remote_addr: Option<std::net::SocketAddr>,
@@ -1285,6 +1293,7 @@ async fn setup_media_leg(
     controlling: bool,
     video_ssrc: u32,
     audio_ssrc: u32,
+    dtls_server: bool,
 ) -> Result<MediaLeg> {
     // Decompress and log the full SDP for debugging
     let decompressed = crate::calling::sdp_compress::decompress_sdp(remote_sdp)
@@ -1299,17 +1308,22 @@ async fn setup_media_leg(
     let remote_offer = sdp::parse_sdp_offer(remote_sdp)
         .with_context(|| format!("Failed to parse {} remote SDP", label))?;
 
-    // Audio SRTP
-    let local_material = srtp::parse_crypto_line(local_audio_crypto_line)?;
-    let remote_material = remote_offer
-        .crypto_lines
-        .iter()
-        .find_map(|l| srtp::parse_crypto_line(l).ok())
-        .with_context(|| format!("No audio crypto line in {} remote SDP", label))?;
-    let audio_srtp_ctx = Arc::new(Mutex::new(srtp::create_context(
-        &local_material,
-        &remote_material,
-    )?));
+    // Audio SRTP — DTLS-SRTP when the remote declared a fingerprint
+    // (WebRTC peers; we offered actpass and they answered active, so we
+    // are the DTLS server). SDES context stays for SFB peers.
+    let audio_dtls_inbound = Arc::new(super::dtls::DtlsInbound::default());
+    let audio_keys_ready = Arc::new(std::sync::atomic::AtomicBool::new(!dtls_server));
+    let audio_srtp_ctx = Arc::new(Mutex::new(if dtls_server {
+        super::dtls::placeholder_context()
+    } else {
+        let local_material = srtp::parse_crypto_line(local_audio_crypto_line)?;
+        let remote_material = remote_offer
+            .crypto_lines
+            .iter()
+            .find_map(|l| srtp::parse_crypto_line(l).ok())
+            .with_context(|| format!("No audio crypto line in {} remote SDP", label))?;
+        srtp::create_context(&local_material, &remote_material)?
+    }));
 
     // Video SRTP
     let video_srtp_ctx = if let Some(ref vid) = remote_offer.video {
@@ -1360,6 +1374,35 @@ async fn setup_media_leg(
         }
     };
 
+    if dtls_server {
+        let socket = audio_socket.clone();
+        let srtp_ctx = audio_srtp_ctx.clone();
+        let inbound = audio_dtls_inbound.clone();
+        let keys_ready = audio_keys_ready.clone();
+        let addr = audio_remote_addr;
+        tokio::spawn(async move {
+            match super::dtls::handshake_srtp(
+                socket,
+                addr,
+                false,
+                inbound,
+                Duration::from_secs(15),
+            )
+            .await
+            {
+                Ok(keys) => match super::dtls::srtp_context(&keys) {
+                    Ok(ctx) => {
+                        *srtp_ctx.lock().await = ctx;
+                        keys_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+                        tracing::info!("DTLS-SRTP keys installed; media ungated");
+                    }
+                    Err(e) => tracing::error!("DTLS key context build failed: {e:#}"),
+                },
+                Err(e) => tracing::error!("DTLS handshake failed (media stays gated): {e:#}"),
+            }
+        });
+    }
+
     // Video ICE
     let video_socket = Arc::new(video_socket);
     let video_remote_addr = if let Some(ref vid) = remote_offer.video {
@@ -1408,6 +1451,8 @@ async fn setup_media_leg(
         audio_srtp_ctx,
         audio_remote_addr,
         audio_local_pwd: local_audio_pwd.to_string(),
+        audio_dtls_inbound,
+        audio_keys_ready,
         video_socket,
         video_srtp_ctx,
         video_remote_addr,
@@ -1479,6 +1524,7 @@ fn spawn_media_leg(
         let send_stats = send_stats.clone();
         let dynamic_remote = dynamic_remote_addr.clone();
         let label = label.clone();
+        let keys_ready = leg.audio_keys_ready.clone();
         handles.push(tokio::spawn(async move {
             let mut tone = test_tone::ToneGenerator::new();
             let mut seq: u16 = 0;
@@ -1489,6 +1535,11 @@ fn spawn_media_leg(
 
             loop {
                 interval.tick().await;
+
+                // DTLS-SRTP: hold until the handshake lands real keys.
+                if !keys_ready.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
 
                 // Mute gate: false → send silence without stopping RTP.
                 let mic_active = mic_gate.as_ref().map(|g| *g.borrow()).unwrap_or(true);
@@ -1553,12 +1604,19 @@ fn spawn_media_leg(
         let local_pwd = leg.audio_local_pwd.clone();
         let label = label.clone();
         let dynamic_remote = dynamic_remote_addr.clone();
+        let dtls_inbound = leg.audio_dtls_inbound.clone();
         handles.push(tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, from)) => {
                         let data = &buf[..len];
+
+                        // RFC 5764 demux: DTLS records feed the handshake.
+                        if super::dtls::is_dtls_record(data) {
+                            super::dtls::push_inbound(&dtls_inbound, data);
+                            continue;
+                        }
 
                         if len >= 20 && ice::is_stun_message(data) {
                             if ice::is_stun_request(data) {

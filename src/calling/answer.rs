@@ -156,6 +156,9 @@ pub async fn answer_call_with_stop(
     let mut audio_plan: Option<AudioPlan> = None;
     let mut consumer_sdp: Option<String> = None;
     let mut session: Option<media::MediaSession> = None;
+    // DTLS-SRTP when the caller's offer declares a fingerprint (WebRTC
+    // peers); we answered `a=setup:active` → we are the DTLS client.
+    let mut dtls_client: Option<bool> = None;
     if let Some(ref inv) = notification.call_invitation {
         if let Some(ref mc) = inv.media_content {
             if let Some(ref blob) = mc.blob {
@@ -218,6 +221,9 @@ pub async fn answer_call_with_stop(
 
                         // Bind the RTP socket now so the answer carries the
                         // real port (see the comment above).
+                        if blob.contains("a=fingerprint") {
+                            dtls_client = Some(true);
+                        }
                         if let Some((candidates, local_creds, remote_creds, local_mat, remote_mat)) =
                             audio_plan.clone()
                         {
@@ -228,6 +234,7 @@ pub async fn answer_call_with_stop(
                                 &remote_creds,
                                 &local_mat,
                                 &remote_mat,
+                                dtls_client,
                             )
                             .await
                             {
