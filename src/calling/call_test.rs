@@ -2233,7 +2233,19 @@ fn spawn_media_leg(
                                     _ => codec::encode_black_frame(&mut encoder),
                                 }
                             }
-                            _ => codec::encode_black_frame(&mut encoder),
+                            _ => {
+                                if let (Some(ref tx), Some(ref e)) =
+                                    (&preview_tx, encoder.as_ref())
+                                {
+                                    let (ew, eh) = e.dimensions();
+                                    let _ = tx.try_send(video::VideoFrame {
+                                        width: ew,
+                                        height: eh,
+                                        data: codec::black_i420(ew, eh),
+                                    });
+                                }
+                                codec::encode_black_frame(&mut encoder)
+                            }
                         }
                     }
                     #[cfg(not(feature = "video-cam"))]

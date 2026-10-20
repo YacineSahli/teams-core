@@ -426,6 +426,12 @@ pub async fn answer_call_with_stop(
     signaling::accept_call_with_sdp(&http, skype_token_str, notification, video, consumer_sdp.as_deref()).await?;
     result.call_accepted = true;
     tracing::info!("Incoming call accepted");
+    // Drive the embedder's phase watch: an answered call is connected the
+    // moment the acceptance POST returns 200 (media already flows — the
+    // session was bound before the answer went out).
+    if let Some(ref controls) = controls {
+        let _ = controls.phase.send(crate::calling::call_test::CallPhase::Connected);
+    }
 
     // The audio session (if it started) is already running — it was
     // bound before the answer went out so the SDP carried the real

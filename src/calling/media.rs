@@ -286,7 +286,20 @@ async fn video_send_loop_shared(
                     _ => super::codec::encode_black_frame(&mut encoder),
                 }
             }
-            _ => super::codec::encode_black_frame(&mut encoder),
+            _ => {
+                // The preview mirrors the ENCODE INPUT — black frames
+                // included (a "camera…" placeholder implies initializing;
+                // a black tile says the lens is off / no source).
+                if let (Some(ref tx), Some(ref e)) = (&cfg.local_preview, encoder.as_ref()) {
+                    let (ew, eh) = e.dimensions();
+                    let _ = tx.try_send(video::VideoFrame {
+                        width: ew,
+                        height: eh,
+                        data: super::codec::black_i420(ew, eh),
+                    });
+                }
+                super::codec::encode_black_frame(&mut encoder)
+            }
         };
         #[cfg(not(feature = "video-cam"))]
         let _ = (&frame, &cfg.local_preview);

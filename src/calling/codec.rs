@@ -146,10 +146,7 @@ pub fn encode_black_frame(encoder: &mut Option<H264Encoder>) -> Vec<Vec<u8>> {
         .as_ref()
         .map(|e| e.dimensions())
         .unwrap_or((DEFAULT_W, DEFAULT_H));
-    match encoder
-        .as_mut()
-        .map(|enc| enc.encode(&vec![0u8; (w * h * 3 / 2) as usize]))
-    {
+    match encoder.as_mut().map(|enc| enc.encode(&black_i420(w, h))) {
         Some(Ok(nals)) => nals,
         Some(Err(e)) => {
             tracing::debug!("black-frame encode error: {e:#}");
@@ -157,6 +154,19 @@ pub fn encode_black_frame(encoder: &mut Option<H264Encoder>) -> Vec<Vec<u8>> {
         }
         None => Vec::new(),
     }
+}
+
+/// A black I420 frame with CORRECT neutral chroma: Y=0, U=V=128. An
+/// all-zero buffer is not video black — zero chroma converts to solid
+/// RGB(0,135,0) GREEN on every YUV→RGB renderer (live-verified: the
+/// caller's remote tile was a uniform green field).
+pub fn black_i420(w: u32, h: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; (w * h * 3 / 2) as usize];
+    let uv_off = (w * h) as usize;
+    for b in &mut buf[uv_off..] {
+        *b = 128;
+    }
+    buf
 }
 
 /// H.264 decoder wrapper.
