@@ -655,6 +655,9 @@ pub async fn accept_call_with_sdp(
             // accounts don't declare).
             "clientEndpointCapabilities": 1,
             "callKeepAliveInterval": null,
+            // Web-captured (HAR 2026-10-20): the consumer application
+            // type on the acceptance.
+            "applicationType": "TFL",
             // The acceptance's own callbacks are validated as required
             // (live: 400 "CallAcceptance.Links") — the AG link set.
             "links": {
@@ -769,6 +772,10 @@ pub async fn attach_forked_call(
         "attach": {
             "requireMediaContent": true,
             "links": { "end": end_link },
+            // Captured from the web client (HAR 2026-10-20): the consumer
+            // fleet's application type rides the attach, the join's
+            // conversationRequest, and the acceptance.
+            "applicationType": "TFL",
         },
         "capabilities": null,
         "endpointCapabilities": 73463,
@@ -777,6 +784,7 @@ pub async fn attach_forked_call(
                 "capabilities": null,
                 "endpointCapabilities": 73463,
                 "conversationRequest": {
+                    "applicationType": "TFL",
                     "roster": {
                         "type": "Delta",
                         "rosterUpdate": cb("conversation/rosterUpdate/"),
