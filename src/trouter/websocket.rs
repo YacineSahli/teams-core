@@ -59,7 +59,7 @@ impl TrouterSocket {
 
                     // Auto-respond to Trouter data frame deliveries (3::: HTTP-over-WS)
                     if let Some(req_id) = extract_trouter_request_id(&text) {
-                        let resp = format!("3:::{{\"id\":{},\"status\":200}}", req_id);
+                        let resp = trouter_frame_response(req_id, &text);
                         tracing::debug!("Trouter response: {}", resp);
                         if let Err(e) = self.stream.send(Message::Text(resp)).await {
                             tracing::warn!("Failed to send Trouter response: {:#}", e);
@@ -113,6 +113,62 @@ fn extract_trouter_request_id(frame: &str) -> Option<i64> {
     v.get("id").and_then(|id| id.as_i64())
 }
 
+/// Build the `3:::` response for a trouter HTTP-over-WS POST forward.
+///
+/// Plain frames get a bare `{"id":N,"status":200}`. A forwarded call
+/// ACCEPTANCE (`.../call/acceptance/`) must carry the
+/// `callAcceptanceAcknowledgement` in the response BODY: the web
+/// client's `handleIncomingMsgSync` returns the Ty payload as the
+/// response body, and the Call Controller resolves the callee's accept
+/// long-poll on THIS transport ack — the separate acknowledgement POST
+/// alone leaves the acceptance hanging 30s → 408/10056 (live,
+/// rig↔rig 2026-10-20; the trouter-js client serializes responses as
+/// `{id,status,headers,body}`).
+fn trouter_frame_response(req_id: i64, frame: &str) -> String {
+    let mut resp = serde_json::json!({ "id": req_id, "status": 200 });
+    let Some(json_str) = frame.strip_prefix("3:::") else {
+        return format!("3:::{resp}");
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return format!("3:::{resp}");
+    };
+    let url = v.get("url").and_then(|u| u.as_str()).unwrap_or("");
+    if !url.ends_with("/call/acceptance/") {
+        return format!("3:::{resp}");
+    }
+    // Ty-shaped body (mined from calling-pluginless, TsCalling
+    // 2026.36): the caller's renegotiation-era callback links.
+    let (surl, epid) = (crate::trouter::current_surl(), crate::trouter::current_epid());
+    if let (Some(surl), Some(epid)) = (surl, epid) {
+        let tc = |path: &str| crate::calling::signaling::trouter_callback(&surl, &epid, path);
+        let body = serde_json::json!({
+            "callAcceptanceAcknowledgement": { "links": {
+                "mediaRenegotiation": tc("call/mediaRenegotiation/"),
+                "transfer": tc("call/transfer/"),
+                "replacement": tc("call/replacement/"),
+                "balanceUpdate": tc("call/balanceUpdate/"),
+                "retargetCompletion": tc("call/retargetCompletion/"),
+                "controlVideoStreaming": tc("call/controlVideoStreaming/"),
+                "updateMediaDescriptions": tc("call/updateMediaDescriptions/")
+            } }
+        });
+        resp["body"] = serde_json::Value::String(body.to_string());
+    } else {
+        tracing::warn!("acceptance frame answered without ack body: no registered surl/epid");
+    }
+    // Echo the request's correlation headers, like the web transport.
+    let mut headers = serde_json::Map::new();
+    for h in ["X-Microsoft-Skype-Chain-ID", "X-Microsoft-Skype-Message-ID"] {
+        if let Some(val) = v.get("headers").and_then(|hs| hs.get(h)).and_then(|x| x.as_str()) {
+            headers.insert(h.to_string(), serde_json::Value::String(val.to_string()));
+        }
+    }
+    if !headers.is_empty() {
+        resp["headers"] = serde_json::Value::Object(headers);
+    }
+    format!("3:::{resp}")
+}
+
 /// Extract Socket.IO event ack ID from a `5:ID::` frame.
 ///
 /// Socket.IO v1 event frames have format `5:ACK_ID:ENDPOINT:JSON`.
@@ -125,4 +181,24 @@ fn extract_socketio_ack_id(frame: &str) -> Option<u64> {
         return None;
     }
     id_part.parse().ok()
+}
+
+#[cfg(test)]
+mod acceptance_response_tests {
+    use super::trouter_frame_response;
+
+    /// Plain POST forwards keep the bare status-200 shape.
+    #[test]
+    fn plain_frames_answer_bare_200() {
+        let frame = "3:::{\"id\":42,\"method\":\"POST\",\"url\":\"/v4/f/x/callAgent/e/1/call/end/\",\"headers\":{}}";
+        let resp = trouter_frame_response(42, frame);
+        assert_eq!(resp, "3:::{\"id\":42,\"status\":200}");
+    }
+
+    /// The forwarded call acceptance must answer with the Ty-shaped
+    /// callAcceptanceAcknowledgement body (mined from the web's
+    /// calling-pluginless chunk, 2026-10-20).
+    #[test]
+    #[ignore = "needs a registered surl/epid (thread-local trouter session)"]
+    fn acceptance_frame_answers_with_ack_body() {}
 }
