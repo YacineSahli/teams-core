@@ -746,6 +746,19 @@ pub async fn gather_srflx_candidate(socket: &UdpSocket, stun_server: &str) -> Op
                         if resp_txn == txn_id {
                             if let Some(mapped_addr) = parse_binding_response(data) {
                                 let local_addr = socket.local_addr().ok()?;
+                                // The socket binds 0.0.0.0, so its local ip
+                                // is 0.0.0.0 — an invalid raddr that strict
+                                // SDP parsers (the web client's) reject.
+                                // Use the LAN address like MS-generated
+                                // SDP does.
+                                let raddr = {
+                                    let ip = local_addr.ip().to_string();
+                                    if ip == "0.0.0.0" {
+                                        crate::calling::sdp::get_local_ip()
+                                    } else {
+                                        ip
+                                    }
+                                };
                                 return Some(IceCandidate {
                                     foundation: "2".into(),
                                     component: 1,
@@ -758,7 +771,7 @@ pub async fn gather_srflx_candidate(socket: &UdpSocket, stun_server: &str) -> Op
                                     address: mapped_addr.ip().to_string(),
                                     port: mapped_addr.port(),
                                     candidate_type: CandidateType::ServerReflexive,
-                                    raddr: Some(local_addr.ip().to_string()),
+                                    raddr: Some(raddr),
                                     rport: Some(local_addr.port()),
                                 });
                             }

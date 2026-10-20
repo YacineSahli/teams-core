@@ -274,6 +274,17 @@ pub fn generate_sdp_answer_with_crypto(
 }
 
 /// Generate a random 4-character ICE ufrag.
+/// MS-style SDP session id in o= (a modest decimal number, e.g. 418176
+/// captured from the echo bot — not the 0 we used to send).
+fn rand_session_id() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (nanos % 900_000) + 100_000
+}
+
 pub fn generate_ice_ufrag() -> String {
     use std::fmt::Write;
     let bytes: [u8; 3] = rand_bytes();
@@ -366,16 +377,20 @@ pub fn generate_sdp_answer_with_video(
         );
 
         sdp.push_str(&format!("m=video {} RTP/SAVP 122 121 123\r\n", video_port));
+        sdp.push_str(&format!("c=IN IP4 {}\r\n", local_ip));
         sdp.push_str("a=rtpmap:122 X-H264UC/90000\r\n");
         sdp.push_str("a=fmtp:122 packetization-mode=1;mst-mode=NI-TC\r\n");
         sdp.push_str("a=rtpmap:121 x-rtvc1/90000\r\n");
         sdp.push_str("a=rtpmap:123 x-ulpfecuc/90000\r\n");
         sdp.push_str("a=rtcp-fb:* x-message app send:src,x-pli recv:src,x-pli\r\n");
+        sdp.push_str("a=x-signaling-fb:* x-message app send:src,csrc,vc recv:src\r\n");
         sdp.push_str("a=rtcp-rsize\r\n");
-        sdp.push_str("a=sendrecv\r\n");
+        sdp.push_str("a=x-source-streamid:202\r\n");
+        sdp.push_str(&format!("a=rtcp:{}\r\n", video_port));
         sdp.push_str("a=rtcp-mux\r\n");
         sdp.push_str("a=label:main-video\r\n");
         sdp.push_str("a=x-source:main-video\r\n");
+        sdp.push_str("a=mid:1\r\n");
         sdp.push_str(&format!("a=ice-ufrag:{}\r\n", vid_ufrag));
         sdp.push_str(&format!("a=ice-pwd:{}\r\n", vid_pwd));
         sdp.push_str(&format!(
@@ -427,8 +442,12 @@ pub fn generate_sdp_answer_full(
     );
 
     let mut sdp = String::new();
+    // MS-shaped SDP (see generate_av_sdp_offer): per-m-line c=, rtcp,
+    // x-signaling-fb, x-source-streamid, no direction attribute, real
+    // session id in o=.
+    let session_id = rand_session_id();
     sdp.push_str("v=0\r\n");
-    sdp.push_str(&format!("o=- 0 0 IN IP4 {}\r\n", local_ip));
+    sdp.push_str(&format!("o=- {} 0 IN IP4 127.0.0.1\r\n", session_id));
     sdp.push_str("s=session\r\n");
     sdp.push_str(&format!("c=IN IP4 {}\r\n", local_ip));
     sdp.push_str("t=0 0\r\n");
@@ -439,12 +458,18 @@ pub fn generate_sdp_answer_full(
 
     // Audio section
     sdp.push_str(&format!("m=audio {} RTP/SAVP 0\r\n", audio_port));
+    sdp.push_str(&format!("c=IN IP4 {}\r\n", local_ip));
     sdp.push_str("a=rtpmap:0 PCMU/8000\r\n");
     sdp.push_str("a=ptime:20\r\n");
-    sdp.push_str("a=sendrecv\r\n");
+    sdp.push_str("a=rtcp-fb:* x-message app send:dsh recv:dsh\r\n");
+    sdp.push_str("a=x-signaling-fb:* x-message app send:dsh recv:dsh\r\n");
+    sdp.push_str("a=rtcp-rsize\r\n");
+    sdp.push_str("a=x-source-streamid:201\r\n");
+    sdp.push_str("a=x-source:main-audio\r\n");
+    sdp.push_str(&format!("a=rtcp:{}\r\n", audio_port));
     sdp.push_str("a=rtcp-mux\r\n");
     sdp.push_str("a=label:main-audio\r\n");
-    sdp.push_str("a=x-source:main-audio\r\n");
+    sdp.push_str("a=mid:0\r\n");
     sdp.push_str(&format!("a=ice-ufrag:{}\r\n", our_ufrag));
     sdp.push_str(&format!("a=ice-pwd:{}\r\n", our_pwd));
 
@@ -475,16 +500,20 @@ pub fn generate_sdp_answer_full(
         );
 
         sdp.push_str(&format!("m=video {} RTP/SAVP 122 121 123\r\n", video_port));
+        sdp.push_str(&format!("c=IN IP4 {}\r\n", local_ip));
         sdp.push_str("a=rtpmap:122 X-H264UC/90000\r\n");
         sdp.push_str("a=fmtp:122 packetization-mode=1;mst-mode=NI-TC\r\n");
         sdp.push_str("a=rtpmap:121 x-rtvc1/90000\r\n");
         sdp.push_str("a=rtpmap:123 x-ulpfecuc/90000\r\n");
         sdp.push_str("a=rtcp-fb:* x-message app send:src,x-pli recv:src,x-pli\r\n");
+        sdp.push_str("a=x-signaling-fb:* x-message app send:src,csrc,vc recv:src\r\n");
         sdp.push_str("a=rtcp-rsize\r\n");
-        sdp.push_str("a=sendrecv\r\n");
+        sdp.push_str("a=x-source-streamid:202\r\n");
+        sdp.push_str(&format!("a=rtcp:{}\r\n", video_port));
         sdp.push_str("a=rtcp-mux\r\n");
         sdp.push_str("a=label:main-video\r\n");
         sdp.push_str("a=x-source:main-video\r\n");
+        sdp.push_str("a=mid:1\r\n");
         sdp.push_str(&format!("a=ice-ufrag:{}\r\n", vid_ufrag));
         sdp.push_str(&format!("a=ice-pwd:{}\r\n", vid_pwd));
 
@@ -625,9 +654,16 @@ pub fn generate_av_sdp_offer(p: &AvSdpParams) -> AvSdpResult {
     );
     let mut sdp = String::new();
 
-    // Session level
+    // Session level — shaped like MS-generated SDP (captured live from the
+    // echo bot's callAcceptance, 2026-10-20): the web client's SFB-SDP
+    // parser dies on offers that deviate (its Accept failed client-side
+    // with CallEndReasonMediaOfferProcessingError before any HTTP request
+    // while our offers carried host-style shapes). MS includes per-m-line
+    // c=/rtcp/x-signaling-fb/x-source-streamid, omits direction
+    // attributes, and puts 127.0.0.1 + a real session id in o=.
+    let session_id = p.audio_ssrc;
     sdp.push_str("v=0\r\n");
-    sdp.push_str(&format!("o=- 0 0 IN IP4 {}\r\n", p.local_ip));
+    sdp.push_str(&format!("o=- {} 0 IN IP4 127.0.0.1\r\n", session_id));
     sdp.push_str("s=session\r\n");
     sdp.push_str(&format!("c=IN IP4 {}\r\n", p.local_ip));
     sdp.push_str("b=CT:99980\r\n");
@@ -636,19 +672,22 @@ pub fn generate_av_sdp_offer(p: &AvSdpParams) -> AvSdpResult {
 
     // Audio m-line
     sdp.push_str(&format!("m=audio {} RTP/SAVP 0\r\n", p.audio_port));
+    sdp.push_str(&format!("c=IN IP4 {}\r\n", p.local_ip));
     sdp.push_str(&format!(
         "a=x-ssrc-range:{}-{}\r\n",
         p.audio_ssrc, p.audio_ssrc
     ));
     sdp.push_str("a=rtcp-fb:* x-message app send:dsh recv:dsh\r\n");
+    sdp.push_str("a=x-signaling-fb:* x-message app send:dsh recv:dsh\r\n");
     sdp.push_str("a=rtcp-rsize\r\n");
+    sdp.push_str("a=x-source-streamid:201\r\n");
+    sdp.push_str("a=x-source:main-audio\r\n");
+    sdp.push_str(&format!("a=rtcp:{}\r\n", p.audio_port));
     sdp.push_str("a=mid:0\r\n");
     sdp.push_str("a=rtpmap:0 PCMU/8000\r\n");
     sdp.push_str("a=ptime:20\r\n");
-    sdp.push_str("a=sendrecv\r\n");
     sdp.push_str("a=rtcp-mux\r\n");
     sdp.push_str("a=label:main-audio\r\n");
-    sdp.push_str("a=x-source:main-audio\r\n");
     sdp.push_str(&format!("a=ice-ufrag:{}\r\n", p.audio_ufrag));
     sdp.push_str(&format!("a=ice-pwd:{}\r\n", p.audio_pwd));
 
@@ -671,13 +710,16 @@ pub fn generate_av_sdp_offer(p: &AvSdpParams) -> AvSdpResult {
         "m=video {} RTP/SAVP 122 121 123\r\n",
         p.video_port
     ));
+    sdp.push_str(&format!("c=IN IP4 {}\r\n", p.local_ip));
     sdp.push_str("a=mid:1\r\n");
     sdp.push_str("a=rtpmap:122 X-H264UC/90000\r\n");
     sdp.push_str("a=fmtp:122 packetization-mode=1;mst-mode=NI-TC\r\n");
     sdp.push_str("a=rtpmap:121 x-rtvc1/90000\r\n");
     sdp.push_str("a=rtpmap:123 x-ulpfecuc/90000\r\n");
     sdp.push_str("a=rtcp-fb:* x-message app send:src,x-pli recv:src,x-pli\r\n");
+    sdp.push_str("a=x-signaling-fb:* x-message app send:src,csrc,vc recv:src\r\n");
     sdp.push_str("a=rtcp-rsize\r\n");
+    sdp.push_str("a=x-source-streamid:202\r\n");
     sdp.push_str(&format!(
         "a=x-ssrc-range:{}-{}\r\n",
         p.video_ssrc_base,
@@ -685,7 +727,7 @@ pub fn generate_av_sdp_offer(p: &AvSdpParams) -> AvSdpResult {
             .saturating_add(super::video::VIDEO_SSRC_RANGE_SIZE - 1)
     ));
     sdp.push_str("a=x-caps:121 263:320:240:15.0:250000:1;4359:176:144:15.0:100000:1\r\n");
-    sdp.push_str("a=sendrecv\r\n");
+    sdp.push_str(&format!("a=rtcp:{}\r\n", p.video_port));
     sdp.push_str("a=rtcp-mux\r\n");
     sdp.push_str("a=label:main-video\r\n");
     sdp.push_str("a=x-source:main-video\r\n");
