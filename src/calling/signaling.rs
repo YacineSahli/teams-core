@@ -1593,9 +1593,18 @@ pub async fn create_1to1_call_modalities(
             }
         },
         "groupContext": null,
-        "groupChat": {
-            "threadId": params.thread_id,
-            "messageId": null
+        // Consumer 1:1s create WITHOUT a group thread (web shape, HAR
+        // 2026-10-20: groupChat=null in cpconv). A thread here makes the
+        // CC build a GROUP call (isMultiParty=true, groupCallInitiator)
+        // whose acceptance waits on group-call acknowledgement machinery
+        // and times out 408/10056 (live, rig↔rig same day).
+        "groupChat": if params.consumer {
+            serde_json::json!(null)
+        } else {
+            serde_json::json!({
+                "threadId": params.thread_id,
+                "messageId": null
+            })
         },
         "participants": {
             "from": {
@@ -1616,11 +1625,13 @@ pub async fn create_1to1_call_modalities(
         },
         "capabilities": null,
         "endpointCapabilities": 73463,
-        "clientEndpointCapabilities": 9336554,
+        // Consumer: the web client's exact mask (HAR 2026-10-20); the
+        // work-tenant mask predates the split.
+        "clientEndpointCapabilities": if params.consumer { 109985824 } else { 9336554 },
         "endpointMetadata": { "holographicCapabilities": 3 },
         "meetingInfo": null,
         "endpointState": {
-            "endpointStateSequenceNumber": 0,
+            "endpointStateSequenceNumber": 1,
             "endpointProperties": {
                 "additionalEndpointProperties": {
                     "infoShownInReportMode": "FullInformation"

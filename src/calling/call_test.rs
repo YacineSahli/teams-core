@@ -586,6 +586,13 @@ pub async fn run_call_with_controls(
     // 5. Derive epconv URL from region_gtms
     let epconv_url =
         derive_epconv_url(&region_gtms).context("Cannot derive epconv URL from region_gtms")?;
+    // Consumer 1:1s create through the CALLING-PROXY conversation
+    // endpoint (the web client's own create, HAR 2026-10-20): epconv
+    // builds a GROUP-style call (fresh thread, isMultiParty=true,
+    // groupCallInitiator) whose acceptance waits on group-call
+    // acknowledgement machinery and dies 408/10056; cpconv builds a
+    // true two-party call.
+    let cpconv_url = epconv_url.replace("/epconv", "/cpconv");
 
     // 6. Two-phase call placement
     let endpoint_id = uuid::Uuid::new_v4().to_string();
@@ -713,11 +720,17 @@ pub async fn run_call_with_controls(
         }
     };
     let (phase1, _phase2) = if is_1to1_call {
-        // 1:1 call: single POST to epconv with SDP
-        tracing::info!("Creating 1:1 call (single-shot epconv with SDP)...");
+        // 1:1 call: single POST with SDP (cpconv for consumer — see
+        // cpconv_url derivation; epconv for work tenants)
+        let create_url: &str = if consumer {
+            &cpconv_url
+        } else {
+            &epconv_url
+        };
+        tracing::info!("Creating 1:1 call (single-shot create with SDP at {create_url})...");
         let (created, joined) = signaling::create_1to1_call_modalities(
             &http,
-            &epconv_url,
+            create_url,
             &conv_params,
             &offer_sdp,
             callee_mri.as_deref(),
