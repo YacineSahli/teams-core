@@ -137,43 +137,737 @@ async fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    if std::env::var("PAIR_PROBE_PRESENCE").is_ok() {
-        let base = std::env::var("PAIR_UPS").unwrap_or_else(|_| "https://presence.teams.live.com".to_string());
-        let get = |p: &str| a.http.get(format!("{base}{p}")).header("X-Skypetoken", &*a.skype).header("x-ms-client-consumer-type", "teams4life");
-        for p in [
-            "/v1/users/ME/presence",
-            "/v1/users/8:live:rig-consumer-a/presence",
-            "/v1/me/presence",
-            "/v1.0/me/presence",
-        ] {
-            match get(p).timeout(std::time::Duration::from_secs(8)).send().await {
-                Ok(r) => println!("GET {p:<40} HTTP {} {}", r.status(), r.text().await.unwrap_or_default().chars().take(200).collect::<String>()),
-                Err(e) => println!("GET {p:<40} ERR {e}"),
+    if std::env::var("PAIR_ADD_CONTACTS").is_ok() {
+        // Call-end forensics: 403 "Permission check for callee to
+        // interact with caller is not allowed" — the consumer privacy
+        // model gates calls to contacts. Make A and B mutual contacts.
+        let b_mri = format!("8:{}", b.skypeid);
+        let a_mri = format!("8:{}", a.skypeid);
+        for (label, sess, mri) in [("A adds B", &a, &b_mri), ("B adds A", &b, &a_mri)] {
+            let enc = mri.replace(':', "%3A").replace('@', "%40");
+            for (form, url) in [
+                ("put-enc", format!("{}/v1/users/ME/contacts/{enc}", sess.chat_service)),
+                ("post-invite", format!("{}/v1/users/ME/contacts", sess.chat_service)),
+            ] {
+                let body = match form {
+                    "put-enc" => serde_json::json!({"id": mri}),
+                    _ => serde_json::json!({"mri": mri}),
+                };
+                let req = if form == "put-enc" {
+                    sess.http.put(&url)
+                } else {
+                    sess.http.post(&url)
+                };
+                match req
+                    .header("X-SkypeToken", &*sess.skype)
+                    .header("Content-Type", "application/json")
+                    .body(body.to_string())
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                {
+                    Ok(r) => println!(
+                        "CONTACT {label} {form:<12} HTTP {} {}",
+                        r.status(),
+                        r.text().await.unwrap_or_default().chars().take(200).collect::<String>()
+                    ),
+                    Err(e) => println!("CONTACT {label} {form:<12} ERR {e}"),
+                }
+            }
+            // contacts.skype.com v2 form
+            match sess
+                .http
+                .post("https://contacts.skype.com/contacts/v2/users/ME/contacts")
+                .header("Authorization", format!("SkypeToken {}", sess.skype))
+                .header("X-SkypeToken", &*sess.skype)
+                .header("Content-Type", "application/json")
+                .body(serde_json::json!({"mri": mri}).to_string())
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await
+            {
+                Ok(r) => println!(
+                    "CONTACT {label} contacts.skype.com HTTP {} {}",
+                    r.status(),
+                    r.text().await.unwrap_or_default().chars().take(250).collect::<String>()
+                ),
+                Err(e) => println!("CONTACT {label} contacts.skype.com ERR {e}"),
+            }
+            // classic api.skype.com forms
+            for (form, url, body) in [
+                (
+                    "api.skype.com me/contacts",
+                    "https://api.skype.com/users/ME/contacts".to_string(),
+                    serde_json::json!({"mri": mri}).to_string(),
+                ),
+                (
+                    "api.skype.com profile invite",
+                    "https://api.skype.com/users/ME/contacts/invite".to_string(),
+                    serde_json::json!({"mri": mri}).to_string(),
+                ),
+                (
+                    "profile.skype.com contacts",
+                    "https://profile.skype.com/profile/v1/users/ME/contacts".to_string(),
+                    serde_json::json!({"mri": mri}).to_string(),
+                ),
+            ] {
+                match sess
+                    .http
+                    .post(&url)
+                    .header("Authorization", format!("SkypeToken {}", sess.skype))
+                    .header("X-SkypeToken", &*sess.skype)
+                    .header("Content-Type", "application/json")
+                    .body(body)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                {
+                    Ok(r) => println!(
+                        "CONTACT {label} {form:<30} HTTP {} {}",
+                        r.status(),
+                        r.text().await.unwrap_or_default().chars().take(180).collect::<String>()
+                    ),
+                    Err(e) => println!("CONTACT {label} {form:<30} ERR {e}"),
+                }
             }
         }
-        // presenceUPS candidates
-        for (m, p, body) in [
-            ("PUT", "/v1/presence/publish", r#"{"availability":"Available"}"#),
-            ("POST", "/v1/presence/publish", r#"{"availability":"Available"}"#),
-            ("PUT", "/presence", r#"{"availability":"Available"}"#),
-            ("PATCH", "/v1/me/presence", r#"{"availability":"Available","capabilities":["Audio","Video"]}"#),
+        // Read back A's contact list.
+        match a
+            .http
+            .get(format!("{}/v1/users/ME/contacts", a.chat_service))
+            .header("X-SkypeToken", &*a.skype)
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await
+        {
+            Ok(r) => println!(
+                "CONTACTS A readback: HTTP {} {}",
+                r.status(),
+                r.text().await.unwrap_or_default().chars().take(300).collect::<String>()
+            ),
+            Err(e) => println!("CONTACTS A readback ERR {e}"),
+        }
+        // contacts.skype.com LIST (auth sanity) + full 403 detail.
+        match a
+            .http
+            .get("https://contacts.skype.com/contacts/v2/users/ME/contacts")
+            .header("Authorization", format!("SkypeToken {}", a.skype))
+            .header("X-SkypeToken", &*a.skype)
+            .header("Accept", "application/json")
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(r) => {
+                let st = r.status();
+                let hdrs: Vec<String> = r
+                    .headers()
+                    .iter()
+                    .filter(|(k, _)| {
+                        let ks = k.as_str();
+                        ks.starts_with("x-") || ks == "www-authenticate" || ks.starts_with("content-type")
+                    })
+                    .map(|(k, v)| format!("{}={}", k, String::from_utf8_lossy(v.as_ref())))
+                    .collect();
+                println!(
+                    "CONTACTS skype LIST: HTTP {st} {} | headers: {}",
+                    r.text().await.unwrap_or_default().chars().take(400).collect::<String>(),
+                    hdrs.join("; ")
+                );
+            }
+            Err(e) => println!("CONTACTS skype LIST ERR {e}"),
+        }
+        // Per-service tokens via authz v1 ?resource= (MT pattern worked).
+        for res in [
+            "https://contacts.skype.com/",
+            "https://people.skype.com/",
         ] {
-            let _ = &body;
-            let req = match m {
-                "PUT" => a.http.put(format!("{base}{p}")),
-                "GET" => a.http.get(format!("{base}{p}")),
-                _ => a.http.post(format!("{base}{p}")),
+            let tok = mint_service_token(&a.http, &a.aad, res).await;
+            match tok {
+                Some(t) => {
+                    for (label, hdr) in [
+                        ("bearer", format!("Bearer {t}")),
+                        ("skypetoken", format!("SkypeToken {t}")),
+                    ] {
+                        match a
+                            .http
+                            .get("https://contacts.skype.com/contacts/v2/users/ME/contacts")
+                            .header("Authorization", &hdr)
+                            .header("x-ms-client-consumer-type", "teams4life")
+                            .header("Accept", "application/json")
+                            .timeout(std::time::Duration::from_secs(10))
+                            .send()
+                            .await
+                        {
+                            Ok(r) => println!(
+                                "SVCTOK {res} {label}: HTTP {} {}",
+                                r.status(),
+                                r.text().await.unwrap_or_default().chars().take(250).collect::<String>()
+                            ),
+                            Err(e) => println!("SVCTOK {res} {label}: ERR {e}"),
+                        }
+                    }
+                }
+                None => println!("SVCTOK {res}: mint failed"),
+            }
+        }
+        for (label, hdrs) in [
+            (
+                "x-skype+consumer",
+                vec![
+                    ("X-SkypeToken", a.skype.clone()),
+                    ("x-ms-client-consumer-type", "teams4life".to_string()),
+                ],
+            ),
+            (
+                "auth-skypetoken+consumer",
+                vec![
+                    ("Authorization", format!("SkypeToken {}", a.skype)),
+                    ("x-ms-client-consumer-type", "teams4life".to_string()),
+                ],
+            ),
+            (
+                "bearer-msa+consumer",
+                vec![
+                    ("Authorization", format!("Bearer {}", a.aad)),
+                    ("x-ms-client-consumer-type", "teams4life".to_string()),
+                ],
+            ),
+            (
+                "flightproxy+x-skype",
+                vec![
+                    ("X-SkypeToken", a.skype.clone()),
+                    ("x-ms-client-consumer-type", "teams4life".to_string()),
+                ],
+            ),
+        ] {
+            let url = if label == "flightproxy+x-skype" {
+                "https://api.flightproxy.skype.com/api/v2/ep/contacts.skype.com/contacts/v2/users/ME/contacts"
+            } else {
+                "https://contacts.skype.com/contacts/v2/users/ME/contacts"
             };
-            let req = if body.is_empty() { req } else { req.header("Content-Type", "application/json").body(body) };
-            match req
-                .bearer_auth(&a.aad)
+            let mut req = a.http.get(url);
+            for (k, v) in &hdrs {
+                req = req.header(k.clone(), v.clone());
+            }
+            match req.timeout(std::time::Duration::from_secs(10)).send().await {
+                Ok(r) => println!(
+                    "CONTACTS skype LIST {label:<26} HTTP {} {}",
+                    r.status(),
+                    r.text().await.unwrap_or_default().chars().take(300).collect::<String>()
+                ),
+                Err(e) => println!("CONTACTS skype LIST {label:<26} ERR {e}"),
+            }
+        }
+        return Ok(());
+    }
+    if std::env::var("PAIR_PROBE_MTPRESENCE").is_ok() {
+        // LIFE presence: enableSendPresenceTokenToUPS=false → mtAuthResource
+        // (middle-tier auth), enableAfdPresenceEndpoint → base
+        // https://teams.live.com/ups/global/ (defaultPresenceAfdRegionGTM).
+        // MT token = authz consumer with resource
+        // https://mtsvc.fl.teams.microsoft.com/teams.mt.readwrite.
+        let base = "https://teams.live.com/ups/global";
+        let mt_resource = "https://mtsvc.fl.teams.microsoft.com/teams.mt.readwrite";
+        // The v2/TFL authz endpoint 401s default-scope MSA tokens; the web
+        // client's own audience for teams.live.com APIs is the site origin.
+        let tl_aad = mint_msa(&b.http, B_RT, "https://teams.live.com/.default").await;
+        println!(
+            "teams.live-scoped MSA: {}",
+            if tl_aad.is_some() { "OK" } else { "FAILED" }
+        );
+        let mut mt_token: Option<String> = None;
+        for (label, req) in [
+            (
+                "v2 query tl-token",
+                b.http
+                    .post(format!("https://teams.live.com/api/auth/v2.0/authz/consumer?resource={}", urlencoding_simple(mt_resource)))
+                    .bearer_auth(tl_aad.as_deref().unwrap_or(&b.aad))
+                    .header("Content-Length", "0"),
+            ),
+            (
+                "v1 query tl-token",
+                b.http
+                    .post(format!("https://teams.live.com/api/auth/v1.0/authz/consumer?resource={}", urlencoding_simple(mt_resource)))
+                    .bearer_auth(tl_aad.as_deref().unwrap_or(&b.aad))
+                    .header("Content-Length", "0"),
+            ),
+            (
+                "v1 body tl-token",
+                b.http
+                    .post("https://teams.live.com/api/auth/v1.0/authz/consumer")
+                    .bearer_auth(tl_aad.as_deref().unwrap_or(&b.aad))
+                    .header("Content-Type", "application/json")
+                    .body(format!(r#"{{"resource":"{mt_resource}"}}"#)),
+            ),
+        ] {
+            match req.timeout(std::time::Duration::from_secs(10)).send().await {
+                Ok(r) => {
+                    let st = r.status();
+                    let txt = r.text().await.unwrap_or_default();
+                    println!("MTAUTH {label}: HTTP {st} {}", &txt.chars().take(220).collect::<String>());
+                    if st.is_success() {
+                        if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+                            let tok = v
+                                .pointer("/skypeToken/skypetoken")
+                                .or_else(|| v.pointer("/skypetoken"))
+                                .and_then(|t| t.as_str())
+                                .map(str::to_string)
+                                .or_else(|| {
+                                    v.get("token").and_then(|t| t.as_str()).map(str::to_string)
+                                });
+                            mt_token = tok;
+                        }
+                    }
+                }
+                Err(e) => println!("MTAUTH {label}: ERR {e}"),
+            }
+            if mt_token.is_some() {
+                break;
+            }
+        }
+        let Some(mt) = mt_token else {
+            println!("=> MT token mint failed; aborting");
+            return Ok(());
+        };
+        println!("MT token minted ({} bytes)", mt.len());
+
+        let ep = uuid::Uuid::new_v4().to_string();
+        let body = serde_json::json!({
+            "id": ep,
+            "availability": "Available",
+            "activity": "Available",
+            "deviceType": "Desktop",
+            "capabilities": ["Audio", "Video"],
+        });
+        // Publish for B through the MT path.
+        match b
+            .http
+            .put(format!("{base}/v1/me/endpoints/"))
+            .header("Content-Type", "application/json")
+            .header("x-ms-client-consumer-type", "teams4life")
+            .header("x-ms-client-user-agent", "Teams-V2-Desktop")
+            .header("x-ms-endpoint-id", &ep)
+            .header("Authorization", format!("Bearer {mt}"))
+            .header("x-skypetoken", &*b.skype)
+            .body(body.to_string())
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(r) => println!(
+                "MT PUT endpoints: HTTP {} {}",
+                r.status(),
+                r.text().await.unwrap_or_default().chars().take(240).collect::<String>()
+            ),
+            Err(e) => println!("MT PUT endpoints: ERR {e}"),
+        }
+        match b
+            .http
+            .get(format!("{base}/v1/me/presence"))
+            .header("x-ms-client-consumer-type", "teams4life")
+            .header("Authorization", format!("Bearer {mt}"))
+            .header("x-skypetoken", &*b.skype)
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await
+        {
+            Ok(r) => println!(
+                "MT GET presence: HTTP {} {}",
+                r.status(),
+                r.text().await.unwrap_or_default().chars().take(300).collect::<String>()
+            ),
+            Err(e) => println!("MT GET presence: ERR {e}"),
+        }
+        // reportmyactivity heartbeat — the endpoint is only ACTIVE (and
+        // thus counted by the aggregator) after this per the JS model.
+        match b
+            .http
+            .post(format!("{base}/v1/me/reportmyactivity/"))
+            .header("Content-Type", "application/json")
+            .header("x-ms-client-consumer-type", "teams4life")
+            .header("x-ms-endpoint-id", &ep)
+            .header("Authorization", format!("Bearer {mt}"))
+            .header("x-skypetoken", &*b.skype)
+            .body(serde_json::json!({"endpointId": ep, "isActive": true}).to_string())
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(r) => println!(
+                "MT reportmyactivity: HTTP {} {}",
+                r.status(),
+                r.text().await.unwrap_or_default().chars().take(200).collect::<String>()
+            ),
+            Err(e) => println!("MT reportmyactivity: ERR {e}"),
+        }
+        // And the directory view from A.
+        let body = serde_json::json!([{"mri": format!("8:{}", b.skypeid)}]);
+        match a
+            .http
+            .post("https://presence.teams.live.com/v1/presence/getpresence/")
+            .header("X-SkypeToken", &*a.skype)
+            .header("x-ms-client-consumer-type", "teams4life")
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await
+        {
+            Ok(r) => println!(
+                "getPresence B after MT publish: HTTP {} {}",
+                r.status(),
+                r.text().await.unwrap_or_default().chars().take(300).collect::<String>()
+            ),
+            Err(e) => println!("getPresence B after MT publish: ERR {e}"),
+        }
+        return Ok(());
+    }
+    if std::env::var("PAIR_PROBE_SKYPEREG").is_ok() {
+        // config-life trouterService: registrarDefaultEndpoint
+        //   https://edge.skype.com/registrar/prod/v2/registrations
+        // trouterDefaultEndpoint https://go.trouter.skype.com/v4/a —
+        // the CONSUMER notification spine (work prod = teams.microsoft.com
+        // /registrar/prod/v3). NGCall invites for consumer↔consumer (event
+        // 107 SKYPE_SKYPE_CALL) ride THIS fleet.
+        let epid = uuid::Uuid::new_v4().to_string();
+        let resp = b
+            .http
+            .get(format!("https://go.trouter.skype.com/v4/a?epid={epid}"))
+            .header("X-SkypeToken", &*b.skype)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        println!("skype trouter negotiate: HTTP {}", resp.status());
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        let surl = v
+            .get("surl")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string();
+        println!(
+            "skype surl: {surl}\n  socketio: {:?}\n  registrarUrl hint: {:?}",
+            v.get("socketio").and_then(|s| s.as_str()).map(|s| s.chars().take(90).collect::<String>()),
+            v.get("registrarUrl").and_then(|s| s.as_str())
+        );
+        if !surl.is_empty() {
+            // Channel auth: config-life trouterAuthUrlSuffix (web "/auth",
+            // win "/NGCallManagerWin/auth") — slimcore authorizes its
+            // trouter channels after connect. Probe the shape.
+            for (label, path, tok_hdr) in [
+                ("NGCallManagerWin/auth skypehdr", "NGCallManagerWin/auth", "skype"),
+                ("auth skypehdr", "auth", "skype"),
+                ("NGCallManagerWin/auth bearer", "NGCallManagerWin/auth", "bearer"),
+            ] {
+                let mut req = b.http.post(format!("{surl}{path}"));
+                req = match tok_hdr {
+                    "skype" => req.header("X-SkypeToken", &*b.skype),
+                    _ => req.header("Authorization", format!("Bearer {}", b.aad)),
+                };
+                match req
+                    .timeout(std::time::Duration::from_secs(8))
+                    .send()
+                    .await
+                {
+                    Ok(r) => println!(
+                        "CHANNELAUTH {label:<34} HTTP {} {}",
+                        r.status(),
+                        r.text().await.unwrap_or_default().chars().take(200).collect::<String>()
+                    ),
+                    Err(e) => println!("CHANNELAUTH {label:<34} ERR {e}"),
+                }
+            }
+        }
+        if !surl.is_empty() {
+            for (label, app_id, template, ctx, suffix) in [
+                ("CDL 2.6 TFL", "TeamsCDLWebWorker", "TeamsCDLWebWorker_2.6", "TFL", ""),
+                ("SkypeSpacesWeb_2.6", "SkypeSpacesWeb", "SkypeSpacesWeb_2.6", "", "SkypeSpacesWeb"),
+                ("NGCall DesktopNgc", "NextGenCalling", "DesktopNgc_2.5:SkypeNgc", "", "NGCallManagerWin"),
+                ("TFLSkypeSpacesWeb_2.0", "SkypeSpacesWeb", "TFLSkypeSpacesWeb_2.0", "TFL", "NGCallManagerWin"),
+            ] {
+                let payload = serde_json::json!({
+                    "clientDescription": {
+                        "appId": app_id, "aesKey": "", "languageId": "en-US",
+                        "platform": "edge", "templateKey": template,
+                        "platformUIVersion": "49/1.0.0"
+                    },
+                    "registrationId": uuid::Uuid::new_v4().to_string(),
+                    "nodeId": "",
+                    "transports": {"TROUTER": [{"context": ctx, "path": format!("{surl}{suffix}"), "ttl": 3600}]}
+                });
+                match b
+                    .http
+                    .post("https://edge.skype.com/registrar/prod/v2/registrations")
+                    .header("X-SkypeToken", &*b.skype)
+                    .json(&payload)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                {
+                    Ok(r) => println!(
+                        "SKYPEREG {label:<24} HTTP {} {}",
+                        r.status(),
+                        r.text().await.unwrap_or_default().chars().take(200).collect::<String>()
+                    ),
+                    Err(e) => println!("SKYPEREG {label:<24} ERR {e}"),
+                }
+            }
+        }
+        return Ok(());
+    }
+    if std::env::var("PAIR_PROBE_LIFEREG").is_ok() {
+        // config-life: registrarServiceUrl =
+        //   https://teams.microsoft.com/registrar/prod/v2/registrations
+        // pnhContext=TFL, pnhTemplate=TFLSkypeSpacesWeb_2.0 (web) /
+        // SkypeSpacesWeb_2.6; webRegistrarTtlInSeconds=3600. Probe which
+        // payload shape it accepts, using a fresh negotiated trouter path.
+        let epid = uuid::Uuid::new_v4().to_string();
+        let neg = b
+            .http
+            .get(format!("https://go.trouter.teams.microsoft.com/v4/a?epid={epid}"))
+            .header("X-SkypeToken", &*b.skype)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        let negv: Value = neg.json().await?;
+        let surl = negv
+            .get("surl")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        println!("negotiated surl: {surl} (registrarUrl hint: {:?})", negv.get("registrarUrl"));
+
+        let candidates: Vec<(&str, Value)> = vec![
+            (
+                "SkypeSpacesWeb TFLSkypeSpacesWeb_2.0 ctxTFL",
+                serde_json::json!({
+                    "clientDescription": {
+                        "appId": "SkypeSpacesWeb", "aesKey": "", "languageId": "en-US",
+                        "platform": "edge", "templateKey": "TFLSkypeSpacesWeb_2.0",
+                        "platformUIVersion": "49/1.0.0"
+                    },
+                    "registrationId": uuid::Uuid::new_v4().to_string(),
+                    "nodeId": "",
+                    "transports": {"TROUTER": [{"context": "TFL", "path": format!("{surl}SkypeSpacesWeb"), "ttl": 3600}]}
+                }),
+            ),
+            (
+                "SkypeSpacesWeb SkypeSpacesWeb_2.6 ctxTFL",
+                serde_json::json!({
+                    "clientDescription": {
+                        "appId": "SkypeSpacesWeb", "aesKey": "", "languageId": "en-US",
+                        "platform": "edge", "templateKey": "SkypeSpacesWeb_2.6",
+                        "platformUIVersion": "49/1.0.0"
+                    },
+                    "registrationId": uuid::Uuid::new_v4().to_string(),
+                    "nodeId": "",
+                    "transports": {"TROUTER": [{"context": "TFL", "path": format!("{surl}NGCallManagerWin"), "ttl": 3600}]}
+                }),
+            ),
+            (
+                "NextGenCalling DesktopNgc ctxTFL",
+                serde_json::json!({
+                    "clientDescription": {
+                        "appId": "NextGenCalling", "aesKey": "", "languageId": "en-US",
+                        "platform": "edge", "templateKey": "DesktopNgc_2.5:SkypeNgc",
+                        "platformUIVersion": "49/1.0.0"
+                    },
+                    "registrationId": uuid::Uuid::new_v4().to_string(),
+                    "nodeId": "",
+                    "transports": {"TROUTER": [{"context": "TFL", "path": format!("{surl}NGCallManagerWin"), "ttl": 3600}]}
+                }),
+            ),
+        ];
+        for (label, payload) in candidates {
+            match b
+                .http
+                .post("https://teams.microsoft.com/registrar/prod/v2/registrations")
+                .header("X-SkypeToken", &*b.skype)
+                .json(&payload)
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await
+            {
+                Ok(r) => println!(
+                    "LIFEREG {label:<44} HTTP {} {}",
+                    r.status(),
+                    r.text().await.unwrap_or_default().chars().take(300).collect::<String>()
+                ),
+                Err(e) => println!("LIFEREG {label:<44} ERR {e}"),
+            }
+        }
+        return Ok(());
+    }
+    if std::env::var("PAIR_PROBE_PRESENCE").is_ok() {        // Mined from the web client's presence-service chunk (2026-10-19):
+        // the ONLY write path is PUT v1/me/endpoints/ with an endpoint
+        // object; auth = authorizeByUrl(req, true) which resolves to
+        // aad.authorizeRequest(req, "https://presence.teams.live.com/") —
+        // i.e. an MSA token scoped to the service ORIGIN, not the default
+        // service:: resource.
+        let base = std::env::var("PAIR_UPS")
+            .unwrap_or_else(|_| "https://presence.teams.live.com".to_string());
+        let origin = base.trim_end_matches('/').to_string();
+
+        let mint = |scope: String| {
+            let http = &a.http;
+            let rt = std::fs::read_to_string(A_RT)
+                .ok()
+                .map(|s| s.trim().to_string());
+            async move {
+                let rt = rt?;
+                let resp = http
+                    .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+                    .form(&[
+                        ("grant_type", "refresh_token"),
+                        ("refresh_token", rt.as_str()),
+                        ("client_id", CLIENT_ID),
+                        ("scope", &format!("{scope} offline_access")),
+                    ])
+                    .send()
+                    .await
+                    .ok()?;
+                let v: Value = resp.json().await.ok()?;
+                v.get("access_token")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string)
+            }
+        };
+        let scoped = mint(format!("{origin}/.default")).await;
+        // Target view: what the CC would see for the callee (A asks
+        // about B) — the getPresence batch API from the presence chunk.
+        {
+            let body = serde_json::json!([{"mri": format!("8:{}", b.skypeid)}]);
+            match a
+                .http
+                .post(format!("{origin}/v1/presence/getpresence/"))
+                .header("X-SkypeToken", &*a.skype)
+                .header("x-ms-client-consumer-type", "teams4life")
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .timeout(std::time::Duration::from_secs(8))
+                .send()
+                .await
+            {
+                Ok(r) => println!(
+                    "getPresence B: HTTP {} {}",
+                    r.status(),
+                    r.text().await.unwrap_or_default().chars().take(400).collect::<String>()
+                ),
+                Err(e) => println!("getPresence B: ERR {e}"),
+            }
+        }
+        println!(
+            "presence-scoped MSA mint: {}",
+            match &scoped {
+                Some(t) => format!("OK ({} bytes)", t.len()),
+                None => "FAILED".into(),
+            }
+        );
+
+        let ep_id = uuid::Uuid::new_v4().to_string();
+        let body = serde_json::json!({
+            "id": ep_id,
+            "availability": "Available",
+            "activity": "Available",
+            "deviceType": "Desktop",
+            "capabilities": ["Audio", "Video"],
+        });
+        let attempts: Vec<(&str, String, bool)> =
+            vec![("x-skypetoken default", a.skype.clone(), false)];
+        for (label, token, bearer) in attempts {
+            let mut req = a
+                .http
+                .put(format!("{origin}/v1/me/endpoints/"))
+                .header("Content-Type", "application/json")
+                .header("x-ms-client-consumer-type", "teams4life")
+                .header("x-ms-client-user-agent", "Teams-V2-Desktop")
+                .header("x-ms-endpoint-id", &ep_id)
+                .header("x-ms-client-caller", "callqa")
+                .body(body.to_string());
+            req = if bearer {
+                req.header("Authorization", format!("Bearer {token}"))
+            } else {
+                req.header("X-SkypeToken", token)
+            };
+            match req.timeout(std::time::Duration::from_secs(8)).send().await {
+                Ok(r) => println!(
+                    "PUT endpoints {label:<24} HTTP {} {}",
+                    r.status(),
+                    r.text().await.unwrap_or_default().chars().take(200).collect::<String>()
+                ),
+                Err(e) => println!("PUT endpoints {label:<24} ERR {e}"),
+            }
+        }
+
+        // Publish for BOTH rig endpoints — the CALLEE needs capabilities
+        // for invite routing (5-min expiry; the app must re-publish).
+        for (label, sess) in [("A", &a), ("B", &b)] {
+            let ep = uuid::Uuid::new_v4().to_string();
+            let body = serde_json::json!({
+                "id": ep,
+                "availability": "Available",
+                "activity": "Available",
+                "deviceType": "Desktop",
+                "capabilities": ["Audio", "Video"],
+            });
+            match sess
+                .http
+                .put(format!("{origin}/v1/me/endpoints/"))
+                .header("Content-Type", "application/json")
+                .header("x-ms-client-consumer-type", "teams4life")
+                .header("x-ms-client-user-agent", "Teams-V2-Desktop")
+                .header("x-ms-endpoint-id", &ep)
+                .body(body.to_string())
+                .header("X-SkypeToken", &*sess.skype)
+                .timeout(std::time::Duration::from_secs(8))
+                .send()
+                .await
+            {
+                Ok(r) => println!("PUBLISH {label}: HTTP {}", r.status()),
+                Err(e) => println!("PUBLISH {label}: ERR {e}"),
+            }
+            match sess
+                .http
+                .get(format!("{origin}/v1/me/presence"))
+                .header("X-SkypeToken", &*sess.skype)
                 .header("x-ms-client-consumer-type", "teams4life")
                 .timeout(std::time::Duration::from_secs(8))
                 .send()
                 .await
             {
-                Ok(r) => println!("{m} {p:<40} HTTP {} {}", r.status(), r.text().await.unwrap_or_default().chars().take(200).collect::<String>()),
-                Err(e) => println!("{m} {p:<40} ERR {e}"),
+                Ok(r) => println!(
+                    "READBACK {label}: {} ",
+                    r.text().await.unwrap_or_default().chars().take(300).collect::<String>()
+                ),
+                Err(e) => println!("READBACK {label}: ERR {e}"),
+            }
+        }
+        // Target view AFTER the fresh publish: does B now read Available?
+        {
+            let body = serde_json::json!([{"mri": format!("8:{}", b.skypeid)}]);
+            for i in 0..7 {
+                match a
+                    .http
+                    .post(format!("{origin}/v1/presence/getpresence/"))
+                    .header("X-SkypeToken", &*a.skype)
+                    .header("x-ms-client-consumer-type", "teams4life")
+                    .header("Content-Type", "application/json")
+                    .body(body.to_string())
+                    .timeout(std::time::Duration::from_secs(8))
+                    .send()
+                    .await
+                {
+                    Ok(resp) => println!(
+                        "getPresence B t+{}s: HTTP {} {}",
+                        i * 10,
+                        resp.status(),
+                        resp.text().await.unwrap_or_default().chars().take(220).collect::<String>()
+                    ),
+                    Err(e) => println!("getPresence B t+{}s: ERR {e}", i * 10),
+                }
+                if i < 6 {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
             }
         }
         return Ok(());
@@ -400,4 +1094,46 @@ async fn main() -> anyhow::Result<()> {
         println!("=> receive not confirmed — see statuses above.");
     }
     Ok(())
+}
+
+fn urlencoding_simple(s: &str) -> String {
+    s.replace(':', "%3A").replace('/', "%2F")
+}
+
+async fn mint_msa(http: &reqwest::Client, rt_path: &str, scope: &str) -> Option<String> {
+    let rt = std::fs::read_to_string(rt_path).ok()?.trim().to_string();
+    let resp = http
+        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", rt.as_str()),
+            ("client_id", CLIENT_ID),
+            ("scope", &format!("{scope} offline_access")),
+        ])
+        .send()
+        .await
+        .ok()?;
+    let v: Value = resp.json().await.ok()?;
+    v.get("access_token").and_then(|t| t.as_str()).map(str::to_string)
+}
+
+async fn mint_service_token(http: &reqwest::Client, aad: &str, resource: &str) -> Option<String> {
+    let resp = http
+        .post(format!(
+            "https://teams.live.com/api/auth/v1.0/authz/consumer?resource={}",
+            resource.replace(':', "%3A").replace('/', "%2F")
+        ))
+        .bearer_auth(aad)
+        .header("Content-Length", "0")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: Value = resp.json().await.ok()?;
+    v.pointer("/skypeToken/skypetoken")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
 }
