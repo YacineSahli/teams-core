@@ -50,6 +50,67 @@ impl VideoFrame {
         rgba
     }
 
+    /// Box-filtered downscale so the UI never converts/uploads
+    /// screen-sized frames (a 1280x720 share at 15 repaints/s is
+    /// ~55MB/s of RGBA on software GL — the stage starves, live
+    /// 2026-10-20). Integer factor chosen so the result is at most
+    /// `max_w` wide; returns `self` (cheap clone) when already small
+    /// enough or when the factor would not divide the frame evenly.
+    pub fn downscaled(&self, max_w: u32) -> Self {
+        if self.width == 0 || self.height == 0 || self.width <= max_w {
+            return self.clone();
+        }
+        let mut f = 1u32;
+        while self.width / (f * 2) >= max_w && self.width % (f * 2) == 0 && self.height % (f * 2) == 0 {
+            f *= 2;
+        }
+        if f == 1 {
+            return self.clone();
+        }
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (ow, oh) = (w / f as usize, h / f as usize);
+        let (y, uv) = self.data.split_at(w * h);
+        let (u, v) = uv.split_at(w * h / 4);
+        let (uw, uh) = (w / 2, h / 2);
+        let mut out = vec![0u8; ow * oh * 3 / 2];
+        let (oy_plane, ouv) = out.split_at_mut(ow * oh);
+        let (ou, ov) = ouv.split_at_mut(ow * oh / 4);
+        let fu = f as usize;
+        for row in 0..oh {
+            for col in 0..ow {
+                let mut acc = 0u32;
+                for dy in 0..fu {
+                    for dx in 0..fu {
+                        acc += y[(row * fu + dy) * w + col * fu + dx] as u32;
+                    }
+                }
+                oy_plane[row * ow + col] = (acc / (fu * fu) as u32) as u8;
+            }
+        }
+        // UV is half-resolution: the source block is (fu/2)^2 samples.
+        let cu = fu / 2;
+        let plane = |src: &[u8], dst: &mut [u8]| {
+            for row in 0..oh / 2 {
+                for col in 0..ow / 2 {
+                    let mut acc = 0u32;
+                    for dy in 0..cu {
+                        for dx in 0..cu {
+                            acc += src[(row * cu + dy) * uw + col * cu + dx] as u32;
+                        }
+                    }
+                    dst[row * (ow / 2) + col] = (acc / (cu * cu) as u32) as u8;
+                }
+            }
+        };
+        plane(u, ou);
+        plane(v, ov);
+        VideoFrame {
+            width: ow as u32,
+            height: oh as u32,
+            data: out,
+        }
+    }
+
     /// Flat gray frame of the given size (test/QA helper): Y = level,
     /// neutral chroma.
     pub fn gray(w: u32, h: u32, level: u8) -> Self {
@@ -300,6 +361,37 @@ fn build_prefix_nal(slice_nal_header: u8, is_idr: bool) -> Vec<u8> {
 /// 2. Sends SPS/PPS NAL units as-is (single NAL mode)
 /// 3. Prepends a prefix NAL unit (type 14) before each coded slice, then
 ///    sends the slice via single NAL or FU-A fragmentation
+#[cfg(test)]
+mod downscale_tests {
+    use super::*;
+
+    #[test]
+    fn downscale_720p_to_640_caps_and_preserves_color() {
+        // Red frame (Y=82 U=90 V=240 BT.601 full-range) at 1280x720.
+        let (w, h) = (1280u32, 720u32);
+        let mut data = vec![0u8; (w * h * 3 / 2) as usize];
+        for b in &mut data[..(w * h) as usize] {
+            *b = 82;
+        }
+        let uv_off = (w * h) as usize;
+        let uv_len = (w * h / 4) as usize;
+        for i in 0..uv_len {
+            data[uv_off + i] = 90;
+            data[uv_off + uv_len + i] = 240;
+        }
+        let f = VideoFrame { width: w, height: h, data };
+        let d = f.downscaled(640);
+        assert_eq!((d.width, d.height), (640, 360));
+        assert_eq!(d.data.len(), (640 * 360 * 3 / 2) as usize);
+        // Flat input stays flat through the box filter.
+        assert!(d.data[..(640 * 360) as usize].iter().all(|&b| b == 82));
+        assert!(d.data[(640 * 360) as usize..].iter().all(|&b| b == 90 || b == 240));
+        // Small frames pass through untouched (same dims).
+        let small = VideoFrame { width: 320, height: 240, data: vec![16; 320 * 240 * 3 / 2] };
+        assert_eq!(small.downscaled(640).width, 320);
+    }
+}
+
 pub struct VideoPacketizer {
     ssrc: u32,
     seq: u16,
