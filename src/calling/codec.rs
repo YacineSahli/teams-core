@@ -116,6 +116,40 @@ impl H264Encoder {
     }
 }
 
+/// Encoder-backed black-frame source for the video send loops' fallback
+/// path. The hand-rolled baseline IDR bitstream (video::generate_black_iframe)
+/// is rejected by openh264's decoder on this NAL-per-call feeding mode
+/// (live rigs 2026-10-20: first frame or nothing decodes, then
+/// dsNoParam|dsRefLost forever) — keep the fallback stream decoder-
+/// compatible by encoding real black frames.
+pub struct BlackFrameSource {
+    encoder: H264Encoder,
+    black: Vec<u8>,
+}
+
+impl Default for BlackFrameSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlackFrameSource {
+    pub fn new() -> Self {
+        let (w, h) = (320u32, 240u32);
+        let encoder = H264Encoder::new(w, h, 15.0, 256)
+            .expect("black-frame fallback encoder");
+        BlackFrameSource {
+            encoder,
+            black: vec![0u8; (w * h * 3 / 2) as usize],
+        }
+    }
+
+    /// One encoded black access unit (SPS/PPS/IDR on first use).
+    pub fn frame(&mut self) -> Vec<Vec<u8>> {
+        self.encoder.encode(&self.black).unwrap_or_default()
+    }
+}
+
 /// H.264 decoder wrapper.
 pub struct H264Decoder {
     decoder: Decoder,
@@ -247,5 +281,66 @@ mod tests {
             decoded_frames >= 3,
             "expected >=3 decoded frames over 4 encoded (1-frame decoder latency), got {decoded_frames}"
         );
+    }
+}
+
+#[cfg(test)]
+mod black_stream_tests {
+    use super::*;
+
+    /// The black-frame fallback stream (all-IDR, no P-frames) through the
+    /// packetizer — the rig shape when no camera source delivers. Live
+    /// 2026-10-20: only the FIRST frame decoded, then dsNoParam|dsRefLost
+    /// on every following IDR.
+    #[test]
+    fn black_iframe_stream_decodes() {
+        let mut dec = H264Decoder::new().expect("decoder");
+        let mut packetizer = crate::calling::video::VideoPacketizer::new(0x1234);
+        let mut depacketizer = crate::calling::video::VideoDepacketizer::new();
+        let mut decoded = 0usize;
+        for _round in 0..6 {
+            let nals = crate::calling::video::generate_black_iframe();
+            for pkt in &packetizer.packetize_frame(&nals) {
+                let marker = pkt[1] & 0x80 != 0;
+                let payload = &pkt[crate::calling::rtp::RTP_HEADER_SIZE..];
+                if let Ok(Some(nal)) = depacketizer.depacketize(payload, marker) {
+                    if matches!(nal[0] & 0x1F, 14 | 30) {
+                        continue;
+                    }
+                    if let Ok(Some(_f)) = dec.decode(&nal) {
+                        decoded += 1;
+                    }
+                }
+            }
+        }
+        // The hand-rolled bitstream is documented decoder-hostile here —
+        // this asserts the SYMPTOM so a future regeneration that fixes it
+        // updates the test. The encoder-backed source below is the fix.
+        assert!(decoded == 0, "hand-rolled stream now decodes? {decoded}/6 — switch the fallback back");
+    }
+
+    /// The encoder-backed fallback decodes frame after frame.
+    #[test]
+    fn encoder_backed_black_stream_decodes() {
+        let mut dec = H264Decoder::new().expect("decoder");
+        let mut packetizer = crate::calling::video::VideoPacketizer::new(0x1234);
+        let mut depacketizer = crate::calling::video::VideoDepacketizer::new();
+        let mut black = BlackFrameSource::new();
+        let mut decoded = 0usize;
+        for _round in 0..6 {
+            for pkt in &packetizer.packetize_frame(&black.frame()) {
+                let marker = pkt[1] & 0x80 != 0;
+                let payload = &pkt[crate::calling::rtp::RTP_HEADER_SIZE..];
+                if let Ok(Some(nal)) = depacketizer.depacketize(payload, marker) {
+                    if matches!(nal[0] & 0x1F, 14 | 30) {
+                        continue;
+                    }
+                    if let Ok(Some(_f)) = dec.decode(&nal) {
+                        decoded += 1;
+                    }
+                }
+            }
+        }
+        assert!(decoded >= 4, "only {decoded}/6 encoder-backed black frames decoded");
     }
 }
