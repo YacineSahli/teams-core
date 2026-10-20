@@ -147,9 +147,15 @@ pub async fn answer_call_with_stop(
     }
 
     // Media answer from the offer's SDP blob (protocol order: media answer
-    // BEFORE acceptance). The audio session itself starts after acceptance.
+    // BEFORE acceptance). The audio session itself starts BEFORE the answer
+    // goes out: an answer SDP with `m=audio 0` REJECTS the m-line (RFC
+    // 3264) — the CC then treats the callee's media leg as dead and the
+    // acceptance transaction can never complete (30s hold → 408/10056
+    // "waiting for acknowledgement", connectTime null — live-verified
+    // 2026-10-20). The bound RTP port is patched into the SDP first.
     let mut audio_plan: Option<AudioPlan> = None;
     let mut consumer_sdp: Option<String> = None;
+    let mut session: Option<media::MediaSession> = None;
     if let Some(ref inv) = notification.call_invitation {
         if let Some(ref mc) = inv.media_content {
             if let Some(ref blob) = mc.blob {
@@ -179,19 +185,7 @@ pub async fn answer_call_with_stop(
                             answer_result.audio_ice_ufrag
                         );
 
-                        if let Err(e) = signaling::send_media_answer(
-                            &http,
-                            skype_token_str,
-                            notification,
-                            &answer_result.sdp,
-                        )
-                        .await
-                        {
-                            tracing::warn!("Failed to send media answer: {:#}", e);
-                        }
-                        // Consumer acceptance embeds the SDP itself.
-                        consumer_sdp = Some(answer_result.sdp.clone());
-
+                        let mut sdp_out = answer_result.sdp.clone();
                         if let (Some(local_mat), Some(remote_mat)) =
                             (local_audio_crypto, remote_audio_crypto)
                         {
@@ -201,7 +195,7 @@ pub async fn answer_call_with_stop(
                                 .any(|c| c.transport == ice::Transport::Udp && c.component == 1)
                             {
                                 audio_plan = Some((
-                                    candidates,
+                                    candidates.clone(),
                                     ice::IceCredentials {
                                         ufrag: answer_result.audio_ice_ufrag.clone(),
                                         pwd: answer_result.audio_ice_pwd.clone(),
@@ -221,9 +215,55 @@ pub async fn answer_call_with_stop(
                                 "Missing audio SRTP keying material, audio session not started"
                             );
                         }
+
+                        // Bind the RTP socket now so the answer carries the
+                        // real port (see the comment above).
+                        if let Some((candidates, local_creds, remote_creds, local_mat, remote_mat)) =
+                            audio_plan.clone()
+                        {
+                            match media::MediaSession::start_with_ice(
+                                0,
+                                &candidates,
+                                &local_creds,
+                                &remote_creds,
+                                &local_mat,
+                                &remote_mat,
+                            )
+                            .await
+                            {
+                                Ok(s) => {
+                                    if let Ok(port) = s.local_port() {
+                                        if port > 0 {
+                                            sdp_out = patch_answer_media_port(&sdp_out, port);
+                                            tracing::info!(
+                                                "Answer SDP patched with bound RTP port {port}"
+                                            );
+                                        }
+                                    }
+                                    result.media_started = true;
+                                    session = Some(s);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to start audio session: {:#}", e)
+                                }
+                            }
+                        }
+
+                        if let Err(e) = signaling::send_media_answer(
+                            &http,
+                            skype_token_str,
+                            notification,
+                            &sdp_out,
+                        )
+                        .await
+                        {
+                            tracing::warn!("Failed to send media answer: {e:#}");
+                        }
+                        // Consumer acceptance embeds the SDP itself.
+                        consumer_sdp = Some(sdp_out);
                     }
                     Err(e) => {
-                        tracing::warn!("Could not parse SDP offer (may be compressed): {:#}", e);
+                        tracing::warn!("Could not parse SDP offer (may be compressed): {e:#}");
                         // Acceptance still proceeds without a media answer.
                     }
                 }
@@ -269,27 +309,9 @@ pub async fn answer_call_with_stop(
     result.call_accepted = true;
     tracing::info!("Incoming call accepted");
 
-    // Start the audio session now that the call is accepted.
-    let mut session: Option<media::MediaSession> = None;
-    if let Some((candidates, local_creds, remote_creds, local_mat, remote_mat)) = audio_plan {
-        match media::MediaSession::start_with_ice(
-            0,
-            &candidates,
-            &local_creds,
-            &remote_creds,
-            &local_mat,
-            &remote_mat,
-        )
-        .await
-        {
-            Ok(s) => {
-                tracing::info!("Audio session started on port {}", s.local_port().unwrap_or(0));
-                result.media_started = true;
-                session = Some(s);
-            }
-            Err(e) => tracing::warn!("Failed to start audio session: {:#}", e),
-        }
-    }
+    // The audio session (if it started) is already running — it was
+    // bound before the answer went out so the SDP carried the real
+    // RTP port.
 
     // Run until hang-up (stop watch) — the call stays alive even when the
     // audio session failed to start (e.g. no usable ICE path in sandboxes).
@@ -320,6 +342,25 @@ pub async fn answer_call_with_stop(
         s.stop().await;
     }
     Ok(result)
+}
+
+/// Replace the placeholder (0) media port in a generated answer SDP with
+/// the actually-bound RTP port. Only the audio m-line and its fallback
+/// host candidate carry the placeholder (the video line intentionally
+/// stays 0 = m-line rejected, for audio-only answers).
+fn patch_answer_media_port(sdp: &str, port: u16) -> String {
+    // Patch only the audio section (everything before the video m-line,
+    // if any): the video line intentionally stays 0 = m-line rejected
+    // for audio-only answers, and patching its candidate alone would
+    // contradict the rejected m-line.
+    let (head, tail) = match sdp.find("m=video") {
+        Some(i) => (&sdp[..i], &sdp[i..]),
+        None => (sdp, ""),
+    };
+    let head = head
+        .replace("m=audio 0 RTP", &format!("m=audio {port} RTP"))
+        .replace(" 0 typ host", &format!(" {port} typ host"));
+    format!("{head}{tail}")
 }
 
 /// Long-poll the fork's broker message channel and acknowledge the
