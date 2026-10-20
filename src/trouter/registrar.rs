@@ -98,6 +98,54 @@ pub async fn register_personal_with_endpoint(
     register_inner(http, skype_token, registrar_url, trouter_surl, epid, REGISTRATIONS_PERSONAL).await
 }
 
+/// The CONSUMER calling registration: the appliance V2 registrar (the
+/// web client's calling_registrarUrl template, :8443). Everything else
+/// about consumer calls works over 443, but this one rides 8443 —
+/// networks that filter 8443 (the dev network does — both skype hosts
+/// time out while 443 answers) starve incoming-call routing: invites
+/// never reach the callee. Timeout-tolerant: logs and continues.
+pub async fn register_calling_v2(
+    http: &reqwest::Client,
+    skype_token: &str,
+    call_controller: &str,
+    trouter_surl: &str,
+) -> Result<()> {
+    let host = call_controller
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    let url = format!("https://{host}:8443/V2/registrations");
+    let payload = serde_json::json!({
+        "clientDescription": {
+            "appId": "NextGenCalling",
+            "aesKey": "",
+            "languageId": "en-US",
+            "platform": "edge",
+            "templateKey": "DesktopNgc_2.5:SkypeNgc",
+            "platformUIVersion": "49/1.0.0"
+        },
+        "registrationId": uuid::Uuid::new_v4().to_string(),
+        "nodeId": "",
+        "transports": {
+            "TROUTER": [{ "context": "", "path": format!("{trouter_surl}NGCallManagerWin"), "ttl": 86400 }]
+        }
+    });
+    let resp = http
+        .post(&url)
+        .header("X-Skypetoken", skype_token)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            tracing::info!("V2 calling registration OK at {url}");
+            Ok(())
+        }
+        Ok(r) => anyhow::bail!("V2 calling registration HTTP {} at {url}", r.status()),
+        Err(e) => anyhow::bail!("V2 calling registration unreachable at {url} ({e}) — is outbound 8443 filtered?"),
+    }
+}
+
 /// One registration call with the table chosen by the personal flag.
 pub async fn register_flagged(
     http: &reqwest::Client,

@@ -135,6 +135,33 @@ async fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if std::env::var("PAIR_DUMP_THREAD").is_ok() {
+        let resp = a
+            .get(&format!("{}/v1/users/ME/conversations/19:11111111222233334444555566667777@thread.v2/messages?pageSize=15", a.chat_service))
+            .send()
+            .await?;
+        let v: Value = resp.json().await?;
+        for m in v.get("messages").and_then(|m| m.as_array()).unwrap_or(&vec![]).iter().rev() {
+            if m.get("messagetype").and_then(|t| t.as_str()) == Some("Event/Call") {
+                println!("=== FULL Event/Call ===");
+                println!("{}", m.get("content").and_then(|c| c.as_str()).unwrap_or(""));
+                println!("props: {}", serde_json::to_string(m.get("properties").unwrap_or(&Value::Null)).unwrap_or_default());
+                println!("ids: id={:?} clientmessageid={:?}", m.get("id"), m.get("clientmessageid"));
+                continue;
+            }
+            println!(
+                "{} | type={:?} | {}",
+                m.get("composetime").and_then(|c| c.as_str()).unwrap_or("?"),
+                m.get("messagetype").and_then(|t| t.as_str()).unwrap_or("?"),
+                &m.get("content").and_then(|c| c.as_str()).unwrap_or("").chars().take(80).collect::<String>(),
+            );
+            if let Some(p) = m.get("properties") {
+                let keys: Vec<&str> = p.as_object().map(|o| o.keys().map(|k| k.as_str()).collect()).unwrap_or_default();
+                if !keys.is_empty() { println!("      props: {keys:?}"); }
+            }
+        }
+        return Ok(());
+    }
     if std::env::var("PAIR_PROBE_EPCONV").is_ok() {
         for url in [
             "https://api.cc.skype.com/api/v2/epconv",
@@ -155,6 +182,9 @@ async fn main() -> anyhow::Result<()> {
             "https://api.flightproxy.skype.com/api/v2/cp/api.cc.skype.com:8443/api/v1/conv",
             "https://api.flightproxy.skype.com/api/v2/epconv",
             "https://us-api.flightproxy.skype.com/api/v2/epconv",
+            "https://api.flightproxy.skype.com/api/v2/cp/api.cc.skype.com:8443/V2/registrations",
+            "https://api.flightproxy.skype.com/api/v2/cp/api.conv.skype.com/V2/registrations",
+            "https://api.flightproxy.skype.com/api/v2/ep/api.cc.skype.com:8443/V2/registrations",
         ] {
             match a
                 .http

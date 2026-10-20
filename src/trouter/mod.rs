@@ -127,6 +127,23 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
         {
             tracing::warn!("Initial registrar registration failed: {:#}", e);
         }
+        // Consumer calls: the appliance V2 calling registration (8443).
+        // Failure is expected on 8443-filtered networks — logged, not
+        // fatal; incoming-call routing stays starved until it lands.
+        if personal {
+            let cc = crate::config::Config::load_cached().ok().and_then(|cfg| {
+                cfg.get_region_gtms()
+                    .and_then(|g| g.get("calling_callControllerServiceUrl"))
+                    .and_then(|v| v.as_str().map(String::from))
+            });
+            if let Some(cc) = cc {
+                if let Err(e) =
+                    registrar::register_calling_v2(&http, skype_token_str, &cc, &session.surl).await
+                {
+                    tracing::warn!("{e:#}");
+                }
+            }
+        }
     }
     // OstMac §106: mark the endpoint active (Teams clients send this
     // right after the handshake; the server acks with `6:1+::`).
