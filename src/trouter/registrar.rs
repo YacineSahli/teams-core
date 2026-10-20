@@ -36,6 +36,31 @@ const REGISTRATIONS: &[RegEntry] = &[
     },
 ];
 
+/// CONSUMER (personal) registrations: the TFL product context and the
+/// 2.6 template keys — the exact shape the work flow moved AWAY from
+/// (its §106 note above), which is precisely why it is the consumer
+/// shape: it was built for Teams-for-Life.
+const REGISTRATIONS_PERSONAL: &[RegEntry] = &[
+    RegEntry {
+        app_id: "TeamsCDLWebWorker",
+        template_key: "TeamsCDLWebWorker_2.6",
+        path_suffix: "",
+        context: "TFL",
+    },
+    RegEntry {
+        app_id: "SkypeSpacesWeb",
+        template_key: "SkypeSpacesWeb_2.6",
+        path_suffix: "SkypeSpacesWeb",
+        context: "",
+    },
+    RegEntry {
+        app_id: "NextGenCalling",
+        template_key: "DesktopNgc_2.5:SkypeNgc",
+        path_suffix: "NGCallManagerWin",
+        context: "",
+    },
+];
+
 /// Register our trouter endpoint with the Teams registrar service.
 ///
 /// Performs three separate registrations (TeamsCDLWebWorker, SkypeSpacesWeb,
@@ -59,9 +84,55 @@ pub async fn register_with_endpoint(
     trouter_surl: &str,
     epid: Option<&str>,
 ) -> Result<()> {
+    register_inner(http, skype_token, registrar_url, trouter_surl, epid, REGISTRATIONS).await
+}
+
+/// Personal (consumer) variant: the TFL table.
+pub async fn register_personal_with_endpoint(
+    http: &reqwest::Client,
+    skype_token: &str,
+    registrar_url: &str,
+    trouter_surl: &str,
+    epid: Option<&str>,
+) -> Result<()> {
+    register_inner(http, skype_token, registrar_url, trouter_surl, epid, REGISTRATIONS_PERSONAL).await
+}
+
+/// One registration call with the table chosen by the personal flag.
+pub async fn register_flagged(
+    http: &reqwest::Client,
+    skype_token: &str,
+    registrar_url: &str,
+    trouter_surl: &str,
+    epid: Option<&str>,
+    personal: bool,
+) -> Result<()> {
+    register_inner(
+        http,
+        skype_token,
+        registrar_url,
+        trouter_surl,
+        epid,
+        if personal {
+            REGISTRATIONS_PERSONAL
+        } else {
+            REGISTRATIONS
+        },
+    )
+    .await
+}
+
+async fn register_inner(
+    http: &reqwest::Client,
+    skype_token: &str,
+    registrar_url: &str,
+    trouter_surl: &str,
+    epid: Option<&str>,
+    table: &'static [RegEntry],
+) -> Result<()> {
     let url = registrar_url.trim_end_matches('/').to_string();
 
-    for entry in REGISTRATIONS {
+    for entry in table {
         let reg_id = match epid {
             Some(e) if entry.app_id == "TeamsCDLWebWorker" && !e.trim().is_empty() => e.to_string(),
             _ => uuid::Uuid::new_v4().to_string(),

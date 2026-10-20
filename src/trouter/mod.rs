@@ -115,8 +115,13 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
     // 5. Register with registrar
     let registrar_ttl_secs: u64 = 86400;
     if let Some(ref reg_url) = session.registrar_url {
-        if let Err(e) = registrar::register_with_endpoint(
-            &http, skype_token_str, reg_url, &session.surl, Some(&epid),
+        // Consumer profiles register the TFL table (2.6 keys + product
+        // context) — the work table starves consumer push delivery.
+        let personal = crate::config::Config::load_cached()
+            .map(|c| c.personal == Some(true))
+            .unwrap_or(false);
+        if let Err(e) = registrar::register_flagged(
+            &http, skype_token_str, reg_url, &session.surl, Some(&epid), personal,
         )
         .await
         {
@@ -201,7 +206,8 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
                     let reg = reg_url.clone();
                     let ep = epid.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = registrar::register_with_endpoint(&http2, &tok, &reg, &surl, Some(&ep)).await {
+                        let personal = crate::config::Config::load_cached().map(|c| c.personal == Some(true)).unwrap_or(false);
+                        if let Err(e) = registrar::register_flagged(&http2, &tok, &reg, &surl, Some(&ep), personal).await {
                             tracing::warn!("Re-registration failed: {:#}", e);
                         }
                     });

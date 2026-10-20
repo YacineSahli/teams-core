@@ -401,9 +401,13 @@ pub async fn run_call_with_controls(
     // Determine if this is a 1:1 call (echo or thread override with callee)
     let is_1to1_call = echo || callee_mri.is_some();
 
-    // Get tenant ID
+    // Get tenant ID. Consumer threads carry the all-zeros tenant in
+    // their properties (addedByTenantId) — that is the value to send.
     let tenant_id = match config.tenant_id.as_deref() {
         Some(t) if !t.trim().is_empty() => t.to_string(),
+        _ if config.personal == Some(true) => {
+            "00000000-0000-0000-0000-000000000000".to_string()
+        }
         // Older configs never stored tenant_id — the Skype token's `tid`
         // claim carries it.
         _ => extract_claim_from_skype_token(skype_token_str, "tid")
@@ -2464,7 +2468,10 @@ fn extract_mri_from_skype_token(token: &str) -> Option<String> {
     // Try "skypeid" field first, then "oid" (Azure AD object ID)
     if let Some(skypeid) = json.get("skypeid").and_then(|v| v.as_str()) {
         // skypeid is like "orgid:<guid>" — prefix with "8:"
-        if skypeid.starts_with("orgid:") || skypeid.starts_with("teamsvisitor:") {
+        if skypeid.starts_with("orgid:")
+            || skypeid.starts_with("teamsvisitor:")
+            || skypeid.starts_with("live:")
+        {
             return Some(format!("8:{}", skypeid));
         }
         return Some(skypeid.to_string());
