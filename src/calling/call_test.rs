@@ -616,12 +616,22 @@ pub async fn run_call_with_controls(
                 else {
                     return;
                 };
+                // Hard deadline: the phase sender can outlive the call's
+                // actual end when the call task blocks post-`ended` (e.g. an
+                // un-timed end POST) — without this cap the tone loops
+                // forever on the host's speakers (live: 8 minutes until a
+                // manual hangup cleared it).
+                let deadline = std::time::Instant::now() + Duration::from_secs(120);
                 let mut gen = super::test_tone::ToneGenerator::with(425.0, 0.35);
                 let silence = vec![0i16; 160];
                 let mut on = true;
                 let mut until = std::time::Instant::now() + Duration::from_secs(1);
                 loop {
                     if *rb_stop.borrow() {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!("ringback: 120s deadline reached — stopping");
                         break;
                     }
                     if *watch.borrow_and_update() != CallPhase::Ringing {
@@ -2499,6 +2509,7 @@ async fn end_call_by_url(http: &reqwest::Client, skype_token: &str, end_url: &st
         .header("X-Skypetoken", skype_token)
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({}))
+        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
         .context("Failed to POST end call")?;
