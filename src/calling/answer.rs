@@ -76,6 +76,32 @@ pub async fn answer_call_with_stop(
 
     let mut result = CallAnswerResult::default();
 
+    // CONSUMER (evt:107) invitations: the notification's mediaAnswer is
+    // the `cc://ma` marker — attach to the fork first to receive the real
+    // mediaAnswer/acceptance links, then run the shared answer flow on the
+    // merged notification. Ringing progress rides along (best-effort).
+    let notification_owned;
+    let notification: &CallNotification = if notification
+        .call_invitation
+        .as_ref()
+        .and_then(|i| i.links.as_ref())
+        .map(|l| l.attach.is_some())
+        .unwrap_or(false)
+    {
+        match signaling::attach_forked_call(&http, skype_token_str, notification).await {
+            Ok(merged) => {
+                let _ = signaling::send_call_progress(&http, skype_token_str, &merged).await;
+                notification_owned = merged;
+                &notification_owned
+            }
+            Err(e) => {
+                anyhow::bail!("Fork attach failed: {e:#}");
+            }
+        }
+    } else {
+        notification
+    };
+
     // TURN relay (best-effort; direct/srflx still possible without it).
     let relay_config = match turn::acquire_relay_credentials(&http, skype_token_str).await {
         Ok(rc) => {
@@ -105,6 +131,7 @@ pub async fn answer_call_with_stop(
     // Media answer from the offer's SDP blob (protocol order: media answer
     // BEFORE acceptance). The audio session itself starts after acceptance.
     let mut audio_plan: Option<AudioPlan> = None;
+    let mut consumer_sdp: Option<String> = None;
     if let Some(ref inv) = notification.call_invitation {
         if let Some(ref mc) = inv.media_content {
             if let Some(ref blob) = mc.blob {
@@ -144,6 +171,8 @@ pub async fn answer_call_with_stop(
                         {
                             tracing::warn!("Failed to send media answer: {:#}", e);
                         }
+                        // Consumer acceptance embeds the SDP itself.
+                        consumer_sdp = Some(answer_result.sdp.clone());
 
                         if let (Some(local_mat), Some(remote_mat)) =
                             (local_audio_crypto, remote_audio_crypto)
@@ -185,7 +214,7 @@ pub async fn answer_call_with_stop(
     }
 
     // Acceptance (audio-only modalities).
-    signaling::accept_call_with_video(&http, skype_token_str, notification, video).await?;
+    signaling::accept_call_with_sdp(&http, skype_token_str, notification, video, consumer_sdp.as_deref()).await?;
     result.call_accepted = true;
     tracing::info!("Incoming call accepted");
 

@@ -37,7 +37,7 @@ pub mod video;
 use serde::Deserialize;
 
 /// Links provided in a callInvitation for signaling actions.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct CallLinks {
     pub acceptance: Option<String>,
     pub end: Option<String>,
@@ -45,6 +45,13 @@ pub struct CallLinks {
     pub media_answer: Option<String>,
     #[serde(rename = "p2pForkNotification")]
     pub p2p_fork_notification: Option<String>,
+    /// CONSUMER (evt:107) invitations: the fork-attach entry point, the
+    /// reject link (replaces `end`) and the ringing-progress link. The
+    /// real mediaAnswer/acceptance URLs arrive in the ATTACH RESPONSE —
+    /// the notification itself carries the marker `cc://ma`.
+    pub attach: Option<String>,
+    pub reject: Option<String>,
+    pub progress: Option<String>,
 }
 
 /// Media content (SDP blob) from the call invitation.
@@ -65,6 +72,10 @@ pub struct Participant {
     pub endpoint_id: Option<String>,
     #[serde(rename = "languageId")]
     pub language_id: Option<String>,
+    /// The fork-assigned participant id (consumer attaches mint a fresh
+    /// one per leg — the acceptance must echo it back).
+    #[serde(default, rename = "participantId")]
+    pub participant_id: Option<String>,
 }
 
 /// Participants block from the invitation.
@@ -122,6 +133,10 @@ pub struct CallNotification {
     pub conversation_request: Option<ConversationRequest>,
     #[serde(rename = "debugContent")]
     pub debug_content: Option<DebugContent>,
+    /// CONSUMER invitations: `conversationInvitation.conversationController`
+    /// — the join URL the fork-attach `additionalActions` entry targets.
+    #[serde(default)]
+    pub conversation_controller: Option<String>,
 }
 
 /// Simple call lifecycle state.
@@ -140,13 +155,31 @@ pub enum CallState {
 /// We try to extract the JSON and deserialize it.
 pub fn parse_call_notification(json_str: &str) -> Option<CallNotification> {
     // The JSON may be the full Trouter event envelope or just the body.
-    // Try to find a JSON object containing "callInvitation".
+    // We try to extract the JSON and deserialize it.
     let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
 
     // The Trouter event JSON has a nested structure. The call notification
     // may be at the top level or nested under a "body" field parsed as string.
     if v.get("callInvitation").is_some() {
         return serde_json::from_value(v).ok();
+    }
+
+    // CONSUMER (evt:107) invitations: the payload is wrapped — `cp` =
+    // base64(gzip(json)), `gp` = base64(json) — and the inner object keys
+    // the notification `callNotification` (roles are single objects, the
+    // invitation lives in `conversationInvitation`).
+    if let Some(cn) = v.get("callNotification") {
+        return parse_consumer_notification(cn, v.get("conversationInvitation"));
+    }
+    for key in ["cp", "gp"] {
+        if let Some(wrapped) = v.get(key).and_then(|c| c.as_str()) {
+            let inner = crate::trouter::decode_wrapped(key == "cp", wrapped)?;
+            if let Ok(iv) = serde_json::from_str::<serde_json::Value>(&inner) {
+                if let Some(cn) = iv.get("callNotification") {
+                    return parse_consumer_notification(cn, iv.get("conversationInvitation"));
+                }
+            }
+        }
     }
 
     // Sometimes the body is a stringified JSON inside the event wrapper.
@@ -158,9 +191,58 @@ pub fn parse_call_notification(json_str: &str) -> Option<CallNotification> {
         if body.get("callInvitation").is_some() {
             return serde_json::from_value(body.clone()).ok();
         }
+        if let Some(cn) = body.get("callNotification") {
+            return parse_consumer_notification(cn, body.get("conversationInvitation"));
+        }
     }
 
     None
+}
+
+/// Map the CONSUMER notification shape (`callNotification` +
+/// `conversationInvitation`, live-captured 2026-10-20 on the A↔B rig)
+/// onto [`CallNotification`]. Attach/reject/progress carry the pre-attach
+/// links; `mediaAnswer` is the `cc://ma` marker until the attach response
+/// supplies the real URLs.
+fn parse_consumer_notification(
+    cn: &serde_json::Value,
+    inv: Option<&serde_json::Value>,
+) -> Option<CallNotification> {
+    let from: Participant = serde_json::from_value(cn.get("from")?.clone()).ok()?;
+    let to: Option<Participant> = serde_json::from_value(cn.get("to")?.clone()).ok();
+    let links: CallLinks =
+        serde_json::from_value(cn.get("links").cloned().unwrap_or(serde_json::Value::Null))
+            .unwrap_or_default();
+    let media_content: Option<MediaContent> = serde_json::from_value(
+        cn.get("mediaContent").cloned().unwrap_or(serde_json::Value::Null),
+    )
+    .ok();
+    // Modalities are not a field on the consumer shape — derive them from
+    // the offer (a video m-line = a video call).
+    let call_modalities = media_content.as_ref().and_then(|m| m.blob.as_ref()).map(|blob| {
+        if blob.contains("m=video") {
+            vec!["Audio".to_string(), "Video".to_string()]
+        } else {
+            vec!["Audio".to_string()]
+        }
+    });
+    Some(CallNotification {
+        call_invitation: Some(CallInvitation {
+            call_modalities,
+            links: Some(links),
+            media_content,
+        }),
+        participants: Some(Participants {
+            from: Some(from),
+            to: to.map(|t| vec![t]),
+        }),
+        conversation_request: None,
+        debug_content: None,
+        conversation_controller: inv
+            .and_then(|i| i.get("conversationController"))
+            .and_then(|u| u.as_str())
+            .map(str::to_string),
+    })
 }
 
 #[cfg(test)]
@@ -214,6 +296,96 @@ mod parse_tests {
         let from = n.participants.and_then(|p| p.from).expect("from");
         assert_eq!(from.display_name.as_deref(), Some("Grace Hopper"));
         assert_eq!(from.id.as_deref(), Some("8:orgid:22222222-3333-4444-5555-666666666666"));
+    }
+
+    /// The CONSUMER (evt:107) inner shape, field-for-field from the
+    /// live-captured A→B invitation (2026-10-20, cp frame gunzipped):
+    /// roles as single objects, links.attach/reject/progress, the
+    /// cc://ma mediaAnswer marker, conversationController on the
+    /// conversationInvitation sibling.
+    const CONSUMER_INVITATION: &str = r#"{
+        "callNotification": {
+            "from": {
+                "id": "8:live:rig-consumer-a",
+                "displayName": "(unknown)",
+                "displayNameSource": "unknown",
+                "endpointId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "participantId": "aaaaaaaa-bbbb-cccc-dddd-ffffffffffff"
+            },
+            "to": {
+                "id": "8:live:.cid.0123456789abcdef",
+                "displayName": null,
+                "endpointId": "00000000-0000-0000-0000-000000000000",
+                "participantId": "aaaaaaaa-bbbb-cccc-dddd-111111111111"
+            },
+            "links": {
+                "attach": "https://api.flightproxy.skype.com/api/v2/cp/cc-euwe-06/cc/v1/forked/0a0a0a0a/27/i1/710/attach",
+                "mediaAnswer": "cc://ma",
+                "progress": "https://api.flightproxy.skype.com/api/v2/cp/cc-euwe-06/cc/v1/forked/0a0a0a0a/27/i1/710/progress",
+                "reject": "https://api.flightproxy.skype.com/api/v2/cp/cc-euwe-06/cc/v1/forked/0a0a0a0a/27/i1/710/reject",
+                "udpTransport": "udp://52.112.124.42:3478/"
+            },
+            "mediaContent": {
+                "contentType": "application/sdp",
+                "blob": "v=0\r\nm=audio 46598 RTP/SAVP 0\r\na=crypto:2 AES_CM_128_HMAC_SHA1_80 literal:inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|2^31\r\nm=video 41109 RTP/SAVP 122\r\n"
+            },
+            "udpKey": { "sessionKey": "literal:AAAAAAAAAAAAAAAAAAAAAA==", "ticket": "literal:BBBBBBBBBBBBBBBBBBBBBB==" }
+        },
+        "conversationInvitation": {
+            "conversationController": "https://api.flightproxy.teams.microsoft.com/api/v2/ep/conv-euwe-06/conv/QaQaQaQa",
+            "isMultiParty": false,
+            "isBroadcast": false
+        },
+        "groupChat": { "threadId": "19:11111111222233334444555566667777@thread.v2", "messageId": null }
+    }"#;
+
+    #[test]
+    fn consumer_invitation_parses_with_attach_links() {
+        let n = parse_call_notification(CONSUMER_INVITATION).expect("parses consumer shape");
+        let from = n.participants.as_ref().and_then(|p| p.from.as_ref()).expect("from");
+        assert_eq!(from.id.as_deref(), Some("8:live:rig-consumer-a"));
+        let to = n.participants.as_ref().and_then(|p| p.to.as_ref()).expect("to");
+        assert_eq!(to.len(), 1);
+        assert_eq!(to[0].id.as_deref(), Some("8:live:.cid.0123456789abcdef"));
+        let inv = n.call_invitation.as_ref().expect("invitation");
+        let links = inv.links.as_ref().expect("links");
+        assert!(links.attach.as_deref().unwrap().contains("/attach"));
+        assert_eq!(links.media_answer.as_deref(), Some("cc://ma"));
+        assert!(links.reject.as_deref().unwrap().contains("/reject"));
+        assert!(links.progress.as_deref().unwrap().contains("/progress"));
+        assert_eq!(
+            n.conversation_controller.as_deref(),
+            Some("https://api.flightproxy.teams.microsoft.com/api/v2/ep/conv-euwe-06/conv/QaQaQaQa")
+        );
+        // Modalities derive from the offer: the m=video line = video call.
+        let mods = inv.call_modalities.as_ref().expect("modalities");
+        assert!(mods.iter().any(|m| m.eq_ignore_ascii_case("video")));
+        assert!(inv
+            .media_content
+            .as_ref()
+            .and_then(|m| m.blob.as_deref())
+            .unwrap_or_default()
+            .contains("a=crypto"));
+    }
+
+    /// The trouter wire form: gzip+base64 of the inner object, wrapped in
+    /// {"evt":107,"cp":…} — exactly what the 3::: data frame body carries.
+    #[test]
+    fn consumer_invitation_parses_from_evt_wrapped_cp() {
+        use base64::Engine;
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(CONSUMER_INVITATION.as_bytes()).unwrap();
+        let gz = enc.finish().unwrap();
+        let cp = base64::engine::general_purpose::STANDARD.encode(gz);
+        let wrapped = format!(r#"{{"evt":107,"cp":"{cp}"}}"#);
+        let n = parse_call_notification(&wrapped).expect("parses evt-wrapped cp");
+        assert!(n
+            .call_invitation
+            .as_ref()
+            .and_then(|i| i.links.as_ref())
+            .and_then(|l| l.attach.as_ref())
+            .is_some());
     }
 
     #[test]

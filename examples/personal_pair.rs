@@ -137,6 +137,74 @@ async fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if std::env::var("PAIR_REG_CLEAN").is_ok() {
+        // Enumerate our registrar registrations; the CC's acceptance
+        // fan-out 504s on dead ones (430/10065). Try list + delete.
+        // Live paths per account (env: PAIR_KEEP_A / PAIR_KEEP_B) — every
+        // registration bound to a different path is stale (dead socket,
+        // 24h TTL) and gets deleted.
+        let keep_a = std::env::var("PAIR_KEEP_A").unwrap_or_default();
+        let keep_b = std::env::var("PAIR_KEEP_B").unwrap_or_default();
+        let base = "https://edge.skype.com/registrar/prod/V3/registrations";
+        for (label, sess, keep) in [("A", &a, &keep_a), ("B", &b, &keep_b)] {
+            let Ok(r) = sess
+                .http
+                .get(base)
+                .header("X-SkypeToken", &*sess.skype)
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await
+            else {
+                println!("REGLIST {label}: GET failed");
+                continue;
+            };
+            let v: Value = match r.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("REGLIST {label}: parse {e}");
+                    continue;
+                }
+            };
+            let mut stale = 0;
+            let mut kept = 0;
+            for b_ in v
+                .get("bindings")
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default()
+            {
+                let rid = b_
+                    .get("registrationId")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let path = b_
+                    .pointer("/transports/trouter/0/path")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let is_live = !keep.is_empty() && path.starts_with(keep.as_str());
+                if is_live {
+                    kept += 1;
+                    continue;
+                }
+                stale += 1;
+                match sess
+                    .http
+                    .delete(format!("{base}/{rid}"))
+                    .header("X-SkypeToken", &*sess.skype)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                {
+                    Ok(r) => println!("REGDEL {label} {rid:.8} HTTP {}", r.status()),
+                    Err(e) => println!("REGDEL {label} {rid:.8} ERR {e}"),
+                }
+            }
+            println!("REGSUM {label}: kept {kept} live, deleted {stale} stale");
+        }
+        return Ok(());
+    }
     if std::env::var("PAIR_ADD_CONTACTS").is_ok() {
         // Call-end forensics: 403 "Permission check for callee to
         // interact with caller is not allowed" — the consumer privacy

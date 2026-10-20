@@ -468,9 +468,15 @@ pub async fn run_call_with_controls(
         tracing::warn!("Expected 1:: handshake, got: {}", frame);
     }
 
-    // 2. Register paths
+    // 2. Register paths. CONSUMER calls skip the registrar table: the
+    // create payload binds this socket's callbacks directly, and each
+    // extra registration here leaves a 24h-TTL endpoint behind when the
+    // call ends — the CC's acceptance fan-out then 504s on the dead
+    // paths (live: 430/10065 "Trouter server timed out").
     if let Some(ref reg_url) = trouter_session.registrar_url {
-        registrar::register(&http, skype_token_str, reg_url, &trouter_session.surl).await?;
+        if !consumer {
+            registrar::register(&http, skype_token_str, reg_url, &trouter_session.surl).await?;
+        }
     }
 
     // 3. Bind UDP sockets for audio and video, gather ICE candidates
@@ -708,14 +714,23 @@ pub async fn run_call_with_controls(
         // declaration should still bind the real media leg (A/B #1's
         // invite-only produced a placeholder leg).
         tracing::info!("Inviting user {} (declared at create + invite)...", mri);
-        signaling::invite_user(
+        if let Err(e) = signaling::invite_user(
             &http,
             &phase1.conversation_controller,
             &conv_params,
             mri,
             use_camera,
         )
-        .await?;
+        .await
+        {
+            // The callee is already declared in participants.to at
+            // create — the fork dials them regardless. The explicit
+            // invite can 404 "conversation could not be resolved" on a
+            // fresh conversation (region/replication lag on the conv
+            // service); treat it as best-effort and keep waiting for
+            // the ring instead of aborting the call.
+            tracing::warn!("User invite failed (continuing — callee declared at create): {e:#}");
+        }
     }
 
     // 7. Wait for mediaAnswer on Trouter

@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 
-use super::CallNotification;
+use super::{CallLinks, CallNotification};
 use uuid;
 
 // Common headers for Teams calling API requests.
@@ -582,6 +582,21 @@ pub async fn accept_call_with_video(
     notification: &CallNotification,
     video: bool,
 ) -> Result<()> {
+    accept_call_with_sdp(http, skype_token, notification, video, None).await
+}
+
+/// Accept with an optional SDP answer embedded — CONSUMER controllers
+/// require the full `callAcceptance` envelope (acceptedBy + modalities +
+/// mediaContent; live: 400 "The CallAcceptance field is required" for
+/// the flat work shape) and the caller reads the answer SDP from
+/// `callAcceptance.mediaContent.blob`.
+pub async fn accept_call_with_sdp(
+    http: &reqwest::Client,
+    skype_token: &str,
+    notification: &CallNotification,
+    video: bool,
+    sdp_answer: Option<&str>,
+) -> Result<()> {
     let invitation = notification
         .call_invitation
         .as_ref()
@@ -595,13 +610,69 @@ pub async fn accept_call_with_video(
         .as_ref()
         .context("No acceptance URL in links")?;
 
-    let payload = serde_json::json!({
-        "acceptedCallModalities": accepted_call_modalities(video),
-        "endpointMetadata": {
-            "isCallMediaCaptured": false,
-            "isMicrophoneOn": false
+    let is_consumer = links.attach.is_some();
+    let payload = if is_consumer {
+        let me = notification
+            .participants
+            .as_ref()
+            .and_then(|p| p.to.as_ref())
+            .and_then(|t| t.first())
+            .map(|t| t.id.clone().unwrap_or_default())
+            .unwrap_or_default();
+        let to_part = notification
+            .participants
+            .as_ref()
+            .and_then(|p| p.to.as_ref())
+            .and_then(|t| t.first());
+        let assigned_pid = to_part
+            .and_then(|t| t.participant_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let ep_for_links = to_part
+            .and_then(|t| t.endpoint_id.clone())
+            .filter(|e| !e.contains("0000-0000"))
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let cb = |path: &str| {
+            crate::trouter::current_surl().map(|surl| trouter_callback(&surl, &ep_for_links, path))
+        };
+        let mut acceptance = serde_json::json!({
+            "acceptedBy": {
+                "id": me,
+                "displayName": me,
+                "endpointId": ep_for_links,
+                "participantId": assigned_pid,
+                "languageId": "en-US"
+            },
+            "acceptedCallModalities": accepted_call_modalities(video),
+            "capabilities": null,
+            "endpointCapabilities": 73463,
+            // The acceptance's own callbacks are validated as required
+            // (live: 400 "CallAcceptance.Links") — the AG link set.
+            "links": {
+                "mediaRenegotiation": cb("call/mediaRenegotiation/"),
+                "transfer": cb("call/transfer/"),
+                "replacement": cb("call/replacement/"),
+                "balanceUpdate": cb("call/balanceUpdate/"),
+                "retargetCompletion": cb("call/retargetCompletion/"),
+                "controlVideoStreaming": cb("call/controlVideoStreaming/"),
+                "updateMediaDescriptions": cb("call/updateMediaDescriptions/")
+            }
+        });
+        if let Some(sdp) = sdp_answer {
+            acceptance["mediaContent"] = serde_json::json!({
+                "blob": sdp,
+                "contentType": "application/sdp"
+            });
         }
-    });
+        serde_json::json!({ "callAcceptance": acceptance })
+    } else {
+        serde_json::json!({
+            "acceptedCallModalities": accepted_call_modalities(video),
+            "endpointMetadata": {
+                "isCallMediaCaptured": false,
+                "isMicrophoneOn": false
+            }
+        })
+    };
 
     tracing::info!("Accepting call -> POST {}", acceptance_url);
 
@@ -626,6 +697,229 @@ pub async fn accept_call_with_video(
 }
 
 /// Send the SDP media answer to the mediaAnswer URL.
+/// CONSUMER (evt:107) fork attach — the callee's entry into the call:
+/// POST the attach link, receive the REAL mediaAnswer/acceptance/progress
+/// links plus (when the notification carried no offer) the SDP offer.
+/// Payload mirrors the web client's `sendAttachToCallInternal` (bG),
+/// minimized: attach + a `join` additionalAction on the
+/// conversationController. Returns a merged notification ready for the
+/// shared media-answer/acceptance flow.
+pub async fn attach_forked_call(
+    http: &reqwest::Client,
+    skype_token: &str,
+    notification: &CallNotification,
+) -> Result<CallNotification> {
+    let invitation = notification
+        .call_invitation
+        .as_ref()
+        .context("No callInvitation in notification")?;
+    let attach_url = invitation
+        .links
+        .as_ref()
+        .and_then(|l| l.attach.clone())
+        .context("No attach URL in links (not a consumer invitation?)")?;
+    let controller = notification
+        .conversation_controller
+        .as_deref()
+        .context("No conversationController in consumer invitation")?;
+    let me = notification
+        .participants
+        .as_ref()
+        .and_then(|p| p.to.as_ref())
+        .and_then(|t| t.first())
+        .map(|t| t.id.clone().unwrap_or_default())
+        .unwrap_or_default();
+    let endpoint_id = uuid::Uuid::new_v4().to_string();
+    let participant_id = uuid::Uuid::new_v4().to_string();
+    // attach.links.end is REQUIRED (live: 400 "The Links field is
+    // required") — point it at our live trouter session's push path;
+    // the call controller's end events then arrive on that socket.
+    let end_link = crate::trouter::current_surl()
+        .map(|surl| trouter_callback(&surl, &endpoint_id, "call/end/"));
+    // Payload mirrors the web client's bG builder with the `payload`
+    // wrapper unwrapped — this endpoint validates top-level `attach`
+    // (live: 400 "The Attach field is required" when wrapped).
+    // Callbacks for the join action, all on our live trouter path
+    // (the web client's bG registers its own the same way).
+    let cb = |path: &str| {
+        crate::trouter::current_surl().map(|surl| trouter_callback(&surl, &endpoint_id, path))
+    };
+    let payload = serde_json::json!({
+        "attach": {
+            "requireMediaContent": true,
+            "links": { "end": end_link },
+        },
+        "capabilities": null,
+        "endpointCapabilities": 73463,
+        "additionalActions": [{
+            "input": {
+                "capabilities": null,
+                "endpointCapabilities": 73463,
+                "conversationRequest": {
+                    "roster": {
+                        "type": "Delta",
+                        "rosterUpdate": cb("conversation/rosterUpdate/"),
+                    },
+                    "links": {
+                        "conversationEnd": cb("conversation/conversationEnd/"),
+                        "conversationUpdate": cb("conversation/conversationUpdate/"),
+                        "localParticipantUpdate": cb("conversation/localParticipantUpdate/"),
+                        "addParticipantSuccess": cb("conversation/addParticipantSuccess/"),
+                        "addParticipantFailure": cb("conversation/addParticipantFailure/"),
+                        "receiveMessage": cb("conversation/receiveMessage/"),
+                    }
+                },
+                "participants": {
+                    "from": {
+                        "id": me,
+                        "displayName": me,
+                        "endpointId": endpoint_id,
+                        "participantId": participant_id,
+                        "languageId": "en-US"
+                    }
+                }
+            },
+            "name": "join",
+            "url": controller,
+            "waitForResponse": true
+        }]
+    });
+
+    tracing::info!("Fork attach -> POST {}", &attach_url[..attach_url.len().min(90)]);
+    let resp = http
+        .post(&attach_url)
+        .header("X-Skypetoken", skype_token)
+        .header("Content-Type", "application/json")
+        .header("x-microsoft-skype-client", SKYPE_CLIENT_HEADER)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .context("Fork attach POST failed")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("Fork attach failed ({}): {}", status, &body.chars().take(400).collect::<String>());
+    }
+    tracing::info!("Fork attach OK ({} bytes)", body.len());
+    tracing::debug!("Fork attach response: {}", &body.chars().take(12000).collect::<String>());
+
+    let v: serde_json::Value =
+        serde_json::from_str(&body).context("Fork attach response is not JSON")?;
+    let resp_inv = v
+        .pointer("/callInvitation")
+        .context("No callInvitation in fork-attach response")?;
+    let resp_links: CallLinks = serde_json::from_value(
+        resp_inv
+            .get("links")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .unwrap_or_default();
+
+    // Merge: real mediaAnswer/acceptance/progress from the response; keep
+    // attach/reject from the notification (reject may be refined to the
+    // response's callLeg).
+    let mut merged = notification.clone();
+    let inv = merged
+        .call_invitation
+        .as_mut()
+        .context("merged invitation")?;
+    let links = inv.links.get_or_insert_with(CallLinks::default);
+    if resp_links.media_answer.is_some() {
+        links.media_answer = resp_links.media_answer;
+    }
+    if resp_links.acceptance.is_some() {
+        links.acceptance = resp_links.acceptance;
+    }
+    if resp_links.progress.is_some() {
+        links.progress = resp_links.progress;
+    }
+    if resp_links.end.is_some() {
+        links.end = resp_links.end;
+    }
+    if resp_links.reject.is_some() {
+        links.reject = resp_links.reject;
+    }
+    if inv.media_content.is_none()
+        || inv
+            .media_content
+            .as_ref()
+            .and_then(|m| m.blob.as_ref())
+            .is_none()
+    {
+        if let Some(mc) = resp_inv.get("mediaContent") {
+            inv.media_content = serde_json::from_value(mc.clone()).ok();
+        }
+    }
+    // Adopt the fork-assigned identity for our leg: the acceptance must
+    // echo the attach response's participantId, not a fresh one.
+    if let Some(resp_to) = v
+        .pointer("/participants/to")
+        .and_then(|t| t.as_object())
+        .or_else(|| v.get("participants").and_then(|p| p.as_object()))
+    {
+        let assigned = resp_to.get("participantId").and_then(|x| x.as_str());
+        if let Some(assigned) = assigned {
+            if let Some(parts) = merged.participants.as_mut() {
+                if let Some(to) = parts.to.as_mut().and_then(|t| t.first_mut()) {
+                    to.participant_id = Some(assigned.to_string());
+                }
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// CONSUMER ringing progress: POST the progress link
+/// ({callProgress:{status:"ringing"}}) — the web client sends it right
+/// after attach (best-effort).
+pub async fn send_call_progress(
+    http: &reqwest::Client,
+    skype_token: &str,
+    notification: &CallNotification,
+) -> Result<()> {
+    let Some(progress_url) = notification
+        .call_invitation
+        .as_ref()
+        .and_then(|i| i.links.as_ref())
+        .and_then(|l| l.progress.as_ref())
+    else {
+        return Ok(());
+    };
+    let me = notification
+        .participants
+        .as_ref()
+        .and_then(|p| p.to.as_ref())
+        .and_then(|t| t.first())
+        .map(|t| t.id.clone().unwrap_or_default())
+        .unwrap_or_default();
+    let payload = serde_json::json!({
+        "callProgress": {
+            "sender": { "id": me },
+            "status": "ringing",
+            "phrase": "ringing"
+        }
+    });
+    let resp = http
+        .post(progress_url)
+        .header("X-Skypetoken", skype_token)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .context("Call progress POST failed")?;
+    let status = resp.status();
+    if status.is_success() {
+        tracing::info!("Call progress (ringing) sent");
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Call progress failed ({}): {}", status, &body.chars().take(200).collect::<String>())
+    }
+}
+
 pub async fn send_media_answer(
     http: &reqwest::Client,
     skype_token: &str,
@@ -645,12 +939,19 @@ pub async fn send_media_answer(
         .as_ref()
         .context("No mediaAnswer URL in links")?;
 
-    let payload = serde_json::json!({
-        "mediaContent": {
-            "blob": sdp_answer,
-            "contentType": "application/sdp"
-        }
+    let media_content = serde_json::json!({
+        "blob": sdp_answer,
+        "contentType": "application/sdp"
     });
+    // CONSUMER controllers validate a top-level `mediaAnswer` envelope
+    // (live: 400 "The MediaAnswer field is required" when flat); the
+    // work flow posts the flat mediaContent.
+    let is_consumer = links.attach.is_some();
+    let payload = if is_consumer {
+        serde_json::json!({ "mediaAnswer": { "mediaContent": media_content } })
+    } else {
+        serde_json::json!({ "mediaContent": media_content })
+    };
 
     tracing::info!("Sending media answer -> POST {}", media_answer_url);
 
@@ -1412,7 +1713,12 @@ pub async fn end_call(
         .links
         .as_ref()
         .context("No links in callInvitation")?;
-    let end_url = links.end.as_ref().context("No end URL in links")?;
+    let end_url = links
+        .end
+        .as_ref()
+        // CONSUMER invitations carry `reject` instead of `end`.
+        .or(links.reject.as_ref())
+        .context("No end/reject URL in links")?;
 
     tracing::info!("Ending call -> POST {}", end_url);
 

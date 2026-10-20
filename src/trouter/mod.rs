@@ -27,6 +27,17 @@ enum DisconnectReason {
 /// On transient errors or server-initiated disconnects, reconnects with
 /// exponential backoff (1s, 2s, 4s, ... capped at 64s). On clean shutdown
 /// (Ctrl+C), exits immediately.
+/// The live trouter session's push base (`…/v4/f/{key}/`), set on every
+/// (re)connect — call-answer flows build their signaling callbacks on it.
+static CURRENT_SURL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// The current trouter session's push base, if a session is connected.
+pub fn current_surl() -> Option<String> {
+    let g = CURRENT_SURL.lock().ok()?;
+    let s = g.clone();
+    (!s.is_empty()).then_some(s)
+}
+
 pub async fn connect_and_run() -> Result<()> {
     let mut backoff = 1u64;
 
@@ -98,6 +109,16 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
         .map(|c| c.personal == Some(true))
         .unwrap_or(false);
     let (session, epid) = session::negotiate(&http, skype_token_str, personal_negotiate).await?;
+
+    // Publish the live session's push path for call-answer flows: the
+    // consumer fork-attach registers its `end` callback against this
+    // surl — anything the call controller POSTs there lands on this
+    // socket and flows through the normal 3::: pipeline.
+    {
+        if let Ok(mut g) = CURRENT_SURL.lock() {
+            *g = session.surl.clone();
+        }
+    }
 
     // 2. Get socket.io session ID (authenticated via X-Skypetoken header)
     let session_id = session::get_session_id(&http, &session, skype_token_str, &epid).await?;
@@ -430,7 +451,29 @@ fn chat_event_json(text: &str) -> Option<String> {
             || k.eq_ignore_ascii_case("resource")
             || k.eq_ignore_ascii_case("eventMessages")
     });
-    is_chat.then(|| text.to_string())
+    // CONSUMER call invitations share this pipeline (they arrive as 3:::
+    // data frames with `evt`-wrapped bodies): after the cp/gp unwrap the
+    // inner object keys the notification `callNotification`. Publish them
+    // too — the embedder's call parser consumes this shape.
+    let is_call_notification = v
+        .as_object()?
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("callNotification"));
+    (is_chat || is_call_notification).then(|| text.to_string())
+}
+
+/// Decode a wrapped Trouter payload: `cp` = base64(gzip(json)),
+/// `gp` = base64(json). Shared with the call-notification parser.
+pub(crate) fn decode_wrapped(is_gzip: bool, data: &str) -> Option<String> {
+    if is_gzip {
+        gunzip_base64(data)
+    } else {
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(data.trim())
+            .ok()?;
+        String::from_utf8(raw).ok()
+    }
 }
 
 fn gunzip_base64(body: &str) -> Option<String> {
@@ -565,9 +608,23 @@ mod sendfix_tests {
 
     #[test]
     fn sendfix_data_frame_non_chat_payloads_are_skipped() {
-        assert!(data_frame_event(&frame(r#"{"callNotification":{}}"#, serde_json::json!({}))).is_none());
+        // Consumer call invitations ARE published (evt:107 frames ride
+        // this pipeline — they used to be dropped, starving the ring).
+        assert!(data_frame_event(&frame(r#"{"callNotification":{}}"#, serde_json::json!({}))).is_some());
         assert!(data_frame_event("not json").is_none());
         assert!(data_frame_event(r#"{"id":1,"status":200}"#).is_none());
+        assert!(data_frame_event(&frame(r#"{"foo":1}"#, serde_json::json!({}))).is_none());
+    }
+
+
+    #[test]
+    fn real_captured_invite_frame_publishes() {
+        let Ok(line) = std::fs::read_to_string("/tmp/frame_ng.txt") else { return; };
+        let i = line.find("3:::").unwrap();
+        let payload = &line[i + 4..];
+        let out = data_frame_event(payload);
+        assert!(out.is_some(), "captured evt:107 frame must publish, got None");
+        assert!(out.unwrap().contains("callNotification"));
     }
 
     #[test]
