@@ -871,6 +871,20 @@ pub async fn attach_forked_call(
             inv.media_content = serde_json::from_value(mc.clone()).ok();
         }
     }
+    // Stash the conversation's notificationLinks URL (the join
+    // response's output.links) for the answer flow's
+    // updateConversationLinks POST.
+    if let Some(arr) = v.get("additionalActionResponses").and_then(|a| a.as_array()) {
+        for r in arr {
+            if let Some(nl) = r
+                .pointer("/output/links/notificationLinks")
+                .and_then(|x| x.as_str())
+            {
+                merged.notification_links = Some(nl.to_string());
+                break;
+            }
+        }
+    }
     // Adopt the fork-assigned identity for our leg: the acceptance must
     // echo the attach response's participantId, not a fresh one.
     if let Some(resp_to) = v
@@ -888,6 +902,81 @@ pub async fn attach_forked_call(
         }
     }
     Ok(merged)
+}
+
+/// CONSUMER updateConversationLinks: register our conversation
+/// callback links with the conversation service (the web callee does
+/// this right after attach, then keeps it alive on a timer). Without
+/// it the conversation service has no notification target for our
+/// participant and the acceptance's fan-out dies (430/10065).
+pub async fn update_conversation_links(
+    http: &reqwest::Client,
+    skype_token: &str,
+    url: &str,
+    notification: &CallNotification,
+) -> Result<()> {
+    let to_part = notification
+        .participants
+        .as_ref()
+        .and_then(|p| p.to.as_ref())
+        .and_then(|t| t.first());
+    let me = to_part
+        .map(|t| t.id.clone().unwrap_or_default())
+        .unwrap_or_default();
+    let ep = to_part
+        .and_then(|t| t.endpoint_id.clone())
+        .filter(|e| !e.contains("0000-0000"))
+        .or_else(crate::trouter::current_epid)
+        .unwrap_or_default();
+    let pid = to_part
+        .and_then(|t| t.participant_id.clone())
+        .unwrap_or_default();
+    let surl = crate::trouter::current_surl().context("no live trouter surl")?;
+    let tc = |path: &str| trouter_callback(&surl, &ep, path);
+    // QG shape (payload-unwrapped): participants + roster delta + the
+    // conversation link set (fw over the ly table).
+    let body = serde_json::json!({
+        "participants": {
+            "from": {
+                "id": me,
+                "displayName": me,
+                "endpointId": ep,
+                "participantId": pid,
+                "languageId": "en-US"
+            }
+        },
+        "roster": {
+            "type": "Delta",
+            "rosterUpdate": tc("conversation/rosterUpdate/")
+        },
+        "links": {
+            "conversationEnd": tc("conversation/conversationEnd/"),
+            "conversationUpdate": tc("conversation/conversationUpdate/"),
+            "localParticipantUpdate": tc("conversation/localParticipantUpdate/"),
+            "rosterUpdate": tc("conversation/rosterUpdate/"),
+            "addParticipantSuccess": tc("conversation/addParticipantSuccess/"),
+            "addParticipantFailure": tc("conversation/addParticipantFailure/"),
+            "receiveMessage": tc("conversation/receiveMessage/")
+        }
+    });
+    tracing::info!("updateConversationLinks -> POST {}", url);
+    let resp = http
+        .post(url)
+        .header("X-Skypetoken", skype_token)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .context("updateConversationLinks POST failed")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        tracing::info!("updateConversationLinks OK ({status})");
+        Ok(())
+    } else {
+        anyhow::bail!("updateConversationLinks failed ({status}): {}", &body.chars().take(300).collect::<String>())
+    }
 }
 
 /// CONSUMER ringing progress: POST the progress link
@@ -1768,16 +1857,41 @@ pub async fn end_call(
         .or(links.reject.as_ref())
         .context("No end/reject URL in links")?;
 
-    tracing::info!("Ending call -> POST {}", end_url);
-
-    let resp = http
-        .post(end_url)
-        .header("X-Skypetoken", skype_token)
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .context("Failed to POST end call")?;
+    // CONSUMER fork reject links answer 405 to POST — the web client
+    // declines via DELETE on the reject link (rejectCallWithFetchAndKeepAlive
+    // -> sendDeleteRequest). Plain `end` links stay POST.
+    let is_fork_reject = links.end.is_none() && links.reject.is_some();
+    let resp = if is_fork_reject {
+        // Web shape (Vw builder): DELETE with {payload:{callEnd}} —
+        // a bare DELETE 500s (10053). CALL_END_CODE.REJECT = 603.
+        // The fork endpoints unwrap `payload` (live: 400 "The CallEnd
+        // field is required" when nested).
+        let body = serde_json::json!({
+            "callEnd": {
+                "code": 603,
+                "subCode": 0,
+                "phrase": "localUserInitiated",
+                "resultCategories": ["Success"]
+            }
+        });
+        tracing::info!("Ending call (fork reject) -> DELETE {}", end_url);
+        http.delete(end_url)
+            .header("X-Skypetoken", skype_token)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to DELETE reject call")?
+    } else {
+        tracing::info!("Ending call -> POST {}", end_url);
+        http.post(end_url)
+            .header("X-Skypetoken", skype_token)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .context("Failed to POST end call")?
+    };
 
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();

@@ -129,6 +129,70 @@ const REGISTRATIONS_LIFE: &[RegEntry] = &[
     },
 ];
 
+/// Delete every registration whose trouter path is bound to a
+/// superseded surl. The session reconnects hourly (session-max-age) and
+/// re-registers on a NEW surl; the old entries would linger their full
+/// 24h TTL pointing at dead sockets — every event fan-out to them 504s
+/// and poisons consumers of the registrar (live: the call controller's
+/// acceptance fan-out aborts on one dead binding).
+pub async fn delete_for_path(
+    http: &reqwest::Client,
+    skype_token: &str,
+    registrar_url: &str,
+    path_prefix: &str,
+) -> Result<usize> {
+    let base = registrar_url.trim_end_matches('/');
+    let Ok(resp) = http
+        .get(base)
+        .header("X-Skypetoken", skype_token)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    else {
+        return Ok(0);
+    };
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return Ok(0);
+    };
+    let mut deleted = 0;
+    for b in v
+        .get("bindings")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        let path = b
+            .pointer("/transports/trouter/0/path")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default();
+        if !path.starts_with(path_prefix) {
+            continue;
+        }
+        let rid = b
+            .get("registrationId")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default();
+        if rid.is_empty() {
+            continue;
+        }
+        if let Ok(r) = http
+            .delete(format!("{base}/{rid}"))
+            .header("X-Skypetoken", skype_token)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
+            if r.status().is_success() {
+                deleted += 1;
+            }
+        }
+    }
+    if deleted > 0 {
+        tracing::info!("Registrar cleanup: deleted {deleted} stale binding(s) for superseded surl");
+    }
+    Ok(deleted)
+}
+
 /// Register the consumer calling transports at the LIFE registrar.
 pub async fn register_life(
     http: &reqwest::Client,

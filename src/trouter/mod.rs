@@ -132,6 +132,36 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
     // surl — anything the call controller POSTs there lands on this
     // socket and flows through the normal 3::: pipeline.
     {
+        // A CHANGED surl means the previous session's registrar
+        // bindings now point at a dead socket (they would linger their
+        // full 24h TTL and 504 every fan-out) — sweep them.
+        let prev = CURRENT_SURL
+            .lock()
+            .ok()
+            .and_then(|g| (!g.is_empty()).then(|| g.clone()));
+        if let Some(prev) = prev {
+            if prev != session.surl {
+                let (h, tok) = (http.clone(), skype_token_str.to_string());
+                let reg = session.registrar_url.clone();
+                let personal_clean = crate::config::Config::load_cached()
+                    .map(|c| c.personal == Some(true))
+                    .unwrap_or(false);
+                tokio::spawn(async move {
+                    if let Some(reg) = reg {
+                        let _ = registrar::delete_for_path(&h, &tok, &reg, &prev).await;
+                    }
+                    if personal_clean {
+                        let _ = registrar::delete_for_path(
+                            &h,
+                            &tok,
+                            registrar::LIFE_REGISTRAR,
+                            &prev,
+                        )
+                        .await;
+                    }
+                });
+            }
+        }
         if let Ok(mut g) = CURRENT_SURL.lock() {
             *g = session.surl.clone();
         }

@@ -903,6 +903,11 @@ pub async fn run_call_with_controls(
         camera_gate,
     );
 
+    // The call socket is shared from here: the (CLI-only) recording
+    // task waits on it transiently, and the post-connect frame pump
+    // below owns it for the rest of the call (heartbeats + remote-end
+    // detection).
+    let ws_shared = std::sync::Arc::new(tokio::sync::Mutex::new(ws));
     // 8b. Start recording in background after a short delay to let audio establish.
     // Recording is non-blocking: if it fails, the call continues normally.
     let mut recording_handle = None;
@@ -922,13 +927,15 @@ pub async fn run_call_with_controls(
             let trouter_surl = trouter_session.surl.clone();
             let ic3_token = ic3_token_str.to_string();
             let skype_token = skype_token_str.to_string();
+            let ws_rec = std::sync::Arc::clone(&ws_shared);
             recording_handle = Some(tokio::spawn(async move {
                 // Let audio flow for 3 seconds before injecting the recorder
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 tracing::info!("Starting call recording (background, after 3s media warm-up)...");
+                let mut ws_guard = ws_rec.lock().await;
                 match recording::start_call_recording(
                     &http,
-                    &mut ws,
+                    &mut ws_guard,
                     &conversation_controller,
                     &caller_mri,
                     &participant_id,
@@ -960,11 +967,59 @@ pub async fn run_call_with_controls(
     }
 
     // 10. Wait for test duration or a stop signal (GUI hang-up).
+    // Frame pump: keep the task socket ALIVE post-connect (heartbeats)
+    // and trip the internal end flag when the call controller sends an
+    // end/callEnd signal. Without this the socket silently dies after
+    // ~90s and a remotely-ended call latches the slot until the safety
+    // cap (live: connected-then-failed calls wedged "a call is already
+    // in progress").
+    let (end_tx, end_rx) = tokio::sync::watch::channel(false);
+    let ws_pump = std::sync::Arc::clone(&ws_shared);
+    tokio::spawn(async move {
+        loop {
+            let frame = {
+                let mut g = match ws_pump.lock().await {
+                    g => g,
+                };
+                g.recv_frame().await
+            };
+            match frame {
+                Ok(Some(text)) => {
+                    if text.starts_with("2::") {
+                        if let Ok(mut g) = ws_pump.try_lock() {
+                            let _ = g.send_text("2::").await;
+                        }
+                        continue;
+                    }
+                    if text.contains("callEnd")
+                        || text.contains("call/end")
+                        || text.contains("conversationEnd")
+                    {
+                        tracing::info!(
+                            "Remote end signal on the call socket — stopping: {}",
+                            &text.chars().take(200).collect::<String>()
+                        );
+                        let _ = end_tx.send(true);
+                        return;
+                    }
+                }
+                _ => {
+                    tracing::info!("Call socket closed");
+                    let _ = end_tx.send(true);
+                    return;
+                }
+            }
+        }
+    });
     tracing::info!("Call active, running for up to {}s...", duration_secs);
     let started = std::time::Instant::now();
     loop {
         if *stop.borrow() {
             tracing::info!("Stop signal received — hanging up");
+            break;
+        }
+        if *end_rx.borrow() {
+            tracing::info!("Remote end received — hanging up");
             break;
         }
         if started.elapsed() >= Duration::from_secs(duration_secs) {

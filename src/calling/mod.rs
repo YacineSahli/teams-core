@@ -142,6 +142,14 @@ pub struct CallNotification {
     /// — the join URL the fork-attach `additionalActions` entry targets.
     #[serde(default)]
     pub conversation_controller: Option<String>,
+    /// CONSUMER: the conversation's notificationLinks URL (from the
+    /// fork-attach join response) — POSTing our conversation callback
+    /// links there registers the conversation service's notification
+    /// targets for our participant (the web callee's
+    /// updateConversationLinks); without it the acceptance's
+    /// notification fan-out has no target (430/10065).
+    #[serde(default)]
+    pub notification_links: Option<String>,
 }
 
 /// Simple call lifecycle state.
@@ -247,7 +255,8 @@ fn parse_consumer_notification(
             .and_then(|i| i.get("conversationController"))
             .and_then(|u| u.as_str())
             .map(str::to_string),
-    })
+            notification_links: None,
+})
 }
 
 #[cfg(test)]

@@ -232,6 +232,39 @@ pub async fn answer_call_with_stop(
     }
 
     // Acceptance (audio-only modalities).
+    // Conversation notification-links registration (the web callee's
+    // updateConversationLinks, after mediaAnswer, before acceptance).
+    // Register our conversation notification links with
+    // the conversation service (the web callee's
+    // updateConversationLinks + keep-alive) — without a
+    // registered target the acceptance's notification
+    // fan-out 504s.
+    if let Some(nl) = notification.notification_links.clone() {
+        let http3 = http.clone();
+        let tok3 = skype_token_str.to_string();
+        let notif3 = notification.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                signaling::update_conversation_links(&http3, &tok3, &nl, &notif3).await
+            {
+                tracing::warn!("updateConversationLinks failed: {e:#}");
+            }
+            // Keep-alive: re-register for the call's life
+            // (the conversation service expires stale
+            // notification links).
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if let Err(e) =
+        signaling::update_conversation_links(&http3, &tok3, &nl, &notif3)
+            .await
+                {
+        tracing::info!("conversation keep-alive stopped: {e:#}");
+        break;
+                }
+            }
+        });
+    }
+
     signaling::accept_call_with_sdp(&http, skype_token_str, notification, video, consumer_sdp.as_deref()).await?;
     result.call_accepted = true;
     tracing::info!("Incoming call accepted");

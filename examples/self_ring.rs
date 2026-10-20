@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
 
     // 1. Own trouter endpoint (NGCallManagerWin routing) so we receive the
     //    fan-out invitation and can decline it fast.
-    let (trouter_session, epid) = session::negotiate(&http, skype).await?;
+    let (trouter_session, epid) = session::negotiate(&http, skype, false).await?;
     let session_id = session::get_session_id(&http, &trouter_session, skype, &epid).await?;
     let mut ws = websocket::TrouterSocket::connect(&trouter_session, &session_id, &epid).await?;
     let frame = ws
@@ -93,6 +93,8 @@ async fn main() -> Result<()> {
     let endpoint_id = uuid::Uuid::new_v4().to_string();
     let params = signaling::ConversationCallParams {
         ic3_token: &ic3_token.token,
+        skype_token: skype,
+        consumer: false,
         trouter_surl: &trouter_session.surl,
         caller_mri: &caller_mri,
         caller_display_name: "TeamsFast self-ring",
