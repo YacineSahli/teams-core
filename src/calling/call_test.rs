@@ -453,7 +453,8 @@ pub async fn run_call_with_controls(
 
     // 1. Connect Trouter
     tracing::info!("Negotiating Trouter session...");
-    let (trouter_session, epid) = session::negotiate(&http, skype_token_str).await?;
+    let (trouter_session, epid) =
+        session::negotiate(&http, skype_token_str, consumer).await?;
     let session_id =
         session::get_session_id(&http, &trouter_session, skype_token_str, &epid).await?;
     let mut ws = websocket::TrouterSocket::connect(&trouter_session, &session_id, &epid).await?;

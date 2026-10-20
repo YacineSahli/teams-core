@@ -91,8 +91,13 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
     let skype_token_str = &skype_token.token;
     let http = crate::api::client::shared_http();
 
-    // 1. Negotiate session (returns session info + epid)
-    let (session, epid) = session::negotiate(&http, skype_token_str).await?;
+    // 1. Negotiate session (returns session info + epid). Consumer
+    // profiles negotiate on the SKYPE fleet (go.trouter.skype.com) —
+    // the consumer notification spine; work stays on the teams gateway.
+    let personal_negotiate = crate::config::Config::load_cached()
+        .map(|c| c.personal == Some(true))
+        .unwrap_or(false);
+    let (session, epid) = session::negotiate(&http, skype_token_str, personal_negotiate).await?;
 
     // 2. Get socket.io session ID (authenticated via X-Skypetoken header)
     let session_id = session::get_session_id(&http, &session, skype_token_str, &epid).await?;
@@ -127,24 +132,14 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
         {
             tracing::warn!("Initial registrar registration failed: {:#}", e);
         }
-        // Consumer calls: the appliance V2 calling registration (8443).
-        // Failure is expected on 8443-filtered networks — logged, not
-        // fatal; incoming-call routing stays starved until it lands.
+        // Consumer calls: the LIFE registrar
+        // (teams.microsoft.com/registrar/prod/v2) carries the calling
+        // transports — the eu v3 hint above never routes consumer call
+        // invites. The old appliance-8443 V2 attempt is dead (hosts
+        // don't listen; templates are hybrid-only).
         if personal {
-            let cc = crate::config::Config::load_cached()
-                .ok()
-                .and_then(|cfg| cfg.get_region_gtms())
-                .and_then(|g| {
-                    g.get("calling_callControllerServiceUrl")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                });
-            if let Some(cc) = cc {
-                if let Err(e) =
-                    registrar::register_calling_v2(&http, skype_token_str, &cc, &session.surl).await
-                {
-                    tracing::warn!("{e:#}");
-                }
+            if let Err(e) = registrar::register_life(&http, skype_token_str, &session.surl).await {
+                tracing::warn!("LIFE registrar registration failed: {e:#}");
             }
         }
     }
@@ -229,6 +224,11 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
                         let personal = crate::config::Config::load_cached().map(|c| c.personal == Some(true)).unwrap_or(false);
                         if let Err(e) = registrar::register_flagged(&http2, &tok, &reg, &surl, Some(&ep), personal).await {
                             tracing::warn!("Re-registration failed: {:#}", e);
+                        }
+                        if personal {
+                            if let Err(e) = registrar::register_life(&http2, &tok, &surl).await {
+                                tracing::warn!("LIFE re-registration failed: {e:#}");
+                            }
                         }
                     });
                 }

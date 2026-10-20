@@ -34,6 +34,46 @@ pub struct PresenceInfo {
     pub activity: String,
 }
 
+/// CONSUMER (Teams-for-Life) endpoint publish — the UPS model the web
+/// client uses (mined from its presence-service chunk, live-verified
+/// 2026-10-20): `PUT {unifiedPresence}/v1/me/endpoints/` with an
+/// endpoint object carrying `capabilities` (the callee-callable signal
+/// read by call routing). Auth = the plain skype token; the header
+/// `x-ms-client-consumer-type: teams4life` is required. The record
+/// EXPIRES after ~5 minutes — callers must re-publish on a cadence
+/// (the web client's PresencePostHeartbeat); call routing treats an
+/// expired callee as non-callable.
+pub async fn publish_endpoint_personal(client: &TeamsClient) -> Result<()> {
+    let base = client.unified_presence_url();
+    let base = base.trim_end_matches('/');
+    let endpoint_id = uuid::Uuid::new_v4().to_string();
+    let body = serde_json::json!({
+        "id": endpoint_id,
+        "availability": "Available",
+        "activity": "Available",
+        "deviceType": "Desktop",
+        "capabilities": ["Audio", "Video"],
+    });
+    let resp = super::client::shared_http()
+        .put(format!("{base}/v1/me/endpoints/"))
+        .header("X-Skypetoken", client.skype_token()?)
+        .header("x-ms-client-consumer-type", "teams4life")
+        .header("x-ms-client-user-agent", "Teams-V2-Desktop")
+        .header("x-ms-endpoint-id", &endpoint_id)
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .context("UPS endpoint publish request failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("UPS endpoint publish failed ({}): {}", status, body);
+    }
+    tracing::debug!("UPS endpoint published (capabilities Audio/Video)");
+    Ok(())
+}
+
 /// Fetch current presence and return structured data.
 pub async fn get_presence_data(client: &TeamsClient) -> Result<PresenceInfo> {
     let resp = client.graph_get("/me/presence").await?;

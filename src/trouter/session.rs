@@ -109,12 +109,24 @@ impl SessionResponse {
 }
 
 /// Negotiate a Trouter session, returning connection parameters.
+///
+/// `personal` selects the CONSUMER spine: config-life's trouterService
+/// points at `https://go.trouter.skype.com/v4/a` (work prod uses
+/// go.trouter.teams.microsoft.com) — the fleet consumer↔consumer NGCall
+/// invites (event 107 SKYPE_SKYPE_CALL) are routed on, via the
+/// edge.skype.com registrar the negotiation response hints at.
 pub async fn negotiate(
     http: &reqwest::Client,
     skype_token: &str,
+    personal: bool,
 ) -> Result<(SessionResponse, String)> {
     let epid = uuid::Uuid::new_v4().to_string();
-    let url = format!("https://go.trouter.teams.microsoft.com/v4/a?epid={}", epid);
+    let base = if personal {
+        "https://go.trouter.skype.com"
+    } else {
+        "https://go.trouter.teams.microsoft.com"
+    };
+    let url = format!("{base}/v4/a?epid={}", epid);
 
     tracing::info!("Negotiating trouter session (epid={})", epid);
 

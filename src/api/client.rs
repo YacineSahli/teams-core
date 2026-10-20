@@ -542,6 +542,19 @@ impl TeamsClient {
             .unwrap_or_else(|| DEFAULT_MIDDLE_TIER.to_string())
     }
 
+    /// Unified-presence (UPS) base (`region_gtms.unifiedPresence`),
+    /// falling back to the default — the consumer presence spine.
+    pub fn unified_presence_url(&self) -> String {
+        self.config
+            .get_region_gtms()
+            .and_then(|v| {
+                v.get("unifiedPresence")
+                    .and_then(|s| s.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| "https://presence.teams.live.com".to_string())
+    }
+
     /// Middle-tier auth: the Teams AAD token as Bearer plus X-Skypetoken
     /// (the shell's `mtAuthWithSkypeXTokenResource`).
     fn mt_request(&self, req: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
