@@ -2420,6 +2420,14 @@ fn spawn_media_leg(
                                     let marker = pkt.marker;
                                     match depacketizer.depacketize(&pkt.payload, marker) {
                                         Ok(Some(nal)) => {
+                                            // Skip SVC container NALs (PACSI
+                                            // 30 / prefix 14) — openh264
+                                            // rejects them with bitstream
+                                            // errors that kill P-frames
+                                            // (live-verified 2026-10-20).
+                                            if matches!(nal[0] & 0x1F, 14 | 30) {
+                                                continue;
+                                            }
                                             #[cfg(feature = "video-cam")]
                                             if let Some(ref mut dec) = decoder {
                                                 match dec.decode(&nal) {

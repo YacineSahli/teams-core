@@ -199,3 +199,53 @@ fn strip_start_code(data: &[u8]) -> &[u8] {
         data
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Full wire-path roundtrip: encode -> X-H264UC packetization ->
+    /// depacketize -> decode. The packetizer injects PACSI (30) and
+    /// prefix (14) SVC container NALs; openh264 REJECTS those with
+    /// persistent bitstream errors that kill every P-frame after the
+    /// IDR (live rigs 2026-10-20: ~5000 decode errors, zero rendered
+    /// frames) — the receive path must skip them before decoding.
+    #[test]
+    fn encode_packetize_depacketize_decode_roundtrip() {
+        let w = 320u32;
+        let h = 240u32;
+        let mut enc = H264Encoder::new(w, h, 15.0, 256).expect("encoder");
+        let mut dec = H264Decoder::new().expect("decoder");
+        let mut packetizer = crate::calling::video::VideoPacketizer::new(0x1234);
+        let mut depacketizer = crate::calling::video::VideoDepacketizer::new();
+
+        let mut decoded_frames = 0usize;
+        for frame_idx in 0..4 {
+            let mut yuv = vec![0u8; (w * h * 3 / 2) as usize];
+            // Vary content per frame so P-frames carry data.
+            yuv.iter_mut()
+                .for_each(|b| *b = (frame_idx * 37 + *b as usize % 200) as u8);
+            let nals = enc.encode(&yuv).expect("encode");
+            assert!(!nals.is_empty(), "encoder produced no NALs");
+            let packets = packetizer.packetize_frame(&nals);
+            assert!(!packets.is_empty());
+            for pkt in &packets {
+                let marker = pkt[1] & 0x80 != 0;
+                let payload = &pkt[crate::calling::rtp::RTP_HEADER_SIZE..];
+                if let Ok(Some(nal)) = depacketizer.depacketize(payload, marker) {
+                    let ty = nal[0] & 0x1F;
+                    if matches!(ty, 14 | 30) {
+                        continue;
+                    }
+                    if let Ok(Some(_frame)) = dec.decode(&nal) {
+                        decoded_frames += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            decoded_frames >= 3,
+            "expected >=3 decoded frames over 4 encoded (1-frame decoder latency), got {decoded_frames}"
+        );
+    }
+}

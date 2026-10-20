@@ -33,6 +33,8 @@ pub struct MediaStats {
     /// only when a decoder is available; packets always).
     pub video_packets_received: u64,
     pub video_frames_received: u64,
+    /// Frames the decoder produced (what the UI can show).
+    pub video_frames_decoded: u64,
 }
 
 /// A live-swappable video frame source (camera mid-call, screen share) —
@@ -72,6 +74,8 @@ pub struct VideoRecvPipeline {
     remote_tx: Option<std::sync::mpsc::SyncSender<video::VideoFrame>>,
     pub packets: u64,
     pub frames: u64,
+    /// Frames the decoder actually produced (UI-visible video).
+    pub decoded: u64,
 }
 
 impl VideoRecvPipeline {
@@ -91,6 +95,7 @@ impl VideoRecvPipeline {
             remote_tx,
             packets: 0,
             frames: 0,
+            decoded: 0,
         }
     }
 
@@ -108,10 +113,26 @@ impl VideoRecvPipeline {
                         self.depacketizer.frames_received
                     );
                 }
+                // Skip SVC container NALs (PACSI 30 / prefix 14): openh264
+                // rejects them with bitstream errors that kill every
+                // P-frame after the IDR (live-verified 2026-10-20).
+                let nal_type = nal[0] & 0x1F;
+                if matches!(nal_type, 14 | 30) {
+                    return;
+                }
                 #[cfg(feature = "video-cam")]
                 if let Some(ref mut dec) = self.decoder {
                     match dec.decode(&nal) {
                         Ok(Some(frame)) => {
+                            self.decoded += 1;
+                            if self.decoded % 25 == 1 {
+                                tracing::info!(
+                                    "Recv video frame decoded: {}x{} ({} decoded)",
+                                    frame.width,
+                                    frame.height,
+                                    self.decoded
+                                );
+                            }
                             if let Some(ref tx) = self.remote_tx {
                                 let _ = tx.try_send(video::VideoFrame {
                                     width: frame.width,
@@ -646,6 +667,7 @@ impl MediaSession {
             video_frames_sent: s.video_frames_sent,
             video_packets_received: s.video_packets_received,
             video_frames_received: s.video_frames_received,
+            video_frames_decoded: s.video_frames_decoded,
         }
     }
 
@@ -1135,6 +1157,7 @@ async fn recv_loop_with_stun(
                                     let mut s = stats.lock().await;
                                     s.video_packets_received = pipeline.packets;
                                     s.video_frames_received = pipeline.frames;
+                                    s.video_frames_decoded = pipeline.decoded;
                                     continue;
                                 }
                             }
