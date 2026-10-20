@@ -189,6 +189,22 @@ pub async fn answer_call_with_stop(
                         );
 
                         let mut sdp_out = answer_result.sdp.clone();
+                        // JSEP: the answer must carry an m= section for
+                        // EVERY offer m= section, in order. The web's
+                        // offer has four (audio, video-recvonly,
+                        // screenshare, x-data — BUNDLE 0 1 2 3); we
+                        // answer audio and reject the rest with port-0
+                        // stubs echoing the offer's proto/payloads/mid.
+                        // A short answer = instant setRemoteDescription
+                        // failure (live: 410/3111 in ~600ms).
+                        if blob.contains("a=fingerprint") {
+                            let audio_part = sdp_out
+                                .split("m=video")
+                                .next()
+                                .unwrap_or(&sdp_out)
+                                .to_string();
+                            sdp_out = audio_part + &reject_stub_sections(blob);
+                        }
                         // DTLS-SRTP offers (the web is WebRTC — NO a=crypto)
                         // must not gate the media session on SDES materials:
                         // the handshake task swaps real keys into the
@@ -367,6 +383,38 @@ pub async fn answer_call_with_stop(
         s.stop().await;
     }
     Ok(result)
+}
+
+/// Port-0 reject stubs for every offer m-line after the first (audio).
+/// Echoes the offer's own proto/payload list and mid per section.
+fn reject_stub_sections(offer_blob: &str) -> String {
+    let mut sections: Vec<(String, Option<String>)> = Vec::new();
+    for line in offer_blob.lines() {
+        if let Some(rest) = line.strip_prefix("m=") {
+            sections.push((rest.to_string(), None));
+        } else if let Some(mid) = line.strip_prefix("a=mid:") {
+            if let Some((_, m)) = sections.last_mut() {
+                *m = Some(mid.trim().to_string());
+            }
+        }
+    }
+    let mut out = String::new();
+    for (i, (mline, mid)) in sections.iter().enumerate() {
+        if i == 0 {
+            continue; // audio is answered fully
+        }
+        // "audio 56575 RTP/SAVP 105 111 ..." -> "<type> 0 <proto> <pts>"
+        let parts: Vec<&str> = mline.splitn(4, ' ').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        out.push_str(&format!("m={} 0 {} {}\r\n", parts[0], parts[2], parts[3]));
+        out.push_str("c=IN IP4 127.0.0.1\r\n");
+        if let Some(m) = mid {
+            out.push_str(&format!("a=mid:{}\r\n", m));
+        }
+    }
+    out
 }
 
 /// Replace the placeholder (0) media port in a generated answer SDP with
