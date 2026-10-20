@@ -189,8 +189,29 @@ pub async fn answer_call_with_stop(
                         );
 
                         let mut sdp_out = answer_result.sdp.clone();
-                        if let (Some(local_mat), Some(remote_mat)) =
+                        // DTLS-SRTP offers (the web is WebRTC — NO a=crypto)
+                        // must not gate the media session on SDES materials:
+                        // the handshake task swaps real keys into the
+                        // placeholder context. Live-verified live: the web's
+                        // accept-completed call started no media and the
+                        // caller retried ("Missing audio SRTP keying
+                        // material") because of exactly this gate.
+                        let offer_dtls = blob.contains("a=fingerprint");
+                        if offer_dtls {
+                            dtls_client = Some(true);
+                        }
+                        let dummy_mat = || srtp::SrtpKeyingMaterial {
+                            master_key: [0u8; 16],
+                            master_salt: [0u8; 14],
+                            tag: 2,
+                        };
+                        let (local_mat, remote_mat) = if offer_dtls {
+                            (Some(dummy_mat()), Some(dummy_mat()))
+                        } else {
                             (local_audio_crypto, remote_audio_crypto)
+                        };
+                        if let (Some(local_mat), Some(remote_mat)) =
+                            (local_mat, remote_mat)
                         {
                             let candidates = ice::parse_candidates_from_sdp(blob);
                             if candidates
@@ -221,9 +242,6 @@ pub async fn answer_call_with_stop(
 
                         // Bind the RTP socket now so the answer carries the
                         // real port (see the comment above).
-                        if blob.contains("a=fingerprint") {
-                            dtls_client = Some(true);
-                        }
                         if let Some((candidates, local_creds, remote_creds, local_mat, remote_mat)) =
                             audio_plan.clone()
                         {
