@@ -26,6 +26,279 @@ pub struct MediaStats {
     pub bytes_received: u64,
     pub last_seq: u16,
     pub last_timestamp: u32,
+    /// BUNDLE video plane: packets/frames SENT (camera/share/black).
+    pub video_packets_sent: u64,
+    pub video_frames_sent: u64,
+    /// BUNDLE video plane: packets/frames RECEIVED (decoded frames counted
+    /// only when a decoder is available; packets always).
+    pub video_packets_received: u64,
+    pub video_frames_received: u64,
+}
+
+/// A live-swappable video frame source (camera mid-call, screen share) —
+/// the embedder swaps the receiver in/out; the send loop drains to the
+/// latest frame every tick.
+pub type VideoSourceSlot = Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<video::VideoFrame>>>>;
+
+/// Configuration for the BUNDLE video plane riding an audio
+/// [`MediaSession`]'s transport (same socket, same SRTP keys — per-SSRC
+/// rollover tracking in the context makes that sound).
+#[derive(Default)]
+pub struct VideoSessionConfig {
+    /// Payload type we SEND with (the negotiated one, echoed from the
+    /// offer).
+    pub send_payload_type: u8,
+    /// Payload types treated as video on receive (demux: everything else
+    /// is audio).
+    pub recv_payload_types: Vec<u8>,
+    /// Camera gate (`false` → black keyframes, stream stays alive).
+    pub camera_on: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Mid-call camera source slot (None = black keyframes).
+    pub camera_source: Option<VideoSourceSlot>,
+    /// Screen-share source slot (priority over camera while held).
+    pub screen_source: Option<VideoSourceSlot>,
+    /// Decoded remote video frames sink (latest-wins, drop-on-full).
+    pub remote_frames: Option<std::sync::mpsc::SyncSender<video::VideoFrame>>,
+    /// Local preview tee (frames we are about to encode).
+    pub local_preview: Option<std::sync::mpsc::SyncSender<video::VideoFrame>>,
+}
+
+/// Receive-side video pipeline: RTP payload → NAL → optional H264 decode
+/// → sink. Shared by the answerer's demuxed audio-socket loop.
+pub struct VideoRecvPipeline {
+    depacketizer: video::VideoDepacketizer,
+    #[cfg(feature = "video-cam")]
+    decoder: Option<super::codec::H264Decoder>,
+    remote_tx: Option<std::sync::mpsc::SyncSender<video::VideoFrame>>,
+    pub packets: u64,
+    pub frames: u64,
+}
+
+impl VideoRecvPipeline {
+    pub fn new(remote_tx: Option<std::sync::mpsc::SyncSender<video::VideoFrame>>) -> Self {
+        #[cfg(feature = "video-cam")]
+        let decoder = match super::codec::H264Decoder::new() {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::warn!("H.264 decoder init failed (frames counted, not decoded): {e:#}");
+                None
+            }
+        };
+        VideoRecvPipeline {
+            depacketizer: video::VideoDepacketizer::new(),
+            #[cfg(feature = "video-cam")]
+            decoder,
+            remote_tx,
+            packets: 0,
+            frames: 0,
+        }
+    }
+
+    /// Feed one decrypted RTP packet's payload; the marker bit frames NALs.
+    pub fn on_rtp(&mut self, payload: &[u8], marker: bool) {
+        self.packets += 1;
+        match self.depacketizer.depacketize(payload, marker) {
+            Ok(Some(nal)) => {
+                self.frames = self.depacketizer.frames_received;
+                if self.depacketizer.frames_received % 50 == 1 {
+                    tracing::info!(
+                        "Recv video NAL: type={}, size={} bytes (frames: {})",
+                        nal[0] & 0x1F,
+                        nal.len(),
+                        self.depacketizer.frames_received
+                    );
+                }
+                #[cfg(feature = "video-cam")]
+                if let Some(ref mut dec) = self.decoder {
+                    match dec.decode(&nal) {
+                        Ok(Some(frame)) => {
+                            if let Some(ref tx) = self.remote_tx {
+                                let _ = tx.try_send(video::VideoFrame {
+                                    width: frame.width,
+                                    height: frame.height,
+                                    data: frame.data,
+                                });
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::debug!("video decode error: {e:#}"),
+                    }
+                }
+                #[cfg(not(feature = "video-cam"))]
+                let _ = &self.remote_tx;
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!("video depacketize error: {e:#}"),
+        }
+    }
+}
+
+/// Pick the frame to encode this tick: screen share (sticky, latest-wins)
+/// > camera (gate-aware, latest-wins) > None (black keyframes).
+fn pick_source_frame(
+    screen_source: &Option<VideoSourceSlot>,
+    camera_source: &Option<VideoSourceSlot>,
+    camera_on: &Option<tokio::sync::watch::Receiver<bool>>,
+    last_screen: &mut Option<video::VideoFrame>,
+) -> Option<video::VideoFrame> {
+    // Screen share is STICKY: hold the last frame between capture ticks
+    // (a slower source on a faster send tick must not flap to camera).
+    if let Some(slot) = screen_source.as_ref() {
+        if let Ok(mut guard) = slot.lock() {
+            if let Some(rx) = guard.as_mut() {
+                match rx.try_recv() {
+                    Ok(mut latest) => {
+                        while let Ok(newer) = rx.try_recv() {
+                            latest = newer;
+                        }
+                        *last_screen = Some(latest.clone());
+                        return Some(latest);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        tracing::info!("screen share source disconnected");
+                        *guard = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return last_screen.clone();
+                    }
+                }
+            }
+        }
+    }
+    if let Some(gate) = camera_on.as_ref() {
+        if !*gate.borrow() {
+            return None;
+        }
+    }
+    for slot in camera_source.as_ref().into_iter() {
+        if let Ok(mut guard) = slot.lock() {
+            if let Some(rx) = guard.as_mut() {
+                match rx.try_recv() {
+                    Ok(mut latest) => {
+                        while let Ok(newer) = rx.try_recv() {
+                            latest = newer;
+                        }
+                        return Some(latest);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        tracing::info!("camera source disconnected");
+                        *guard = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                }
+            }
+        }
+    }
+    None
+}
+
+/// BUNDLE video send loop: one transport with audio, SHARED SRTP context
+/// (per-SSRC rollover), own SSRC + payload type; sends gated until DTLS
+/// keys land (same gate flag as audio).
+#[allow(clippy::too_many_arguments)]
+async fn video_send_loop_shared(
+    socket: Arc<UdpSocket>,
+    remote_addr: SocketAddr,
+    srtp_ctx: Arc<Mutex<srtp::SrtpContext>>,
+    keys_ready: Arc<std::sync::atomic::AtomicBool>,
+    stats: Arc<Mutex<MediaStats>>,
+    ssrc: u32,
+    cfg: VideoSessionConfig,
+) {
+    let mut packetizer = video::VideoPacketizer::new(ssrc);
+    let mut interval = time::interval(Duration::from_millis(video::FRAME_INTERVAL_MS));
+    let mut last_screen: Option<video::VideoFrame> = None;
+
+    #[cfg(feature = "video-cam")]
+    let mut encoder: Option<super::codec::H264Encoder> = None;
+    #[cfg(feature = "video-cam")]
+    let mut enc_dims = (0u32, 0u32);
+
+    tracing::info!(
+        "BUNDLE video send loop started (SSRC {:#010x}, PT {})",
+        ssrc,
+        cfg.send_payload_type
+    );
+
+    loop {
+        interval.tick().await;
+
+        if !keys_ready.load(std::sync::atomic::Ordering::SeqCst) {
+            continue;
+        }
+
+        let frame = pick_source_frame(
+            &cfg.screen_source,
+            &cfg.camera_source,
+            &cfg.camera_on,
+            &mut last_screen,
+        );
+
+        #[cfg(feature = "video-cam")]
+        let nal_units = match frame {
+            Some(f) if f.width > 0 && f.height > 0 => {
+                if enc_dims != (f.width, f.height) {
+                    let kbps = (((f.width as u64 * f.height as u64) * 256) / (320 * 240))
+                        .clamp(256, 3500) as u32;
+                    match super::codec::H264Encoder::new(f.width, f.height, 15.0, kbps) {
+                        Ok(enc) => {
+                            tracing::info!(
+                                "H.264 encoder initialized ({}x{}, {kbps}kbps)",
+                                f.width,
+                                f.height
+                            );
+                            encoder = Some(enc);
+                        }
+                        Err(e) => {
+                            tracing::warn!("encoder {}x{} failed: {e:#} — black frames", f.width, f.height);
+                            encoder = None;
+                        }
+                    }
+                    enc_dims = (f.width, f.height);
+                }
+                if let Some(ref tx) = cfg.local_preview {
+                    let _ = tx.try_send(f.clone());
+                }
+                match encoder.as_mut().map(|enc| enc.encode(&f.data)) {
+                    Some(Ok(nals)) if !nals.is_empty() => nals,
+                    _ => video::generate_black_iframe(),
+                }
+            }
+            _ => video::generate_black_iframe(),
+        };
+        #[cfg(not(feature = "video-cam"))]
+        let _ = (&frame, &cfg.local_preview);
+        #[cfg(not(feature = "video-cam"))]
+        let nal_units = video::generate_black_iframe();
+
+        let rtp_packets = packetizer.packetize_frame(&nal_units);
+        // The packetizer stamps its own payload type; rewrite to the
+        // negotiated one before protection.
+        let mut sent = 0u64;
+        for mut rtp_pkt in rtp_packets {
+            if rtp_pkt.len() >= 2 {
+                rtp_pkt[1] = (rtp_pkt[1] & 0x80) | (cfg.send_payload_type & 0x7F);
+            }
+            let srtp_packet = {
+                let mut ctx = srtp_ctx.lock().await;
+                match srtp::protect(&mut ctx, &rtp_pkt) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("BUNDLE video SRTP protect: {e:#}");
+                        continue;
+                    }
+                }
+            };
+            if socket.send_to(&srtp_packet, remote_addr).await.is_ok() {
+                sent += 1;
+            }
+        }
+        if sent > 0 {
+            let mut s = stats.lock().await;
+            s.video_packets_sent += sent;
+            s.video_frames_sent += 1;
+        }
+    }
 }
 
 /// A running media session for a single audio stream.
@@ -60,6 +333,34 @@ impl MediaSession {
         local_material: &srtp::SrtpKeyingMaterial,
         remote_material: &srtp::SrtpKeyingMaterial,
         dtls_client: Option<bool>,
+    ) -> Result<Self> {
+        Self::start_with_ice_video(
+            local_port,
+            remote_candidates,
+            local_creds,
+            remote_creds,
+            local_material,
+            remote_material,
+            dtls_client,
+            None,
+        )
+        .await
+    }
+
+    /// [`start_with_ice`] plus an optional BUNDLE video plane riding the
+    /// same transport: video RTP is demuxed by payload type on receive and
+    /// a send loop emits camera/share/black frames with the negotiated PT
+    /// under the SHARED SRTP context (per-SSRC rollover tracking).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_ice_video(
+        local_port: u16,
+        remote_candidates: &[ice::IceCandidate],
+        local_creds: &ice::IceCredentials,
+        remote_creds: &ice::IceCredentials,
+        local_material: &srtp::SrtpKeyingMaterial,
+        remote_material: &srtp::SrtpKeyingMaterial,
+        dtls_client: Option<bool>,
+        video: Option<VideoSessionConfig>,
     ) -> Result<Self> {
         let bind_addr = format!("0.0.0.0:{}", local_port);
         let socket = UdpSocket::bind(&bind_addr)
@@ -159,10 +460,39 @@ impl MediaSession {
             let srtp_ctx = srtp_ctx.clone();
             let stats = stats.clone();
             let dtls_inbound = dtls_inbound.clone();
+            let video_demux = video.as_ref().map(|cfg| {
+                (
+                    cfg.recv_payload_types.clone(),
+                    VideoRecvPipeline::new(cfg.remote_frames.clone()),
+                )
+            });
             tokio::spawn(recv_loop_with_stun(
-                socket, srtp_ctx, stats, local_pwd, spk_tx, dtls_inbound,
+                socket, srtp_ctx, stats, local_pwd, spk_tx, dtls_inbound, video_demux,
             ))
         };
+
+        // BUNDLE video send loop (own SSRC + negotiated PT, shared context
+        // and DTLS gate).
+        if let Some(cfg) = video {
+            let video_ssrc = {
+                let id = uuid::Uuid::new_v4();
+                let bytes = id.as_bytes();
+                u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
+            };
+            let socket = socket.clone();
+            let srtp_ctx = srtp_ctx.clone();
+            let stats = stats.clone();
+            let keys_ready = keys_ready.clone();
+            tokio::spawn(video_send_loop_shared(
+                socket,
+                remote_addr,
+                srtp_ctx,
+                keys_ready,
+                stats,
+                video_ssrc,
+                cfg,
+            ));
+        }
 
         if let Some(we_are_client) = dtls_client {
             let socket = socket.clone();
@@ -312,6 +642,10 @@ impl MediaSession {
             bytes_received: s.bytes_received,
             last_seq: s.last_seq,
             last_timestamp: s.last_timestamp,
+            video_packets_sent: s.video_packets_sent,
+            video_frames_sent: s.video_frames_sent,
+            video_packets_received: s.video_packets_received,
+            video_frames_received: s.video_frames_received,
         }
     }
 
@@ -740,6 +1074,9 @@ async fn recv_loop(
 ///
 /// This is used when ICE is active — the peer continues sending STUN checks
 /// during the media session and expects responses to keep the path alive.
+/// `video_demux` (BUNDLE): RTP packets whose payload type is in the set go
+/// to the video pipeline instead of the speaker.
+#[allow(clippy::too_many_arguments)]
 async fn recv_loop_with_stun(
     socket: Arc<UdpSocket>,
     srtp_ctx: Arc<Mutex<srtp::SrtpContext>>,
@@ -747,6 +1084,7 @@ async fn recv_loop_with_stun(
     local_pwd: String,
     spk_tx: Option<std::sync::mpsc::SyncSender<Vec<i16>>>,
     dtls_inbound: Arc<super::dtls::DtlsInbound>,
+    mut video_demux: Option<(Vec<u8>, VideoRecvPipeline)>,
 ) {
     let mut buf = [0u8; 2048];
 
@@ -787,6 +1125,19 @@ async fn recv_loop_with_stun(
                 match srtp::unprotect(&mut ctx, data) {
                     Ok(rtp_data) => {
                         if let Ok(pkt) = rtp::decode(&rtp_data) {
+                            // BUNDLE video plane: demux by payload type.
+                            if let Some((pts, pipeline)) = video_demux.as_mut() {
+                                if pts.contains(&pkt.payload_type) {
+                                    let marker = pkt.marker;
+                                    let payload = pkt.payload.clone();
+                                    drop(ctx);
+                                    pipeline.on_rtp(&payload, marker);
+                                    let mut s = stats.lock().await;
+                                    s.video_packets_received = pipeline.packets;
+                                    s.video_frames_received = pipeline.frames;
+                                    continue;
+                                }
+                            }
                             let mut s = stats.lock().await;
                             s.packets_received += 1;
                             s.bytes_received += rtp_data.len() as u64;

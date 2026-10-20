@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::calling::{ice, media, sdp, signaling, srtp, turn};
+use crate::calling::{call_test::CallControls, ice, media, sdp, signaling, srtp, turn};
 use crate::calling::CallNotification;
 use crate::config::Config;
 
@@ -20,6 +20,9 @@ pub struct CallAnswerResult {
     pub media_started: bool,
     pub packets_sent: u64,
     pub packets_received: u64,
+    /// BUNDLE video plane counters (0 on audio-only answers).
+    pub video_packets_sent: u64,
+    pub video_packets_received: u64,
 }
 
 /// Decline a ringing call (or hang up an accepted one) by POSTing the
@@ -44,13 +47,21 @@ type AudioPlan = (
     srtp::SrtpKeyingMaterial,
 );
 
-/// Answer an incoming call notification and run its audio until `stop`
-/// flips true (or the stop sender drops). Video offers are answered
-/// audio-only (`acceptedCallModalities: ["Audio"]`, same as the CLI).
+/// Answer an incoming call notification and run its media until `stop`
+/// flips true (or the stop sender drops).
+///
+/// BUNDLE video offers (the consumer web's shape: all m-lines on one
+/// transport, DTLS-SRTP) are answered with a REAL mid1 video section and
+/// a video plane riding the audio session's transport. Other offers
+/// answer audio-only, as before. `controls` (embedder pipes: camera
+/// source, screen-share slot, remote-frame sink, camera gate) feeds the
+/// video plane; `None` = headless (black frames out, frames counted in).
+#[allow(clippy::too_many_arguments)]
 pub async fn answer_call_with_stop(
     notification: &CallNotification,
     video: bool,
     mut stop: tokio::sync::watch::Receiver<bool>,
+    controls: Option<CallControls>,
 ) -> Result<CallAnswerResult> {
     let config = Config::load_cached().context("Failed to load config")?;
     let skype_token = config
@@ -188,32 +199,46 @@ pub async fn answer_call_with_stop(
                             answer_result.audio_ice_ufrag
                         );
 
-                        let mut sdp_out = answer_result.sdp.clone();
                         // JSEP: the answer must carry an m= section for
-                        // EVERY offer m= section, in order. The web's
-                        // offer has four (audio, video-recvonly,
-                        // screenshare, x-data — BUNDLE 0 1 2 3); we
-                        // answer audio and reject the rest with port-0
-                        // stubs echoing the offer's proto/payloads/mid.
-                        // A short answer = instant setRemoteDescription
-                        // failure (live: 410/3111 in ~600ms).
-                        if blob.contains("a=fingerprint") {
+                        // EVERY offer m= section, in order. A short answer
+                        // = instant setRemoteDescription failure (live:
+                        // 410/3111 in ~600ms).
+                        //
+                        // BUNDLE offers (the consumer web: all m-lines on
+                        // ONE transport, DTLS-only) get a REAL mid1 video
+                        // answer on the same transport when we can match
+                        // an H264 payload; everything else answers
+                        // audio-only with port-0 reject stubs (the
+                        // live-proven shape). TEAMSFAST_NO_VIDEO_ANSWER=1
+                        // forces the stub path for A/B debugging.
+                        let offer_dtls = blob.contains("a=fingerprint");
+                        let offered_video =
+                            sdp::parse_first_video_section(blob).filter(|_| video);
+                        let bundle_video = offer_dtls
+                            && sdp::offer_is_bundle(blob)
+                            && offered_video.is_some()
+                            && std::env::var("TEAMSFAST_NO_VIDEO_ANSWER").as_deref() != Ok("1");
+
+                        let mut sdp_out = answer_result.sdp.clone();
+                        if bundle_video {
+                            // Audio section only; the video section (same
+                            // transport) is appended after the session
+                            // binds, with the real port.
+                            sdp_out = sdp_out
+                                .split("m=video")
+                                .next()
+                                .unwrap_or(&sdp_out)
+                                .to_string();
+                            if offer_dtls {
+                                dtls_client = Some(true);
+                            }
+                        } else if offer_dtls {
                             let audio_part = sdp_out
                                 .split("m=video")
                                 .next()
                                 .unwrap_or(&sdp_out)
                                 .to_string();
                             sdp_out = audio_part + &reject_stub_sections(blob);
-                        }
-                        // DTLS-SRTP offers (the web is WebRTC — NO a=crypto)
-                        // must not gate the media session on SDES materials:
-                        // the handshake task swaps real keys into the
-                        // placeholder context. Live-verified live: the web's
-                        // accept-completed call started no media and the
-                        // caller retried ("Missing audio SRTP keying
-                        // material") because of exactly this gate.
-                        let offer_dtls = blob.contains("a=fingerprint");
-                        if offer_dtls {
                             dtls_client = Some(true);
                         }
                         let dummy_mat = || srtp::SrtpKeyingMaterial {
@@ -257,11 +282,33 @@ pub async fn answer_call_with_stop(
                         }
 
                         // Bind the RTP socket now so the answer carries the
-                        // real port (see the comment above).
+                        // real port (an answer SDP with `m=audio 0`
+                        // REJECTS the m-line — RFC 3264 — and the
+                        // acceptance transaction can never complete).
                         if let Some((candidates, local_creds, remote_creds, local_mat, remote_mat)) =
                             audio_plan.clone()
                         {
-                            match media::MediaSession::start_with_ice(
+                            let video_cfg = bundle_video.then(|| {
+                                let vid = offered_video.as_ref().expect("checked above");
+                                media::VideoSessionConfig {
+                                    send_payload_type: vid.payload_type,
+                                    recv_payload_types: sdp::video_payload_types(blob),
+                                    camera_on: controls.as_ref().map(|c| c.camera_on.clone()),
+                                    camera_source: controls
+                                        .as_ref()
+                                        .map(|c| c.camera_source.clone()),
+                                    screen_source: controls
+                                        .as_ref()
+                                        .map(|c| c.screen_source.clone()),
+                                    remote_frames: controls
+                                        .as_ref()
+                                        .map(|c| c.remote_frames.clone()),
+                                    local_preview: controls
+                                        .as_ref()
+                                        .and_then(|c| c.local_preview.clone()),
+                                }
+                            });
+                            match media::MediaSession::start_with_ice_video(
                                 0,
                                 &candidates,
                                 &local_creds,
@@ -269,6 +316,7 @@ pub async fn answer_call_with_stop(
                                 &local_mat,
                                 &remote_mat,
                                 dtls_client,
+                                video_cfg,
                             )
                             .await
                             {
@@ -279,6 +327,35 @@ pub async fn answer_call_with_stop(
                                             tracing::info!(
                                                 "Answer SDP patched with bound RTP port {port}"
                                             );
+                                            // BUNDLE: append the mid1 video
+                                            // section on the SAME transport
+                                            // (real port) and port-0 stubs
+                                            // for the remaining offer
+                                            // m-lines (screenshare/x-data).
+                                            if bundle_video {
+                                                let vid =
+                                                    offered_video.as_ref().expect("checked above");
+                                                sdp_out = insert_bundle_group(sdp_out);
+                                                sdp_out.push_str(
+                                                    &sdp::bundle_video_answer_section(
+                                                        &local_ip,
+                                                        port,
+                                                        &answer_result.audio_ice_ufrag,
+                                                        &answer_result.audio_ice_pwd,
+                                                        &local_cands,
+                                                        vid,
+                                                    ),
+                                                );
+                                                sdp_out.push_str(
+                                                    &reject_stub_sections_after_audio(blob, true),
+                                                );
+                                                tracing::info!(
+                                                    "BUNDLE video answered: PT {} dir {} ({} recv PTs)",
+                                                    vid.payload_type,
+                                                    vid.answer_direction(),
+                                                    sdp::video_payload_types(blob).len()
+                                                );
+                                            }
                                         }
                                     }
                                     result.media_started = true;
@@ -372,11 +449,15 @@ pub async fn answer_call_with_stop(
                 if let Some(ref s) = session {
                     let stats = s.stats().await;
                     tracing::info!(
-                        "Audio stats: sent={}, recv={} ({} bytes)",
-                        stats.packets_sent, stats.packets_received, stats.bytes_received
+                        "Audio stats: sent={}, recv={} ({} bytes); video sent={} ({} frames), recv={} ({} frames)",
+                        stats.packets_sent, stats.packets_received, stats.bytes_received,
+                        stats.video_packets_sent, stats.video_frames_sent,
+                        stats.video_packets_received, stats.video_frames_received
                     );
                     result.packets_sent = stats.packets_sent;
                     result.packets_received = stats.packets_received;
+                    result.video_packets_sent = stats.video_packets_sent;
+                    result.video_packets_received = stats.video_packets_received;
                     if stats.packets_received > last_recv {
                         last_recv = stats.packets_received;
                         recv_stalled_since = None;
@@ -408,20 +489,35 @@ pub async fn answer_call_with_stop(
 /// Port-0 reject stubs for every offer m-line after the first (audio).
 /// Echoes the offer's own proto/payload list and mid per section.
 fn reject_stub_sections(offer_blob: &str) -> String {
-    let mut sections: Vec<(String, Option<String>)> = Vec::new();
+    reject_stub_sections_after_audio(offer_blob, false)
+}
+
+/// Port-0 reject stubs for every offer m-line after the first N answered
+/// sections (N=1: audio only; N=2: audio + BUNDLE video). Echoes the
+/// offer's own proto/payload list and mid per section.
+fn reject_stub_sections_after_audio(offer_blob: &str, skip_video: bool) -> String {
+    let mut sections: Vec<(String, Option<String>, bool)> = Vec::new();
     for line in offer_blob.lines() {
         if let Some(rest) = line.strip_prefix("m=") {
-            sections.push((rest.to_string(), None));
+            let is_video = rest.starts_with("video");
+            sections.push((rest.to_string(), None, is_video));
         } else if let Some(mid) = line.strip_prefix("a=mid:") {
-            if let Some((_, m)) = sections.last_mut() {
+            if let Some((_, m, _)) = sections.last_mut() {
                 *m = Some(mid.trim().to_string());
             }
         }
     }
     let mut out = String::new();
-    for (i, (mline, mid)) in sections.iter().enumerate() {
+    let mut video_seen = false;
+    for (i, (mline, mid, is_video)) in sections.iter().enumerate() {
         if i == 0 {
             continue; // audio is answered fully
+        }
+        // With skip_video, the FIRST video section (mid1) is answered for
+        // real — stub everything after it.
+        if *is_video && !video_seen && skip_video {
+            video_seen = true;
+            continue;
         }
         // "audio 56575 RTP/SAVP 105 111 ..." -> "<type> 0 <proto> <pts>"
         let parts: Vec<&str> = mline.splitn(4, ' ').collect();
@@ -435,6 +531,18 @@ fn reject_stub_sections(offer_blob: &str) -> String {
         }
     }
     out
+}
+
+/// Insert `a=group:BUNDLE 0 1` at session level (before the first m=
+/// line) when the answer carries an accepted video section.
+fn insert_bundle_group(answer: String) -> String {
+    if answer.contains("a=group:BUNDLE") {
+        return answer;
+    }
+    match answer.find("m=audio") {
+        Some(i) => format!("{}a=group:BUNDLE 0 1\r\n{}", &answer[..i], &answer[i..]),
+        None => answer,
+    }
 }
 
 /// Replace the placeholder (0) media port in a generated answer SDP with

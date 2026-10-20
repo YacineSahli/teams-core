@@ -429,8 +429,8 @@ pub fn generate_sdp_answer_full(
     audio_port: u16,
     video_port: u16,
     offer: &SdpOfferInfo,
-    local_candidates: &[super::ice::IceCandidate],
-    video_candidates: &[super::ice::IceCandidate],
+    local_candidates: &[crate::calling::ice::IceCandidate],
+    video_candidates: &[crate::calling::ice::IceCandidate],
 ) -> SdpAnswerResult {
     let our_ufrag = generate_ice_ufrag();
     let our_pwd = generate_ice_pwd();
@@ -570,7 +570,7 @@ pub fn generate_sdp_offer(
     local_port: u16,
     ice_ufrag: &str,
     ice_pwd: &str,
-    candidates: &[super::ice::IceCandidate],
+    candidates: &[crate::calling::ice::IceCandidate],
 ) -> SdpOfferResult {
     let crypto_key = generate_srtp_key();
     let crypto_line = format!(
@@ -637,8 +637,8 @@ pub struct AvSdpParams<'a> {
     pub audio_pwd: &'a str,
     pub video_ufrag: &'a str,
     pub video_pwd: &'a str,
-    pub audio_candidates: &'a [super::ice::IceCandidate],
-    pub video_candidates: &'a [super::ice::IceCandidate],
+    pub audio_candidates: &'a [crate::calling::ice::IceCandidate],
+    pub video_candidates: &'a [crate::calling::ice::IceCandidate],
     /// Base SSRC for the video x-ssrc-range attribute.
     pub video_ssrc_base: u32,
     /// SSRC for audio x-ssrc-range attribute.
@@ -777,8 +777,8 @@ pub fn generate_av_sdp_answer(
     local_ip: &str,
     audio_port: u16,
     video_port: u16,
-    audio_candidates: &[super::ice::IceCandidate],
-    video_candidates: &[super::ice::IceCandidate],
+    audio_candidates: &[crate::calling::ice::IceCandidate],
+    video_candidates: &[crate::calling::ice::IceCandidate],
 ) -> AvSdpResult {
     let audio_ufrag = generate_ice_ufrag();
     let audio_pwd = generate_ice_pwd();
@@ -815,6 +815,275 @@ pub fn get_local_ip() -> String {
         }
     }
     "127.0.0.1".to_string()
+}
+
+/// Video facts parsed from the offer's FIRST `m=video` section (main-video;
+/// a second video section is the applicationsharing line and is answered
+/// with port-0 stubs). BUNDLE/consumer shape: the web offers a pile of
+/// H264/AV1/rtx PTs; we answer with the first packetization-mode=1 H264.
+#[derive(Debug, Clone)]
+pub struct OfferedVideo {
+    pub payload_type: u8,
+    pub rtpmap: String,
+    /// The offer's `a=fmtp` for the chosen PT, echoed verbatim.
+    pub fmtp: Option<String>,
+    /// `true` when the offer section says `a=recvonly` (the web's camera-
+    /// off video call: the browser wants to RECEIVE our camera only).
+    pub recvonly: bool,
+    pub sendonly: bool,
+    pub inactive: bool,
+}
+
+impl OfferedVideo {
+    /// JSEP answer direction for this section (mirror of the offer's).
+    pub fn answer_direction(&self) -> &'static str {
+        if self.recvonly {
+            "sendonly"
+        } else if self.sendonly {
+            "recvonly"
+        } else if self.inactive {
+            "inactive"
+        } else {
+            "sendrecv"
+        }
+    }
+}
+
+/// Parse the offer's first `m=video` section into [`OfferedVideo`].
+///
+/// Returns `None` when the offer has no video section or none of its
+/// payload types are H264 (AV1-only offers cannot be answered by our
+/// encoder). rtx/red/ulpfec PTs are skipped; packetization-mode=1 H264 is
+/// preferred, any H264 accepted as fallback.
+pub fn parse_first_video_section(blob: &str) -> Option<OfferedVideo> {
+    let start = blob.find("m=video")?;
+    let end = blob[start + 7..]
+        .find("\nm=")
+        .map(|i| start + 7 + i)
+        .unwrap_or(blob.len());
+    let section = &blob[start..end];
+
+    let mut recvonly = false;
+    let mut sendonly = false;
+    let mut inactive = false;
+    let mut rtpmaps: Vec<(u8, String)> = Vec::new();
+    let mut fmtps: Vec<(u8, String)> = Vec::new();
+    for line in section.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+            let mut parts = rest.splitn(2, ' ');
+            if let (Some(pt), Some(name)) = (parts.next(), parts.next()) {
+                if let Ok(pt) = pt.parse::<u8>() {
+                    rtpmaps.push((pt, name.trim().to_string()));
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("a=fmtp:") {
+            let mut parts = rest.splitn(2, ' ');
+            if let (Some(pt), Some(params)) = (parts.next(), parts.next()) {
+                if let Ok(pt) = pt.parse::<u8>() {
+                    fmtps.push((pt, params.trim().to_string()));
+                }
+            }
+        } else if line == "a=recvonly" {
+            recvonly = true;
+        } else if line == "a=sendonly" {
+            sendonly = true;
+        } else if line == "a=inactive" {
+            inactive = true;
+        }
+    }
+
+    let is_h264 = |name: &str| name.to_ascii_uppercase().starts_with("H264");
+    let h264: Vec<(u8, String)> = rtpmaps
+        .iter()
+        .filter(|(_, name)| is_h264(name))
+        .cloned()
+        .collect();
+    let chosen = h264
+        .iter()
+        .find(|(pt, _)| {
+            fmtps
+                .iter()
+                .any(|(fpt, params)| fpt == pt && params.contains("packetization-mode=1"))
+        })
+        .or_else(|| h264.first())?;
+    let (pt, name) = chosen.clone();
+    Some(OfferedVideo {
+        payload_type: pt,
+        rtpmap: name,
+        fmtp: fmtps
+            .iter()
+            .find(|(fpt, _)| fpt == &pt)
+            .map(|(_, params)| params.clone()),
+        recvonly,
+        sendonly,
+        inactive,
+    })
+}
+
+/// Is this offer BUNDLE-shaped (the consumer web's)? Explicit group or all
+/// m-lines sharing the audio ICE credentials.
+pub fn offer_is_bundle(blob: &str) -> bool {
+    if blob.contains("a=group:BUNDLE") {
+        return true;
+    }
+    // MS-normalized BUNDLE offers repeat the SAME ufrag in every section;
+    // separate-transport offers (work tenants, our legacy AV shape) use
+    // distinct credentials per m-line.
+    let mut ufrags: Vec<String> = Vec::new();
+    for line in blob.lines() {
+        if let Some(rest) = line.trim().strip_prefix("a=ice-ufrag:") {
+            ufrags.push(rest.trim().to_string());
+        }
+    }
+    ufrags.len() >= 2 && ufrags.windows(2).all(|w| w[0] == w[1])
+}
+
+/// Payload types listed on the offer's FIRST `m=video` m-line (the
+/// receive-side demux set: RTP packets with these PTs are video, anything
+/// else is audio). rtx PTs ride the same line and are harmless here.
+pub fn video_payload_types(blob: &str) -> Vec<u8> {
+    let Some(start) = blob.find("m=video") else {
+        return Vec::new();
+    };
+    let line_end = blob[start..].find("\r\n").map(|i| start + i).unwrap_or(blob.len());
+    blob[start..line_end]
+        .split_whitespace()
+        .skip(3) // "m=video", port, proto
+        .filter_map(|pt| pt.parse::<u8>().ok())
+        .collect()
+}
+
+/// The mid1 video section of a BUNDLE answer: same transport as audio
+/// (same port, credentials, candidates — JSEP BUNDLE), the offer's H264
+/// payload echoed, direction mirrored from the offer.
+pub fn bundle_video_answer_section(
+    local_ip: &str,
+    port: u16,
+    ufrag: &str,
+    pwd: &str,
+    candidates: &[crate::calling::ice::IceCandidate],
+    vid: &OfferedVideo,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "m=video {} RTP/SAVP {}\r\n",
+        port, vid.payload_type
+    ));
+    out.push_str(&format!("c=IN IP4 {}\r\n", local_ip));
+    out.push_str(&format!("a=rtpmap:{} {}\r\n", vid.payload_type, vid.rtpmap));
+    if let Some(ref fmtp) = vid.fmtp {
+        out.push_str(&format!("a=fmtp:{} {}\r\n", vid.payload_type, fmtp));
+    }
+    out.push_str("a=rtcp-fb:* x-message app send:src,x-pli recv:src,x-pli\r\n");
+    out.push_str("a=x-signaling-fb:* x-message app send:src,vc recv:src\r\n");
+    out.push_str("a=rtcp-rsize\r\n");
+    out.push_str(&format!("a=rtcp:{}\r\n", port));
+    out.push_str("a=rtcp-mux\r\n");
+    out.push_str("a=setup:active\r\n");
+    out.push_str("a=mid:1\r\n");
+    out.push_str(&format!("a={}\r\n", vid.answer_direction()));
+    out.push_str(&format!("a=ice-ufrag:{}\r\n", ufrag));
+    out.push_str(&format!("a=ice-pwd:{}\r\n", pwd));
+    if candidates.is_empty() {
+        out.push_str(&format!(
+            "a=candidate:1 1 UDP 2130706431 {} {} typ host\r\n",
+            local_ip, port
+        ));
+    } else {
+        for c in candidates {
+            out.push_str(&format!("a={}\r\n", c.to_sdp_line()));
+        }
+    }
+    out.push_str("a=label:main-video\r\n");
+    out
+}
+
+/// Result of the BUNDLE consumer offer (one transport, audio+video).
+#[derive(Debug, Clone)]
+pub struct BundleOfferResult {
+    pub sdp: String,
+    pub ice_ufrag: String,
+    pub ice_pwd: String,
+}
+
+/// Build the consumer (Teams-for-Life) video-call offer: a web-mirrored
+/// BUNDLE shape — TWO m-lines on ONE transport (same port, credentials,
+/// DTLS fingerprint), DTLS-only (no SDES: the consumer web is WebRTC and
+/// cannot answer SDES). Captured reference: the web's own cpconv create
+/// (HAR 2026-10-20) carries four m-lines BUNDLE'd; we offer the two we
+/// implement. H264 payload types/fmtp match the web's offers so a web
+/// callee can answer them with its own subsets.
+pub fn generate_bundle_sdp_offer(
+    local_ip: &str,
+    port: u16,
+    ice_ufrag: &str,
+    ice_pwd: &str,
+    candidates: &[crate::calling::ice::IceCandidate],
+    audio_ssrc: u32,
+    video_ssrc: u32,
+) -> BundleOfferResult {
+    let mut sdp = String::new();
+    sdp.push_str("v=0\r\n");
+    sdp.push_str(&format!(
+        "o=- {} 2 IN IP4 127.0.0.1\r\n",
+        rand_session_id()
+    ));
+    sdp.push_str("s=-\r\n");
+    sdp.push_str("b=CT:4000\r\n");
+    sdp.push_str("t=0 0\r\n");
+    sdp.push_str("a=group:BUNDLE 0 1\r\n");
+    sdp.push_str(&super::dtls::sdp_attributes(super::dtls::Setup::ActPass));
+
+    // Audio: PCMU only — what our sender actually emits.
+    sdp.push_str(&format!("m=audio {} RTP/SAVP 0\r\n", port));
+    sdp.push_str(&format!("c=IN IP4 {}\r\n", local_ip));
+    sdp.push_str("a=rtpmap:0 PCMU/8000\r\n");
+    sdp.push_str("a=ptime:20\r\n");
+    sdp.push_str(&format!("a=x-ssrc-range:{}-{}\r\n", audio_ssrc, audio_ssrc));
+    sdp.push_str("a=rtcp-fb:* x-message app send:dsh recv:dsh\r\n");
+    sdp.push_str("a=x-signaling-fb:* x-message app send:dsh recv:dsh\r\n");
+    sdp.push_str("a=rtcp-rsize\r\n");
+    sdp.push_str(&format!("a=rtcp:{}\r\n", port));
+    sdp.push_str("a=rtcp-mux\r\n");
+    sdp.push_str("a=mid:0\r\n");
+    sdp.push_str("a=sendrecv\r\n");
+    sdp.push_str(&format!("a=ice-ufrag:{}\r\n", ice_ufrag));
+    sdp.push_str(&format!("a=ice-pwd:{}\r\n", ice_pwd));
+    for c in candidates {
+        sdp.push_str(&format!("a={}\r\n", c.to_sdp_line()));
+    }
+    sdp.push_str(&format!("a=ssrc:{} cname:teamsfast\r\n", audio_ssrc));
+    sdp.push_str("a=label:main-audio\r\n");
+
+    // Video: H264 pm=1 at the web's own two baseline profiles.
+    sdp.push_str(&format!("m=video {} RTP/SAVP 102 108\r\n", port));
+    sdp.push_str(&format!("c=IN IP4 {}\r\n", local_ip));
+    sdp.push_str("a=rtpmap:102 H264/90000\r\n");
+    sdp.push_str("a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f\r\n");
+    sdp.push_str("a=rtpmap:108 H264/90000\r\n");
+    sdp.push_str("a=fmtp:108 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n");
+    sdp.push_str("a=rtcp-fb:* x-message app send:src,x-pli recv:src,x-pli\r\n");
+    sdp.push_str("a=x-signaling-fb:* x-message app send:src,vc recv:src\r\n");
+    sdp.push_str("a=rtcp-rsize\r\n");
+    sdp.push_str(&format!("a=x-ssrc-range:{}-{}\r\n", video_ssrc, video_ssrc));
+    sdp.push_str(&format!("a=rtcp:{}\r\n", port));
+    sdp.push_str("a=rtcp-mux\r\n");
+    sdp.push_str("a=mid:1\r\n");
+    sdp.push_str("a=sendrecv\r\n");
+    sdp.push_str(&format!("a=ice-ufrag:{}\r\n", ice_ufrag));
+    sdp.push_str(&format!("a=ice-pwd:{}\r\n", ice_pwd));
+    for c in candidates {
+        sdp.push_str(&format!("a={}\r\n", c.to_sdp_line()));
+    }
+    sdp.push_str(&format!("a=ssrc:{} cname:teamsfast\r\n", video_ssrc));
+    sdp.push_str("a=label:main-video\r\n");
+
+    BundleOfferResult {
+        sdp,
+        ice_ufrag: ice_ufrag.to_string(),
+        ice_pwd: ice_pwd.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1045,5 +1314,155 @@ a=rtpmap:8 PCMA/8000\r\n";
 
         // Video crypto differs from audio crypto
         assert_ne!(parsed.crypto_lines[0], video.crypto_lines[0]);
+    }
+
+    /// The captured consumer web offer (HAR 2026-10-20, cpconv create),
+    /// abbreviated but structurally faithful: BUNDLE group, per-section
+    /// shared creds, mid1 recvonly, mid2 inactive, H264+AV1+rtx piles.
+    const WEB_OFFER: &str = "v=0\r\n\
+o=- 3218303516063002894 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+b=CT:4000\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1 2 3\r\n\
+a=fingerprint:sha-256 DE:AD:BE:EF\r\n\
+m=audio 54484 RTP/SAVP 105 111 0 8\r\n\
+c=IN IP4 52.112.173.64\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=ice-ufrag:tst1\r\n\
+a=ice-pwd:Tp0Tz1Pw0Tz1Pw0Tz1Pw0Tz1P\r\n\
+a=candidate:1 1 udp 2122265343 192.0.2.22 60494 typ host\r\n\
+m=video 54484 RTP/SAVP 102 104 45 103\r\n\
+c=IN IP4 52.112.173.64\r\n\
+a=rtpmap:102 H264/90000\r\n\
+a=rtpmap:104 H264/90000\r\n\
+a=rtpmap:45 AV1/90000\r\n\
+a=rtpmap:103 rtx/90000\r\n\
+a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f;max-fs=8160\r\n\
+a=fmtp:104 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f\r\n\
+a=fmtp:103 apt=102\r\n\
+a=mid:1\r\n\
+a=recvonly\r\n\
+a=ice-ufrag:tst1\r\n\
+a=ice-pwd:Tp0Tz1Pw0Tz1Pw0Tz1Pw0Tz1P\r\n\
+m=video 54484 RTP/SAVP 102 45\r\n\
+c=IN IP4 52.112.173.64\r\n\
+a=mid:2\r\n\
+a=inactive\r\n\
+a=label:applicationsharing-video\r\n\
+a=ice-ufrag:tst1\r\n\
+a=ice-pwd:Tp0Tz1Pw0Tz1Pw0Tz1Pw0Tz1P\r\n\
+m=x-data 54484 RTP/SAVP 127 126\r\n\
+c=IN IP4 52.112.173.64\r\n\
+a=mid:3\r\n\
+a=sendrecv\r\n\
+a=label:data\r\n\
+a=ice-ufrag:tst1\r\n\
+a=ice-pwd:Tp0Tz1Pw0Tz1Pw0Tz1Pw0Tz1P\r\n";
+
+    #[test]
+    fn test_bundle_detection() {
+        assert!(offer_is_bundle(WEB_OFFER));
+        // Separate transports (work-tenant/legacy shape): distinct ufrags.
+        let legacy = generate_av_sdp_offer(&AvSdpParams {
+            local_ip: "10.0.0.5",
+            audio_port: 40000,
+            video_port: 40002,
+            audio_ufrag: "aUfr",
+            audio_pwd: "aPwd1234567890123456==",
+            video_ufrag: "vUfr",
+            video_pwd: "vPwd1234567890123456==",
+            audio_candidates: &[],
+            video_candidates: &[],
+            video_ssrc_base: 5000,
+            audio_ssrc: 9999,
+        });
+        assert!(!offer_is_bundle(&legacy.sdp));
+        // Single m-line offers are not bundle-shaped for our purposes.
+        assert!(!offer_is_bundle("m=audio 1 RTP/SAVP 0\r\na=ice-ufrag:x\r\n"));
+    }
+
+    #[test]
+    fn test_parse_first_video_section_web_shape() {
+        let vid = parse_first_video_section(WEB_OFFER).expect("video section");
+        // pm=1 H264 (102) preferred over pm=0 (104), AV1/rtx skipped.
+        assert_eq!(vid.payload_type, 102);
+        assert_eq!(vid.rtpmap, "H264/90000");
+        assert!(vid.fmtp.as_deref().unwrap().contains("packetization-mode=1"));
+        assert!(vid.recvonly);
+        assert_eq!(vid.answer_direction(), "sendonly");
+    }
+
+    #[test]
+    fn test_bundle_video_answer_section_shape() {
+        let vid = parse_first_video_section(WEB_OFFER).unwrap();
+        let cand = crate::calling::ice::IceCandidate {
+            foundation: "1".into(),
+            component: 1,
+            transport: crate::calling::ice::Transport::Udp,
+            priority: 2130706431,
+            address: "192.168.1.5".into(),
+            port: 55555,
+            candidate_type: crate::calling::ice::CandidateType::Host,
+            raddr: None,
+            rport: None,
+        };
+        let section = bundle_video_answer_section(
+            "192.168.1.5",
+            55555,
+            "lfrg",
+            "localpwd123",
+            std::slice::from_ref(&cand),
+            &vid,
+        );
+        // Same port as audio (BUNDLE), offer's PT echoed, mirrored direction.
+        assert!(section.starts_with("m=video 55555 RTP/SAVP 102\r\n"));
+        assert!(section.contains("a=rtpmap:102 H264/90000\r\n"));
+        assert!(section.contains("packetization-mode=1"));
+        assert!(section.contains("a=mid:1\r\n"));
+        assert!(section.contains("a=sendonly\r\n"));
+        assert!(section.contains("a=ice-ufrag:lfrg\r\n"));
+        assert!(section.contains("a=ice-pwd:localpwd123\r\n"));
+        assert!(section.contains("a=setup:active\r\n"));
+        assert!(section.contains(&cand.to_sdp_line()));
+        // No SDES crypto ever on DTLS-only offers.
+        assert!(!section.contains("a=crypto:"));
+    }
+
+    #[test]
+    fn test_generate_bundle_sdp_offer_shape() {
+        let cand = crate::calling::ice::IceCandidate {
+            foundation: "1".into(),
+            component: 1,
+            transport: crate::calling::ice::Transport::Udp,
+            priority: 2130706431,
+            address: "192.168.1.7".into(),
+            port: 44444,
+            candidate_type: crate::calling::ice::CandidateType::Host,
+            raddr: None,
+            rport: None,
+        };
+        let r = generate_bundle_sdp_offer(
+            "192.168.1.7",
+            44444,
+            "ufg1",
+            "pwd1pwd1pwd1pwd1",
+            std::slice::from_ref(&cand),
+            1111,
+            2222,
+        );
+        assert!(offer_is_bundle(&r.sdp));
+        // Both m-lines on ONE transport: same port, same creds.
+        assert!(r.sdp.contains("m=audio 44444 RTP/SAVP 0\r\n"));
+        assert!(r.sdp.contains("m=video 44444 RTP/SAVP 102 108\r\n"));
+        assert_eq!(r.sdp.matches("a=ice-ufrag:ufg1\r\n").count(), 2);
+        // DTLS capability declared; NO SDES crypto anywhere.
+        assert!(r.sdp.contains("a=setup:actpass\r\n"));
+        assert!(!r.sdp.contains("a=crypto:"));
+        // Our answerer can parse it back.
+        let vid = parse_first_video_section(&r.sdp).expect("own offer parses");
+        assert_eq!(vid.payload_type, 102);
+        assert!(!vid.recvonly); // sendrecv offer
     }
 }

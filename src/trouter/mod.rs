@@ -593,7 +593,7 @@ async fn handle_call_event(json_str: &str) {
     println!("  Auto-answering call...");
     let never_stop = tokio::sync::watch::channel(false).1;
     tokio::spawn(async move {
-        if let Err(e) = crate::calling::answer_call_with_stop(&notification, false, never_stop)
+        if let Err(e) = crate::calling::answer_call_with_stop(&notification, false, never_stop, None)
             .await
         {
             tracing::warn!("Auto-answer flow failed: {:#}", e);

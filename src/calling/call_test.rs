@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use crate::calling::{camera, codec};
 #[cfg(feature = "video-capture")]
 use crate::calling::display;
-use crate::calling::{ice, recording, rtcp, rtp, sdp, signaling, srtp, test_tone, video};
+use crate::calling::{ice, media, recording, rtcp, rtp, sdp, signaling, srtp, test_tone, video};
 use crate::config::Config;
 use crate::trouter::{registrar, session, websocket};
 
@@ -568,7 +568,12 @@ pub async fn run_call_with_controls(
         video_candidates.push(srflx);
     }
 
-    // 4. Generate AV SDP offer (audio + video)
+    // 4. Generate the AV SDP offer. CONSUMER video calls use the web's
+    // own BUNDLE shape (all m-lines on ONE transport, DTLS-only — the
+    // shape the web callee answers and our own answerer mirrors); every
+    // other leg keeps the MS-native separate-transport SDES offer (echo
+    // bot, work tenants).
+    let bundle_call = consumer && use_camera && !echo;
     let our_audio_ufrag = sdp::generate_ice_ufrag();
     let our_audio_pwd = sdp::generate_ice_pwd();
     let our_video_ufrag = sdp::generate_ice_ufrag();
@@ -576,25 +581,61 @@ pub async fn run_call_with_controls(
     // Generate SSRCs early so we can include them in SDP x-ssrc-range attributes.
     let video_ssrc = video::generate_ssrc();
     let audio_ssrc = video::generate_ssrc();
-    let offer_result = sdp::generate_av_sdp_offer(&sdp::AvSdpParams {
-        local_ip: &local_ip,
-        audio_port,
-        video_port,
-        audio_ufrag: &our_audio_ufrag,
-        audio_pwd: &our_audio_pwd,
-        video_ufrag: &our_video_ufrag,
-        video_pwd: &our_video_pwd,
-        audio_candidates: &audio_candidates,
-        video_candidates: &video_candidates,
-        video_ssrc_base: video_ssrc,
-        audio_ssrc,
-    });
+    let offer_result = if bundle_call {
+        let mut bundle_cands = vec![make_host_candidate(audio_port)];
+        if let Some(srflx) =
+            ice::gather_srflx_candidate(&audio_socket, ice::DEFAULT_STUN_SERVER).await
+        {
+            tracing::info!(
+                "Gathered bundled srflx candidate: {}:{}",
+                srflx.address,
+                srflx.port
+            );
+            bundle_cands.push(srflx);
+        }
+        let sdp_text = sdp::generate_bundle_sdp_offer(
+            &local_ip,
+            audio_port,
+            &our_audio_ufrag,
+            &our_audio_pwd,
+            &bundle_cands,
+            audio_ssrc,
+            video_ssrc,
+        )
+        .sdp;
+        tracing::info!("BUNDLE SDP offer ({} bytes):\n{}", sdp_text.len(), sdp_text);
+        sdp::AvSdpResult {
+            sdp: sdp_text,
+            audio_crypto_line: String::new(),
+            video_crypto_line: String::new(),
+            audio_ufrag: our_audio_ufrag.clone(),
+            audio_pwd: our_audio_pwd.clone(),
+            video_ufrag: our_audio_ufrag.clone(),
+            video_pwd: our_audio_pwd.clone(),
+        }
+    } else {
+        sdp::generate_av_sdp_offer(&sdp::AvSdpParams {
+            local_ip: &local_ip,
+            audio_port,
+            video_port,
+            audio_ufrag: &our_audio_ufrag,
+            audio_pwd: &our_audio_pwd,
+            video_ufrag: &our_video_ufrag,
+            video_pwd: &our_video_pwd,
+            audio_candidates: &audio_candidates,
+            video_candidates: &video_candidates,
+            video_ssrc_base: video_ssrc,
+            audio_ssrc,
+        })
+    };
 
-    tracing::info!(
-        "AV SDP offer ({} bytes):\n{}",
-        offer_result.sdp.len(),
-        offer_result.sdp
-    );
+    if !bundle_call {
+        tracing::info!(
+            "AV SDP offer ({} bytes):\n{}",
+            offer_result.sdp.len(),
+            offer_result.sdp
+        );
+    }
 
     // 5. Derive epconv URL from region_gtms
     let epconv_url =
@@ -867,13 +908,13 @@ pub async fn run_call_with_controls(
     // peers): we offered actpass, they answered active → we are server.
     let remote_answer_sdp = acceptance.sdp_blob.clone().unwrap_or_default();
     let dtls_server = remote_answer_sdp.contains("a=fingerprint");
-    let mut outgoing_leg = setup_media_leg(
+    let mut outgoing_leg = setup_media_leg_ext(
         &offer_result.audio_crypto_line,
         &offer_result.video_crypto_line,
         &our_audio_ufrag,
         &our_audio_pwd,
-        &our_video_ufrag,
-        &our_video_pwd,
+        &offer_result.video_ufrag,
+        &offer_result.video_pwd,
         &remote_answer_sdp,
         audio_socket,
         video_socket,
@@ -882,6 +923,7 @@ pub async fn run_call_with_controls(
         video_ssrc,
         audio_ssrc,
         dtls_server,
+        bundle_call,
     )
     .await
     .context("Failed to set up outgoing media leg")?;
@@ -1301,6 +1343,17 @@ struct MediaLeg {
     video_ssrc: u32,
     /// Audio SSRC matching the SDP x-ssrc-range.
     audio_ssrc: u32,
+    /// BUNDLE (consumer web shape): video rides the AUDIO transport —
+    /// video_socket/audio_socket are the same socket, video_srtp_ctx is
+    /// the audio context (per-SSRC rollover), the video send loop gates on
+    /// the audio DTLS keys, and the AUDIO recv loop demuxes video RTP by
+    /// payload type.
+    video_bundle: bool,
+    /// Payload type video packets are SENT with (negotiated; the
+    /// packetizer's native PT is X-H264UC 122).
+    video_send_pt: u8,
+    /// Payload types treated as video on receive (BUNDLE demux).
+    video_recv_pts: Vec<u8>,
     /// Camera frame receiver (when --camera is active).
     #[cfg(feature = "video-cam")]
     camera_rx: Option<std::sync::mpsc::Receiver<camera::YuvFrame>>,
@@ -1356,6 +1409,46 @@ async fn setup_media_leg(
     audio_ssrc: u32,
     dtls_server: bool,
 ) -> Result<MediaLeg> {
+    setup_media_leg_ext(
+        local_audio_crypto_line,
+        local_video_crypto_line,
+        local_audio_ufrag,
+        local_audio_pwd,
+        local_video_ufrag,
+        local_video_pwd,
+        remote_sdp,
+        audio_socket,
+        video_socket,
+        label,
+        controlling,
+        video_ssrc,
+        audio_ssrc,
+        dtls_server,
+        false,
+    )
+    .await
+}
+
+/// [`setup_media_leg`] with an explicit BUNDLE flag (consumer video
+/// calls: one transport, video rides the audio socket + context).
+#[allow(clippy::too_many_arguments)]
+async fn setup_media_leg_ext(
+    local_audio_crypto_line: &str,
+    local_video_crypto_line: &str,
+    local_audio_ufrag: &str,
+    local_audio_pwd: &str,
+    local_video_ufrag: &str,
+    local_video_pwd: &str,
+    remote_sdp: &str,
+    audio_socket: tokio::net::UdpSocket,
+    video_socket: tokio::net::UdpSocket,
+    label: &str,
+    controlling: bool,
+    video_ssrc: u32,
+    audio_ssrc: u32,
+    dtls_server: bool,
+    bundle_video: bool,
+) -> Result<MediaLeg> {
     // Decompress and log the full SDP for debugging
     let decompressed = crate::calling::sdp_compress::decompress_sdp(remote_sdp)
         .unwrap_or_else(|_| remote_sdp.to_string());
@@ -1386,18 +1479,29 @@ async fn setup_media_leg(
         srtp::create_context(&local_material, &remote_material)?
     }));
 
-    // Video SRTP
-    let video_srtp_ctx = if let Some(ref vid) = remote_offer.video {
-        let local_vid_material = srtp::parse_crypto_line(local_video_crypto_line)?;
-        let remote_vid_material = vid
-            .crypto_lines
-            .iter()
-            .find_map(|l| srtp::parse_crypto_line(l).ok())
-            .with_context(|| format!("No video crypto line in {} remote SDP", label))?;
-        Some(Arc::new(Mutex::new(srtp::create_context(
-            &local_vid_material,
-            &remote_vid_material,
-        )?)))
+    // Video SRTP — SDES only for the separate-transport shape; BUNDLE
+    // shares the audio context (one DTLS handshake = one key set).
+    let video_srtp_ctx = if bundle_video {
+        Some(audio_srtp_ctx.clone())
+    } else if let Some(ref vid) = remote_offer.video {
+        if dtls_server {
+            // DTLS answer with a separate video transport is not a shape
+            // we negotiate today (audio-only answers reject video there);
+            // leave the context unset — the video leg stays dormant.
+            tracing::info!("[{}] DTLS answer with separate video transport — video leg dormant", label);
+            None
+        } else {
+            let local_vid_material = srtp::parse_crypto_line(local_video_crypto_line)?;
+            let remote_vid_material = vid
+                .crypto_lines
+                .iter()
+                .find_map(|l| srtp::parse_crypto_line(l).ok())
+                .with_context(|| format!("No video crypto line in {} remote SDP", label))?;
+            Some(Arc::new(Mutex::new(srtp::create_context(
+                &local_vid_material,
+                &remote_vid_material,
+            )?)))
+        }
     } else {
         tracing::info!("[{}] Remote SDP has no video section", label);
         None
@@ -1464,9 +1568,12 @@ async fn setup_media_leg(
         });
     }
 
-    // Video ICE
+    // Video ICE — skipped for BUNDLE (the audio transport IS the video
+    // transport; same socket, same remote).
     let video_socket = Arc::new(video_socket);
-    let video_remote_addr = if let Some(ref vid) = remote_offer.video {
+    let video_remote_addr = if bundle_video {
+        Some(audio_remote_addr)
+    } else if let Some(ref vid) = remote_offer.video {
         let vid_candidates = ice::parse_candidates_from_sdp_section(remote_sdp, "video");
         tracing::info!(
             "[{}] Video ICE: {} candidates from SDP, remote video ufrag={}, pwd_len={}",
@@ -1505,6 +1612,25 @@ async fn setup_media_leg(
         None
     };
 
+    // BUNDLE: negotiate the video PT from the answer's video m-line (we
+    // offered 102/108; the answer echoes its pick). Receive demux accepts
+    // both offered PTs.
+    let (video_send_pt, video_recv_pts) = if bundle_video {
+        let answer_pts = sdp::video_payload_types(remote_sdp);
+        let send_pt = answer_pts.first().copied().unwrap_or(102);
+        (send_pt, vec![102, 108])
+    } else {
+        (video::PT_H264, Vec::new())
+    };
+
+    // BUNDLE shares the AUDIO socket (the earlier Arc wrap was for the
+    // separate ICE check path).
+    let video_socket = if bundle_video {
+        audio_socket.clone()
+    } else {
+        video_socket
+    };
+
     Ok(MediaLeg {
         camera_source: None,
         label: label.to_string(),
@@ -1520,6 +1646,9 @@ async fn setup_media_leg(
         video_local_pwd: local_video_pwd.to_string(),
         video_ssrc,
         audio_ssrc,
+        video_bundle: bundle_video,
+        video_send_pt,
+        video_recv_pts,
         #[cfg(feature = "video-cam")]
         camera_rx: None,
         #[cfg(feature = "video-capture")]
@@ -1666,6 +1795,22 @@ fn spawn_media_leg(
         let label = label.clone();
         let dynamic_remote = dynamic_remote_addr.clone();
         let dtls_inbound = leg.audio_dtls_inbound.clone();
+        // BUNDLE: video RTP arrives on THIS socket — demux by payload type
+        // into the video pipeline (the separate video recv loop is not
+        // spawned for bundled legs).
+        let mut video_demux = if leg.video_bundle {
+            let video_recv_stats = video_recv_stats.clone();
+            let vid_remote_ssrc = video_remote_ssrc.clone();
+            let remote_tx = leg.remote_tx.take();
+            Some((
+                leg.video_recv_pts.clone(),
+                media::VideoRecvPipeline::new(remote_tx),
+                video_recv_stats,
+                vid_remote_ssrc,
+            ))
+        } else {
+            None
+        };
         handles.push(tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             loop {
@@ -1735,6 +1880,31 @@ fn spawn_media_leg(
                         match srtp_result {
                             Ok(rtp_data) => {
                                 if let Ok(pkt) = rtp::decode(&rtp_data) {
+                                    // BUNDLE: video payload types go to the
+                                    // video pipeline, not the speaker.
+                                    if let Some((pts, pipeline, vstats, vssrc)) =
+                                        video_demux.as_mut()
+                                    {
+                                        if pts.contains(&pkt.payload_type) {
+                                            let marker = pkt.marker;
+                                            let payload = pkt.payload.clone();
+                                            pipeline.on_rtp(&payload, marker);
+                                            let mut rs = vstats.lock().await;
+                                            rs.packets_received = pipeline.packets as u32;
+                                            rs.highest_seq = pipeline.packets as u32;
+                                            drop(rs);
+                                            let mut s = vssrc.lock().await;
+                                            if *s == 0 {
+                                                *s = pkt.ssrc;
+                                                tracing::info!(
+                                                    "[{}] Remote video SSRC: {:#010x}",
+                                                    label,
+                                                    pkt.ssrc
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                    }
                                     let mut rs = recv_stats.lock().await;
                                     rs.packets_received += 1;
                                     if pkt.sequence_number as u32 > rs.highest_seq {
@@ -1861,6 +2031,14 @@ fn spawn_media_leg(
         let vid_srtp = vid_srtp.clone();
         let vid_send_stats = video_send_stats.clone();
         let label = label.clone();
+        // BUNDLE: the send gate is the AUDIO DTLS keys (shared context);
+        // separate transports have their own SDES keys (no gate).
+        let keys_gate = if leg.video_bundle {
+            Some(leg.audio_keys_ready.clone())
+        } else {
+            None
+        };
+        let video_send_pt = leg.video_send_pt;
 
         #[cfg(feature = "video-cam")]
         let camera_rx = leg.camera_rx.take();
@@ -1895,6 +2073,14 @@ fn spawn_media_leg(
 
             loop {
                 interval.tick().await;
+
+                // BUNDLE: hold video until the shared DTLS keys land (the
+                // context holds placeholder keys before the handshake).
+                if let Some(ref gate) = keys_gate {
+                    if !gate.load(std::sync::atomic::Ordering::SeqCst) {
+                        continue;
+                    }
+                }
 
                 // Source priority: screen share > camera > black iframe.
                 // The camera gate ("lens off") keeps the stream alive with
@@ -2073,6 +2259,17 @@ fn spawn_media_leg(
                 let rtp_packets = packetizer.packetize_frame(&nal_units);
 
                 for rtp_pkt in &rtp_packets {
+                    // Rewrite to the negotiated PT when bundling (the
+                    // packetizer's native PT is X-H264UC 122).
+                    let rtp_pkt = if video_send_pt != video::PT_H264
+                        && rtp_pkt.len() >= 2
+                    {
+                        let mut p = rtp_pkt.clone();
+                        p[1] = (p[1] & 0x80) | (video_send_pt & 0x7F);
+                        p
+                    } else {
+                        rtp_pkt.clone()
+                    };
                     let payload_len = rtp_pkt.len().saturating_sub(rtp::RTP_HEADER_SIZE);
                     let last_ts = if rtp_pkt.len() >= 8 {
                         u32::from_be_bytes([rtp_pkt[4], rtp_pkt[5], rtp_pkt[6], rtp_pkt[7]])
@@ -2081,7 +2278,7 @@ fn spawn_media_leg(
                     };
                     let srtp_packet = {
                         let mut ctx = vid_srtp.lock().await;
-                        match srtp::protect(&mut ctx, rtp_pkt) {
+                        match srtp::protect(&mut ctx, &rtp_pkt) {
                             Ok(p) => p,
                             Err(e) => {
                                 tracing::warn!("[{}] Video SRTP protect: {:#}", label, e);
@@ -2100,10 +2297,20 @@ fn spawn_media_leg(
         }));
     }
 
-    // Video recv loop
-    if let (Some(ref vid_srtp), Some(_)) = (&leg.video_srtp_ctx, leg.video_remote_addr) {
+    // Video recv loop — NOT spawned for bundled legs (video arrives on
+    // the audio socket; the audio recv loop demuxes it).
+    if !leg.video_bundle
+        && matches!(
+            (&leg.video_srtp_ctx, leg.video_remote_addr),
+            (Some(_), Some(_))
+        )
+    {
         let socket = leg.video_socket.clone();
-        let vid_srtp = vid_srtp.clone();
+        let vid_srtp = leg
+            .video_srtp_ctx
+            .as_ref()
+            .expect("guarded by the if condition")
+            .clone();
         let vid_recv_stats = video_recv_stats.clone();
         let vid_remote_ssrc = video_remote_ssrc.clone();
         let vid_local_pwd = leg.video_local_pwd.clone();
