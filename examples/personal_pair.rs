@@ -18,6 +18,7 @@ const B_RT: &str = "/tmp/tfl_personal_rt2";
 
 struct Session {
     http: reqwest::Client,
+    aad: String,
     skype: String,
     chat_service: String,
     skypeid: String,
@@ -54,6 +55,7 @@ async fn open(rt_path: &str, label: &str) -> anyhow::Result<Session> {
     let body: Value = resp.json().await?;
     Ok(Session {
         http,
+        aad: aad.clone(),
         skype: body
             .pointer("/skypeToken/skypetoken")
             .and_then(|v| v.as_str())
@@ -133,6 +135,58 @@ async fn main() -> anyhow::Result<()> {
                 v.get("error_description").and_then(|e| e.as_str()).unwrap_or("?")
             ),
         }
+        return Ok(());
+    }
+    if std::env::var("PAIR_PROBE_PRESENCE").is_ok() {
+        let base = std::env::var("PAIR_UPS").unwrap_or_else(|_| "https://presence.teams.live.com".to_string());
+        let get = |p: &str| a.http.get(format!("{base}{p}")).header("X-Skypetoken", &*a.skype).header("x-ms-client-consumer-type", "teams4life");
+        for p in [
+            "/v1/users/ME/presence",
+            "/v1/users/8:live:rig-consumer-a/presence",
+            "/v1/me/presence",
+            "/v1.0/me/presence",
+        ] {
+            match get(p).timeout(std::time::Duration::from_secs(8)).send().await {
+                Ok(r) => println!("GET {p:<40} HTTP {} {}", r.status(), r.text().await.unwrap_or_default().chars().take(200).collect::<String>()),
+                Err(e) => println!("GET {p:<40} ERR {e}"),
+            }
+        }
+        // presenceUPS candidates
+        for (m, p, body) in [
+            ("PUT", "/v1/presence/publish", r#"{"availability":"Available"}"#),
+            ("POST", "/v1/presence/publish", r#"{"availability":"Available"}"#),
+            ("PUT", "/presence", r#"{"availability":"Available"}"#),
+            ("PATCH", "/v1/me/presence", r#"{"availability":"Available","capabilities":["Audio","Video"]}"#),
+        ] {
+            let _ = &body;
+            let req = match m {
+                "PUT" => a.http.put(format!("{base}{p}")),
+                "GET" => a.http.get(format!("{base}{p}")),
+                _ => a.http.post(format!("{base}{p}")),
+            };
+            let req = if body.is_empty() { req } else { req.header("Content-Type", "application/json").body(body) };
+            match req
+                .bearer_auth(&a.aad)
+                .header("x-ms-client-consumer-type", "teams4life")
+                .timeout(std::time::Duration::from_secs(8))
+                .send()
+                .await
+            {
+                Ok(r) => println!("{m} {p:<40} HTTP {} {}", r.status(), r.text().await.unwrap_or_default().chars().take(200).collect::<String>()),
+                Err(e) => println!("{m} {p:<40} ERR {e}"),
+            }
+        }
+        return Ok(());
+    }
+    if std::env::var("PAIR_PROBE_LOCATION").is_ok() {
+        let resp = a
+            .http
+            .get("https://teams.live.com/api/location/prod")
+            .header("X-Skypetoken", &*a.skype)
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await?;
+        println!("location: HTTP {}\n{}", resp.status(), resp.text().await.unwrap_or_default().chars().take(900).collect::<String>());
         return Ok(());
     }
     if std::env::var("PAIR_DUMP_THREAD").is_ok() {
