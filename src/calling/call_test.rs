@@ -974,6 +974,16 @@ pub async fn run_call_with_controls(
     // cap (live: connected-then-failed calls wedged "a call is already
     // in progress").
     let (end_tx, end_rx) = tokio::sync::watch::channel(false);
+    // Late callAcceptance acks: the CC delivers the callee's
+    // callAcceptance to the CALLER ~300ms AFTER the mediaAnswer (i.e.
+    // after wait_for_call_acceptance has already returned on the
+    // answer SDP). The CC's acceptance transaction only completes when
+    // the caller POSTs links.acknowledgement — with nobody acking it,
+    // every consumer call was aborted after 30s with 408/10056 "Call
+    // Controller timed out while waiting for acknowledgement"
+    // (live-verified 2026-10-20, both rigs). The pump forwards the ack
+    // URL here; the main loop owns conv_params.
+    let (late_ack_tx, mut late_ack_rx) = tokio::sync::mpsc::channel::<String>(4);
     let ws_pump = std::sync::Arc::clone(&ws_shared);
     tokio::spawn(async move {
         loop {
@@ -990,6 +1000,25 @@ pub async fn run_call_with_controls(
                             let _ = g.send_text("2::").await;
                         }
                         continue;
+                    }
+                    if let Some(v) = extract_call_payload(&text) {
+                        if v.get("callAcceptance").is_some() {
+                            let ack = v
+                                .pointer("/callAcceptance/links/acknowledgement")
+                                .and_then(|u| u.as_str());
+                            match ack {
+                                Some(url) => {
+                                    tracing::info!(
+                                        "callAcceptance frame on the call socket — forwarding ack URL"
+                                    );
+                                    let _ = late_ack_tx.try_send(url.to_string());
+                                }
+                                None => tracing::warn!(
+                                    "callAcceptance frame carried no acknowledgement URL"
+                                ),
+                            }
+                            continue;
+                        }
                     }
                     if text.contains("callEnd")
                         || text.contains("call/end")
@@ -1014,6 +1043,16 @@ pub async fn run_call_with_controls(
     tracing::info!("Call active, running for up to {}s...", duration_secs);
     let started = std::time::Instant::now();
     loop {
+        // Drain late callAcceptance acks forwarded by the frame pump
+        // (the acceptance frame arrives after connect; acking it from
+        // here completes the CC's acceptance transaction).
+        while let Ok(ack_url) = late_ack_rx.try_recv() {
+            if let Err(e) =
+                signaling::acknowledge_call_acceptance(&http, &ack_url, &conv_params).await
+            {
+                tracing::warn!("Late callAcceptance ack failed: {e:#}");
+            }
+        }
         if *stop.borrow() {
             tracing::info!("Stop signal received — hanging up");
             break;
