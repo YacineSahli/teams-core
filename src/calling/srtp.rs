@@ -52,17 +52,52 @@ pub struct SrtpSessionKeys {
     pub salt: [u8; 14],
 }
 
-/// SRTP context for encrypting/decrypting packets on a single stream.
+/// Per-SSRC rollover state. BUNDLE puts several streams (audio + video
+/// SSRCs) on ONE transport with ONE key set — each stream has its own
+/// sequence space, so ROC tracking must be per-SSRC. A single
+/// (roc, highest_seq) pair shared across streams corrupts the estimate
+/// the moment the sequences interleave far apart (auth-tag mismatches).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StreamRoc {
+    roc: u32,
+    highest_seq: u16,
+    seen: bool,
+}
+
+impl StreamRoc {
+    /// Estimate the ROC for `seq` on this stream (RFC 3711 appendix A).
+    /// Read-only: the caller commits via [`Self::commit`] only after the
+    /// auth tag verifies (a corrupted packet must not poison the state).
+    fn estimate(&self, seq: u16) -> u32 {
+        if !self.seen {
+            return 0;
+        }
+        estimate_roc(self.roc, self.highest_seq, seq)
+    }
+
+    /// Record an observed (seq, roc) — post-verification for inbound.
+    fn commit(&mut self, seq: u16, roc: u32) {
+        self.seen = true;
+        if seq > self.highest_seq || roc > self.roc {
+            self.highest_seq = seq;
+            self.roc = roc;
+        }
+    }
+}
+
+/// SRTP context for encrypting/decrypting packets.
+///
+/// One context = one set of session keys (one DTLS handshake or one SDES
+/// crypto line) covering any number of SSRCs; ROC/seq tracking is
+/// per-SSRC (see [`StreamRoc`]).
 #[derive(Debug, Clone)]
 pub struct SrtpContext {
     pub local_keys: SrtpSessionKeys,
     pub remote_keys: SrtpSessionKeys,
-    /// Rollover counter for outbound packets.
-    pub local_roc: u32,
-    /// Rollover counter for inbound packets.
-    pub remote_roc: u32,
-    /// Highest sequence number seen inbound.
-    pub remote_highest_seq: u16,
+    /// Per-stream rollover counters for outbound packets, keyed by SSRC.
+    local_streams: std::collections::HashMap<u32, StreamRoc>,
+    /// Per-stream rollover counters for inbound packets, keyed by SSRC.
+    remote_streams: std::collections::HashMap<u32, StreamRoc>,
     /// SRTCP session keys for local (outbound) RTCP.
     pub local_srtcp_keys: SrtpSessionKeys,
     /// SRTCP session keys for remote (inbound) RTCP.
@@ -240,9 +275,8 @@ pub fn create_context(
     Ok(SrtpContext {
         local_keys,
         remote_keys,
-        local_roc: 0,
-        remote_roc: 0,
-        remote_highest_seq: 0,
+        local_streams: std::collections::HashMap::new(),
+        remote_streams: std::collections::HashMap::new(),
         local_srtcp_keys,
         remote_srtcp_keys,
         local_srtcp_index: 0,
@@ -264,8 +298,15 @@ pub fn protect(ctx: &mut SrtpContext, rtp_packet: &[u8]) -> Result<Vec<u8>> {
     let ssrc = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
     let seq = u16::from_be_bytes([header[2], header[3]]);
 
-    // Build IV for AES-128-CM (RFC 3711, 4.1.1)
-    let iv = build_iv(&ctx.local_keys.salt, ssrc, ctx.local_roc, seq);
+    // Build IV for AES-128-CM (RFC 3711, 4.1.1) — per-SSRC ROC tracking
+    // (BUNDLE: several streams share one key set).
+    let roc = {
+        let stream = ctx.local_streams.entry(ssrc).or_default();
+        let roc = stream.estimate(seq);
+        stream.commit(seq, roc);
+        roc
+    };
+    let iv = build_iv(&ctx.local_keys.salt, ssrc, roc, seq);
 
     // Encrypt payload with AES-128-CM
     let mut encrypted_payload = payload.to_vec();
@@ -279,13 +320,8 @@ pub fn protect(ctx: &mut SrtpContext, rtp_packet: &[u8]) -> Result<Vec<u8>> {
     srtp_packet.extend_from_slice(&encrypted_payload);
 
     // Compute auth tag over header || encrypted payload || ROC
-    let auth_tag = compute_auth_tag(&ctx.local_keys.auth_key, &srtp_packet, ctx.local_roc);
+    let auth_tag = compute_auth_tag(&ctx.local_keys.auth_key, &srtp_packet, roc);
     srtp_packet.extend_from_slice(&auth_tag);
-
-    // Update ROC on sequence wrap
-    if seq == 0xFFFF {
-        ctx.local_roc = ctx.local_roc.wrapping_add(1);
-    }
 
     Ok(srtp_packet)
 }
@@ -311,8 +347,14 @@ pub fn unprotect(ctx: &mut SrtpContext, srtp_packet: &[u8]) -> Result<Vec<u8>> {
         srtp_packet[11],
     ]);
 
-    // Estimate ROC (simple: if seq < highest and diff is large, ROC may have incremented)
-    let estimated_roc = estimate_roc(ctx.remote_roc, ctx.remote_highest_seq, seq);
+    // Estimate ROC per stream (per-SSRC tracking; BUNDLE interleaves
+    // several SSRCs on one context). State commits only after the auth
+    // tag verifies.
+    let estimated_roc = ctx
+        .remote_streams
+        .get(&ssrc)
+        .map(|s| s.estimate(seq))
+        .unwrap_or(0);
 
     // Verify auth tag
     let expected_tag = compute_auth_tag(
@@ -337,11 +379,10 @@ pub fn unprotect(ctx: &mut SrtpContext, srtp_packet: &[u8]) -> Result<Vec<u8>> {
     let mut cipher = Aes128Ctr::new((&ctx.remote_keys.cipher_key).into(), &iv.into());
     cipher.apply_keystream(&mut decrypted);
 
-    // Update ROC tracking
-    if seq > ctx.remote_highest_seq || estimated_roc > ctx.remote_roc {
-        ctx.remote_highest_seq = seq;
-        ctx.remote_roc = estimated_roc;
-    }
+    ctx.remote_streams
+        .entry(ssrc)
+        .or_default()
+        .commit(seq, estimated_roc);
 
     let mut rtp_packet = Vec::with_capacity(header_len + decrypted.len());
     rtp_packet.extend_from_slice(header);
@@ -712,5 +753,74 @@ mod tests {
 
         let mut ctx2 = create_context(&mat, &mat).unwrap();
         assert!(unprotect_rtcp(&mut ctx2, &srtcp).is_err());
+    }
+
+    /// BUNDLE regression: two SSRCs (audio + video) interleaved on ONE
+    /// context must not corrupt each other's rollover tracking. Before
+    /// per-SSRC state, the first wrap of either stream mis-tagged every
+    /// later packet of the other.
+    #[test]
+    fn test_multi_ssrc_bundle_roundtrip_across_wrap() {
+        let mat = make_test_material();
+        let mut sender = create_context(&mat, &mat).unwrap();
+        let mut receiver = create_context(&mat, &mat).unwrap();
+
+        const AUDIO: u32 = 0x1111_0001;
+        const VIDEO: u32 = 0x2222_0002;
+
+        // Interleave ~70000 packets per stream (crosses 0xFFFF wrap) with
+        // wildly different sequence phases, like real audio (50pps) vs
+        // video (15fps) pacing.
+        let mut a_seq: u16 = 0xFFF0; // audio wraps almost immediately
+        let mut v_seq: u16 = 0x3000; // video mid-range, wraps later
+        for i in 0..70_000u32 {
+            for (ssrc, seq) in [(AUDIO, a_seq), (VIDEO, v_seq)] {
+                let rtp = rtp::encode(
+                    if ssrc == AUDIO { rtp::PT_PCMU } else { 102 },
+                    seq,
+                    i * 160,
+                    ssrc,
+                    &[0xAB; 120],
+                );
+                let srtp = protect(&mut sender, &rtp).unwrap();
+                let decrypted = unprotect(&mut receiver, &srtp)
+                    .expect("interleaved stream decrypts across wraps");
+                assert_eq!(decrypted, rtp);
+            }
+            a_seq = a_seq.wrapping_add(1);
+            v_seq = v_seq.wrapping_add(1);
+        }
+        // Both streams crossed at least one wrap.
+        assert!(sender.local_streams[&AUDIO].roc >= 1);
+        assert!(sender.local_streams[&VIDEO].roc >= 1);
+    }
+
+    /// A corrupted packet (bad auth tag) must not poison the stream's ROC
+    /// state for subsequent good packets.
+    #[test]
+    fn test_corrupt_packet_does_not_poison_stream_state() {
+        let mat = make_test_material();
+        let mut sender = create_context(&mat, &mat).unwrap();
+        let mut receiver = create_context(&mat, &mat).unwrap();
+        const SSRC: u32 = 0xAAAA_0001;
+
+        let mk = |seq: u16| rtp::encode(rtp::PT_PCMU, seq, seq as u32 * 160, SSRC, &[0x11; 160]);
+
+        // Seed the stream with seq 100.
+        let srtp = protect(&mut sender, &mk(100)).unwrap();
+        assert!(unprotect(&mut receiver, &srtp).is_ok());
+
+        // Corrupted in-flight packet (seq 101, garbage tag): must fail
+        // WITHOUT advancing the receiver's highest_seq. (The sender's own
+        // state is unaffected — it genuinely sent 101.)
+        let mut bad = protect(&mut sender, &mk(101)).unwrap();
+        let n = bad.len();
+        bad[n - 1] ^= 0xFF;
+        assert!(unprotect(&mut receiver, &bad).is_err());
+        assert_eq!(receiver.remote_streams[&SSRC].highest_seq, 100);
+
+        // The next good packet still decrypts.
+        let srtp = protect(&mut sender, &mk(102)).unwrap();
+        assert!(unprotect(&mut receiver, &srtp).is_ok());
     }
 }
