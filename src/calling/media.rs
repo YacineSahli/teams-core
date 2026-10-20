@@ -234,9 +234,7 @@ async fn video_send_loop_shared(
     let mut encoder: Option<super::codec::H264Encoder> = None;
     #[cfg(feature = "video-cam")]
     let mut enc_dims = (0u32, 0u32);
-    // Decoder-compatible black fallback (encoder-backed).
-    #[cfg(feature = "video-cam")]
-    let mut black = super::codec::BlackFrameSource::new();
+
 
     tracing::info!(
         "BUNDLE video send loop started (SSRC {:#010x}, PT {})",
@@ -285,10 +283,10 @@ async fn video_send_loop_shared(
                 }
                 match encoder.as_mut().map(|enc| enc.encode(&f.data)) {
                     Some(Ok(nals)) if !nals.is_empty() => nals,
-                    _ => black.frame(),
+                    _ => super::codec::encode_black_frame(&mut encoder),
                 }
             }
-            _ => black.frame(),
+            _ => super::codec::encode_black_frame(&mut encoder),
         };
         #[cfg(not(feature = "video-cam"))]
         let _ = (&frame, &cfg.local_preview);

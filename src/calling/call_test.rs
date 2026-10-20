@@ -2060,9 +2060,7 @@ fn spawn_media_leg(
             let mut encoder: Option<codec::H264Encoder> = None;
             #[cfg(feature = "video-cam")]
             let mut enc_dims = (0u32, 0u32);
-            // Decoder-compatible black fallback (encoder-backed).
-            #[cfg(feature = "video-cam")]
-            let mut black = codec::BlackFrameSource::new();
+
             // Held screen frame between capture ticks (sticky share).
             #[cfg(feature = "video-cam")]
             let mut last_screen: Option<video::VideoFrame> = None;
@@ -2232,18 +2230,10 @@ fn spawn_media_leg(
                                 }
                                 match encoder.as_mut().map(|enc| enc.encode(&frame.data)) {
                                     Some(Ok(nals)) if !nals.is_empty() => nals,
-                                    Some(Ok(_)) | None => black.frame(),
-                                    Some(Err(e)) => {
-                                        tracing::debug!(
-                                            "[{}] Encode error: {:#}",
-                                            label,
-                                            e
-                                        );
-                                        black.frame()
-                                    }
+                                    _ => codec::encode_black_frame(&mut encoder),
                                 }
                             }
-                            _ => black.frame(),
+                            _ => codec::encode_black_frame(&mut encoder),
                         }
                     }
                     #[cfg(not(feature = "video-cam"))]

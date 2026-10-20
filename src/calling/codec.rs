@@ -74,6 +74,11 @@ impl H264Encoder {
     /// Encode a raw I420 YUV frame into H.264 NAL units.
     ///
     /// Returns a Vec of NAL unit byte vectors (without start codes).
+    /// The configured (width, height).
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     pub fn encode(&mut self, yuv_data: &[u8]) -> Result<Vec<Vec<u8>>> {
         let expected_size = (self.width * self.height * 3 / 2) as usize;
         if yuv_data.len() < expected_size {
@@ -116,37 +121,41 @@ impl H264Encoder {
     }
 }
 
-/// Encoder-backed black-frame source for the video send loops' fallback
-/// path. The hand-rolled baseline IDR bitstream (video::generate_black_iframe)
-/// is rejected by openh264's decoder on this NAL-per-call feeding mode
-/// (live rigs 2026-10-20: first frame or nothing decodes, then
-/// dsNoParam|dsRefLost forever) — keep the fallback stream decoder-
-/// compatible by encoding real black frames.
-pub struct BlackFrameSource {
-    encoder: H264Encoder,
-    black: Vec<u8>,
-}
-
-impl Default for BlackFrameSource {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BlackFrameSource {
-    pub fn new() -> Self {
-        let (w, h) = (320u32, 240u32);
-        let encoder = H264Encoder::new(w, h, 15.0, 256)
-            .expect("black-frame fallback encoder");
-        BlackFrameSource {
-            encoder,
-            black: vec![0u8; (w * h * 3 / 2) as usize],
+/// Encode one black access unit through the CALL'S encoder — the same
+/// instance live content uses. Two independent encoders interleaving on
+/// one SSRC produce two unrelated reference chains and the receiver's
+/// decoder rejects every P-slice with dsRefLost (live rigs 2026-10-20:
+/// 3 frames decoded then permanent errors). The encoder is initialized
+/// on first use so a no-source stream still flows.
+pub fn encode_black_frame(encoder: &mut Option<H264Encoder>) -> Vec<Vec<u8>> {
+    // A live encoder keeps its own resolution (a 1080p share must not
+    // flap the encoder back to 320p on a no-source tick); fresh streams
+    // start at camera size.
+    const DEFAULT_W: u32 = 320;
+    const DEFAULT_H: u32 = 240;
+    if encoder.is_none() {
+        match H264Encoder::new(DEFAULT_W, DEFAULT_H, 15.0, 256) {
+            Ok(e) => *encoder = Some(e),
+            Err(e) => {
+                tracing::warn!("black-frame encoder init failed: {e:#}");
+                return Vec::new();
+            }
         }
     }
-
-    /// One encoded black access unit (SPS/PPS/IDR on first use).
-    pub fn frame(&mut self) -> Vec<Vec<u8>> {
-        self.encoder.encode(&self.black).unwrap_or_default()
+    let (w, h) = encoder
+        .as_ref()
+        .map(|e| e.dimensions())
+        .unwrap_or((DEFAULT_W, DEFAULT_H));
+    match encoder
+        .as_mut()
+        .map(|enc| enc.encode(&vec![0u8; (w * h * 3 / 2) as usize]))
+    {
+        Some(Ok(nals)) => nals,
+        Some(Err(e)) => {
+            tracing::debug!("black-frame encode error: {e:#}");
+            Vec::new()
+        }
+        None => Vec::new(),
     }
 }
 
@@ -216,7 +225,12 @@ impl H264Decoder {
             }
             Ok(None) => Ok(None),
             Err(e) => {
-                tracing::debug!("openh264 decode error: {:?}", e);
+                let ty = nal.first().map(|b| b & 0x1F).unwrap_or(99);
+                tracing::debug!(
+                    "openh264 decode error (NAL type {ty}, {} bytes): {:?}",
+                    nal.len(),
+                    e
+                );
                 Ok(None) // Don't bail -- decoder may recover on next NAL
             }
         }
@@ -319,16 +333,19 @@ mod black_stream_tests {
         assert!(decoded == 0, "hand-rolled stream now decodes? {decoded}/6 — switch the fallback back");
     }
 
-    /// The encoder-backed fallback decodes frame after frame.
+    /// The same-encoder fallback decodes frame after frame (one
+    /// reference chain, no interleaving).
     #[test]
     fn encoder_backed_black_stream_decodes() {
         let mut dec = H264Decoder::new().expect("decoder");
         let mut packetizer = crate::calling::video::VideoPacketizer::new(0x1234);
         let mut depacketizer = crate::calling::video::VideoDepacketizer::new();
-        let mut black = BlackFrameSource::new();
+        let mut encoder: Option<H264Encoder> = None;
         let mut decoded = 0usize;
         for _round in 0..6 {
-            for pkt in &packetizer.packetize_frame(&black.frame()) {
+            let nals = encode_black_frame(&mut encoder);
+            assert!(!nals.is_empty(), "fallback produced no NALs");
+            for pkt in &packetizer.packetize_frame(&nals) {
                 let marker = pkt[1] & 0x80 != 0;
                 let payload = &pkt[crate::calling::rtp::RTP_HEADER_SIZE..];
                 if let Ok(Some(nal)) = depacketizer.depacketize(payload, marker) {
@@ -341,6 +358,6 @@ mod black_stream_tests {
                 }
             }
         }
-        assert!(decoded >= 4, "only {decoded}/6 encoder-backed black frames decoded");
+        assert!(decoded >= 4, "only {decoded}/6 black frames decoded");
     }
 }
