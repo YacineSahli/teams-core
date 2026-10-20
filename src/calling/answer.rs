@@ -358,6 +358,14 @@ pub async fn answer_call_with_stop(
     // audio session failed to start (e.g. no usable ICE path in sandboxes).
     let mut stats_tick = tokio::time::interval(Duration::from_secs(5));
     stats_tick.tick().await; // skip the immediate first tick
+    // Remote-gone watchdog: the CC does not reliably deliver call/end to
+    // the callee (live 2026-10-20: caller hang-up produced NO trouter
+    // frame and NO broker event; the callee kept streaming into the
+    // void with recv frozen). Our sender always paces 50pps, so a frozen
+    // recv counter after traffic means the remote leg is gone — end the
+    // call locally after 30s of silence instead of wedging the slot.
+    let mut last_recv: u64 = 0;
+    let mut recv_stalled_since: Option<std::time::Instant> = None;
     loop {
         tokio::select! {
             _ = stats_tick.tick() => {
@@ -369,6 +377,18 @@ pub async fn answer_call_with_stop(
                     );
                     result.packets_sent = stats.packets_sent;
                     result.packets_received = stats.packets_received;
+                    if stats.packets_received > last_recv {
+                        last_recv = stats.packets_received;
+                        recv_stalled_since = None;
+                    } else if last_recv > 0 {
+                        let since = *recv_stalled_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= Duration::from_secs(30) {
+                            tracing::warn!(
+                                "remote end gone: recv frozen at {last_recv} for 30s — ending call"
+                            );
+                            break;
+                        }
+                    }
                 }
             }
             changed = stop.changed() => {

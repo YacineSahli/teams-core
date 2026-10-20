@@ -636,13 +636,21 @@ pub async fn accept_call_with_sdp(
             .filter(|e| !e.contains("0000-0000"))
             .or_else(crate::trouter::current_epid)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // The caller's post-accept roster shows acceptedBy.displayName
+        // verbatim — send a real name (sign-in email local part, the
+        // app's self-label convention), not the raw MRI.
+        let my_display = crate::config::Config::load_cached()
+            .ok()
+            .and_then(|c| c.signinname)
+            .map(|e| e.split('@').next().unwrap_or(&e).to_string())
+            .unwrap_or_else(|| me.clone());
         let cb = |path: &str| {
             crate::trouter::current_surl().map(|surl| trouter_callback(&surl, &ep_for_links, path))
         };
         let mut acceptance = serde_json::json!({
             "acceptedBy": {
                 "id": me,
-                "displayName": me,
+                "displayName": my_display,
                 "endpointId": ep_for_links,
                 "participantId": assigned_pid,
                 "languageId": "en-US"

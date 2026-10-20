@@ -462,6 +462,19 @@ pub async fn run_call_with_controls(
                     .unwrap_or_else(|| "(unknown)".into()),
             )
         }
+        _ if config.personal == Some(true) => {
+            // Consumer: no Graph. The sign-in email's local part (the
+            // app's own self-label convention) rides the invite's
+            // from.displayName — the callee's ring banner shows it
+            // ("(unknown) calling" otherwise, live 2026-10-20).
+            let name = config
+                .signinname
+                .as_deref()
+                .map(|e| e.split('@').next().unwrap_or(e))
+                .unwrap_or("Teams")
+                .to_string();
+            (name, config.signinname.clone().unwrap_or_default())
+        }
         _ => {
             tracing::warn!("Graph token expired or missing — skipping profile fetch");
             ("(unknown)".into(), "(unknown)".into())
