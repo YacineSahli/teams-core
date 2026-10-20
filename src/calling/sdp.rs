@@ -488,8 +488,13 @@ pub fn generate_sdp_answer_full(
         }
     }
 
-    sdp.push_str(&audio_crypto_line);
-    sdp.push_str("\r\n");
+    // RFC 3264: never answer with SDES crypto the offer did not offer
+    // (a WebRTC peer fails setRemoteDescription on the extra a=crypto
+    // lines — live: the web tore the call 500ms after its 200).
+    if !offer.crypto_lines.is_empty() {
+        sdp.push_str(&audio_crypto_line);
+        sdp.push_str("\r\n");
+    }
 
     // Video section
     let (video_crypto_line, video_ice_ufrag, video_ice_pwd) = if offer.video.is_some() {
@@ -530,8 +535,9 @@ pub fn generate_sdp_answer_full(
             }
         }
 
-        sdp.push_str(&vid_crypto);
-        sdp.push_str("\r\n");
+        if !offer.crypto_lines.is_empty() {
+            sdp.push_str(&vid_crypto);
+        }
 
         (Some(vid_crypto), Some(vid_ufrag), Some(vid_pwd))
     } else {
