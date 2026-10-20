@@ -375,7 +375,7 @@ pub async fn run_call_with_controls(
             let callee_mri = callee_oid.map(|oid| format!("8:orgid:{}", oid));
             (tid.clone(), callee_mri)
         } else {
-            let callee_mri = consumer_thread_peer(
+            let raw_peer = consumer_thread_peer(
                 &http,
                 &chat_service_base(&config),
                 skype_token_str,
@@ -388,6 +388,41 @@ pub async fn run_call_with_controls(
                     e
                 })
                 .ok();
+            // A freshly-created 1:1 roster carries the callee in UPN
+            // form (8:user@host) when the thread was created from the
+            // UPN — the calling CC cannot route that form and rejects
+            // the invite fan-out with call/end 403 subCode 10124
+            // ("callee to interact with caller", live 2026-10-20).
+            // Resolve the endpoint-registered form via the sticky
+            // OneToOneChat roster instead.
+            let callee_mri = match raw_peer {
+                Some(ref m) if m.contains('@') => {
+                    match consumer_endpoint_mri(
+                        &http,
+                        &chat_service_base(&config),
+                        skype_token_str,
+                        &caller_mri,
+                    )
+                    .await
+                    {
+                        Some(resolved) => {
+                            tracing::info!(
+                                "consumer callee {m} resolved to endpoint MRI {resolved} \
+                                 (sticky OneToOneChat roster)"
+                            );
+                            Some(resolved)
+                        }
+                        None => {
+                            tracing::warn!(
+                                "consumer callee {m} is UPN-form and no sticky OneToOneChat \
+                                 roster resolved an endpoint MRI — the invite will likely gate"
+                            );
+                            Some(m.clone())
+                        }
+                    }
+                }
+                other => other,
+            };
             (tid.clone(), callee_mri)
         }
     } else {
@@ -2657,6 +2692,66 @@ fn chat_service_base(config: &crate::config::Config) -> String {
         .unwrap_or_else(|| "https://msgapi.teams.live.com".to_string())
 }
 
+/// Pick the sticky OneToOneChat conversation ids from a
+/// `GET /v1/users/ME/conversations` body. The consumer web anchors its
+/// contact 1:1 on a `productThreadType: OneToOneChat` thread whose
+/// roster freezes endpoint-registered MRI forms (live 2026-10-20: the
+/// peer shows as `8:live:.cid.<guid>` there while a UPN-created bare
+/// thread roster carries `8:user@host`).
+fn sticky_one_to_one_conv_ids(list: &serde_json::Value) -> Vec<String> {
+    list.get("conversations")
+        .and_then(|c| c.as_array())
+        .map(|convs| {
+            convs.iter()
+                .filter(|c| {
+                    c.get("threadProperties")
+                        .and_then(|tp| tp.get("productThreadType"))
+                        .and_then(|t| t.as_str())
+                        == Some("OneToOneChat")
+                })
+                .filter_map(|c| c.get("id").and_then(|i| i.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve the callee's endpoint-registered MRI via the sticky
+/// OneToOneChat roster when a thread roster only knows the UPN form.
+/// Returns None when no sticky thread (or no single-peer roster)
+/// resolves — callers then keep the raw MRI and log the likely gate.
+async fn consumer_endpoint_mri(
+    http: &reqwest::Client,
+    chat_service: &str,
+    skype_token: &str,
+    self_mri: &str,
+) -> Option<String> {
+    let url = format!("{chat_service}/v1/users/ME/conversations?pageSize=100&view=msnp24Equivalent");
+    let resp = http
+        .get(&url)
+        .header("X-SkypeToken", skype_token)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        tracing::warn!("sticky 1:1 conversation list HTTP {}", resp.status());
+        return None;
+    }
+    let list: serde_json::Value = resp.json().await.ok()?;
+    // With multiple contacts the sticky-thread -> peer mapping is
+    // ambiguous client-side (no UPN<->MRI table is exposed); take the
+    // single-peer rosters in list order and stop at the first that
+    // resolves.
+    for tid in sticky_one_to_one_conv_ids(&list) {
+        if let Ok(peer) =
+            consumer_thread_peer(http, chat_service, skype_token, &tid, self_mri).await
+        {
+            return Some(peer);
+        }
+    }
+    None
+}
+
 fn extract_mri_from_skype_token(token: &str) -> Option<String> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() < 2 {
@@ -2778,4 +2873,57 @@ fn write_wav(path: &str, samples: &[i16], sample_rate: u32) -> anyhow::Result<()
         f.write_all(&s.to_le_bytes())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod endpoint_mri_tests {
+    use super::sticky_one_to_one_conv_ids;
+
+    /// Captured live shape (2026-10-20, msgapi conversations list):
+    /// the sticky contact 1:1 carries productThreadType=OneToOneChat
+    /// while UPN-created bare threads are productThreadType=Chat.
+    #[test]
+    fn sticky_one_to_one_picker_matches_only_contact_threads() {
+        let list = serde_json::json!({
+            "conversations": [
+                {
+                    "id": "19:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb@thread.v2",
+                    "threadProperties": {
+                        "productThreadType": "Chat",
+                        "threadType": "chat"
+                    }
+                },
+                {
+                    "id": "19:uni01_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@thread.v2",
+                    "threadProperties": {
+                        "productThreadType": "OneToOneChat",
+                        "threadType": "chat",
+                        "isStickyThread": "true"
+                    }
+                },
+                {
+                    "id": "19:cccccccccccccccccccccccccccccccc@thread.v2",
+                    "threadProperties": {
+                        "threadType": "chat"
+                    }
+                }
+            ]
+        });
+        let picked = sticky_one_to_one_conv_ids(&list);
+        assert_eq!(
+            picked,
+            vec!["19:uni01_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@thread.v2"]
+        );
+    }
+
+    #[test]
+    fn sticky_one_to_one_picker_handles_empty_and_malformed() {
+        assert!(sticky_one_to_one_conv_ids(&serde_json::json!({})).is_empty());
+        assert!(sticky_one_to_one_conv_ids(&serde_json::json!({"conversations": []})).is_empty());
+        // conversations array of non-objects must not panic
+        assert!(
+            sticky_one_to_one_conv_ids(&serde_json::json!({"conversations": [1, "x", null]}))
+                .is_empty()
+        );
+    }
 }
