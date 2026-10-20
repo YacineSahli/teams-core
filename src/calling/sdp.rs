@@ -451,6 +451,8 @@ pub fn generate_sdp_answer_full(
     sdp.push_str("s=session\r\n");
     sdp.push_str(&format!("c=IN IP4 {}\r\n", local_ip));
     sdp.push_str("t=0 0\r\n");
+    // DTLS capability (see generate_av_sdp_offer): answers declare active.
+    sdp.push_str(&super::dtls::sdp_attributes(super::dtls::Setup::Active));
 
     if offer.video.is_some() {
         sdp.push_str("a=x-mediabw:main-video send=2000;recv=2000\r\n");
@@ -669,6 +671,9 @@ pub fn generate_av_sdp_offer(p: &AvSdpParams) -> AvSdpResult {
     sdp.push_str("b=CT:99980\r\n");
     sdp.push_str("t=0 0\r\n");
     sdp.push_str("a=x-mediabw:main-video send=12000;recv=12000\r\n");
+    // DTLS capability (WebRTC answerers require a=fingerprint+setup; SFB
+    // peers ignore them and keep using a=crypto below).
+    sdp.push_str(&super::dtls::sdp_attributes(super::dtls::Setup::ActPass));
 
     // Audio m-line
     sdp.push_str(&format!("m=audio {} RTP/SAVP 0\r\n", p.audio_port));

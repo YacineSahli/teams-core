@@ -4,6 +4,7 @@
 
 #[cfg(feature = "audio")]
 pub mod audio;
+pub mod dtls;
 pub mod answer;
 pub mod call_test;
 

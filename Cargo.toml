@@ -46,6 +46,11 @@ aes = "0.8"
 ctr = "0.9"
 hmac = "0.12"
 
+# DTLS-SRTP: self-signed certificate whose sha-256 fingerprint rides the
+# SDP (a=fingerprint) — the consumer web client is a WebRTC stack that
+# cannot answer SDES-only offers (run-13 root cause).
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
