@@ -650,6 +650,11 @@ pub async fn accept_call_with_sdp(
             "acceptedCallModalities": accepted_call_modalities(video),
             "capabilities": null,
             "endpointCapabilities": 73463,
+            // cy() bitmask from the web's AG builder: 1 = base calling
+            // support (4/8 = AAD/CAE token support, which consumer
+            // accounts don't declare).
+            "clientEndpointCapabilities": 1,
+            "callKeepAliveInterval": null,
             // The acceptance's own callbacks are validated as required
             // (live: 400 "CallAcceptance.Links") — the AG link set.
             "links": {
