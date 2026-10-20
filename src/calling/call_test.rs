@@ -664,15 +664,29 @@ pub async fn run_call_with_controls(
     // dials them as the call target — the post-hoc participant-add left the
     // CC with a hostless meeting and a placeholder media leg (one-sided
     // audio, reversed CDR).
+    // Audio-only calls: strip the video m-line so the offer matches the
+    // declared modalities — the web callee preps its accept from the
+    // DECLARED modalities and a video m-line it cannot answer
+    // (X-H264UC) kills the accept client-side
+    // (CallEndReasonMediaOfferProcessingError, HAR-captured 2026-10-20).
+    let offer_sdp: String = if use_camera {
+        offer_result.sdp.clone()
+    } else {
+        match offer_result.sdp.find("m=video") {
+            Some(idx) => offer_result.sdp[..idx].to_string(),
+            None => offer_result.sdp.clone(),
+        }
+    };
     let (phase1, _phase2) = if is_1to1_call {
         // 1:1 call: single POST to epconv with SDP
         tracing::info!("Creating 1:1 call (single-shot epconv with SDP)...");
-        let (created, joined) = signaling::create_1to1_call(
+        let (created, joined) = signaling::create_1to1_call_modalities(
             &http,
             &epconv_url,
             &conv_params,
-            &offer_result.sdp,
+            &offer_sdp,
             callee_mri.as_deref(),
+            use_camera,
         )
         .await?;
         (created, joined)
@@ -695,7 +709,7 @@ pub async fn run_call_with_controls(
             &http,
             &created.conversation_controller,
             &conv_params,
-            &offer_result.sdp,
+            &offer_sdp,
             use_camera,
         )
         .await?;

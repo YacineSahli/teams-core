@@ -1534,6 +1534,24 @@ pub async fn create_1to1_call(
     sdp_offer: &str,
     callee_mri: Option<&str>,
 ) -> Result<(ConversationCreated, ConversationJoined)> {
+    create_1to1_call_modalities(http, epconv_url, params, sdp_offer, callee_mri, false).await
+}
+
+/// [`create_1to1_call`] with explicit modalities. The web callee PREPS its
+/// accept from the caller's DECLARED `callInvitation.callModalities`: an
+/// audio call labelled Audio+Video+ScreenViewer makes the web build a
+/// video answer, choke on the X-H264UC video m-line and fail client-side
+/// with CallEndReasonMediaOfferProcessingError before any HTTP request
+/// (three HAR captures, 2026-10-20). Audio-only calls must declare
+/// `["Audio"]` (and offer no video m-line).
+pub async fn create_1to1_call_modalities(
+    http: &reqwest::Client,
+    epconv_url: &str,
+    params: &ConversationCallParams<'_>,
+    sdp_offer: &str,
+    callee_mri: Option<&str>,
+    include_video: bool,
+) -> Result<(ConversationCreated, ConversationJoined)> {
     // Consumer: the DECLARED endpoint must be the main session's
     // REGISTERED epid — the call controller resolves endpoint-addressed
     // deliveries (the acceptance notification) against the registrar; a
@@ -1610,7 +1628,11 @@ pub async fn create_1to1_call(
             }
         },
         "callInvitation": {
-            "callModalities": ["Audio", "Video", "ScreenViewer"],
+            "callModalities": if include_video {
+                serde_json::json!(["Audio", "Video"])
+            } else {
+                serde_json::json!(["Audio"])
+            },
             "replaces": null,
             "transferor": null,
             "links": {
