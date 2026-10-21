@@ -416,3 +416,36 @@ mod tests {
         assert!(stats.jitter < 10, "jitter={}", stats.jitter);
     }
 }
+
+/// Build an RTCP Payload-Specific Feedback **PLI** (RFC 4585 §6.3.1):
+/// "some picture is lost, send a keyframe NOW". The essential recovery
+/// mechanism for a late-joining or key-missed receiver — the sender
+/// answers with a fresh IDR + SPS/PPS (live 2026-10-21: Chrome's
+/// initial keyframe burst landed before our DTLS keys; without a PLI it
+/// never repeats the parameter sets and every P-slice fails dsNoParam).
+pub fn build_pli(sender_ssrc: u32, media_ssrc: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(12);
+    // V=2, P=0, FMT=1 (PLI), PT=206 (PSFB), length = 2 words.
+    buf.push(0x80 | 1);
+    buf.push(206);
+    buf.extend_from_slice(&2u16.to_be_bytes());
+    buf.extend_from_slice(&sender_ssrc.to_be_bytes());
+    buf.extend_from_slice(&media_ssrc.to_be_bytes());
+    buf
+}
+
+#[cfg(test)]
+mod pli_tests {
+    use super::*;
+
+    #[test]
+    fn pli_wire_shape() {
+        let p = build_pli(0x11111111, 0x22222222);
+        assert_eq!(p.len(), 12);
+        assert_eq!(p[0], 0x81); // V=2, FMT=1
+        assert_eq!(p[1], 206); // PSFB
+        assert_eq!(u16::from_be_bytes([p[2], p[3]]), 2);
+        assert_eq!(&p[4..8], &0x11111111u32.to_be_bytes());
+        assert_eq!(&p[8..12], &0x22222222u32.to_be_bytes());
+    }
+}

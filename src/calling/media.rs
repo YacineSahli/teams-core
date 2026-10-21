@@ -68,6 +68,15 @@ pub struct VideoSessionConfig {
     pub local_preview: Option<std::sync::mpsc::SyncSender<video::VideoFrame>>,
 }
 
+/// PLI recovery probe: the recv loop publishes decode progress + the
+/// remote video SSRC; the recovery task requests keyframes until frames
+/// actually decode (senders do not repeat parameter sets unprompted).
+#[derive(Default)]
+struct PliProbe {
+    decoded: std::sync::atomic::AtomicU64,
+    last_ssrc: std::sync::atomic::AtomicU32,
+}
+
 /// Receive-side video pipeline: RTP payload → NAL → optional H264 decode
 /// → sink. Shared by the answerer's demuxed audio-socket loop.
 pub struct VideoRecvPipeline {
@@ -79,6 +88,8 @@ pub struct VideoRecvPipeline {
     pub frames: u64,
     /// Frames the decoder actually produced (UI-visible video).
     pub decoded: u64,
+    /// Last observed source SSRC (PLI target).
+    pub last_ssrc: u32,
 }
 
 impl VideoRecvPipeline {
@@ -99,12 +110,14 @@ impl VideoRecvPipeline {
             packets: 0,
             frames: 0,
             decoded: 0,
+            last_ssrc: 0,
         }
     }
 
     /// Feed one decrypted RTP packet's payload; the marker bit frames NALs.
-    pub fn on_rtp(&mut self, payload: &[u8], marker: bool) {
+    pub fn on_rtp(&mut self, payload: &[u8], marker: bool, ssrc: u32) {
         self.packets += 1;
+        self.last_ssrc = ssrc;
         match self.depacketizer.depacketize(payload, marker) {
             Ok(Some(nal)) => {
                 self.frames = self.depacketizer.frames_received;
@@ -492,20 +505,42 @@ impl MediaSession {
             ))
         };
 
+        let pli_probe = video.as_ref().map(|_| {
+            std::sync::Arc::new(PliProbe {
+                decoded: std::sync::atomic::AtomicU64::new(0),
+                last_ssrc: std::sync::atomic::AtomicU32::new(0),
+            })
+        });
+        let pli_probe_pub = pli_probe.clone();
+
         let local_pwd = local_creds.pwd.clone();
         let recv_handle = {
             let socket = socket.clone();
             let srtp_ctx = srtp_ctx.clone();
             let stats = stats.clone();
             let dtls_inbound = dtls_inbound.clone();
+            let pli_probe_recv = pli_probe.clone();
             let video_demux = video.as_ref().map(|cfg| {
-                (
-                    cfg.recv_payload_types.clone(),
-                    VideoRecvPipeline::new(cfg.remote_frames.clone()),
-                )
+                let pipeline = VideoRecvPipeline::new(cfg.remote_frames.clone());
+                // PLI probe: the recv loop publishes decode progress + the
+                // remote video SSRC; the recovery task below requests
+                // keyframes until frames actually decode.
+                if let Some(probe) = pli_probe.as_ref() {
+                    probe
+                        .decoded
+                        .store(pipeline.decoded, std::sync::atomic::Ordering::SeqCst);
+                }
+                (cfg.recv_payload_types.clone(), pipeline)
             });
             tokio::spawn(recv_loop_with_stun(
-                socket, srtp_ctx, stats, local_pwd, spk_tx, dtls_inbound, video_demux,
+                socket,
+                srtp_ctx,
+                stats,
+                local_pwd,
+                spk_tx,
+                dtls_inbound,
+                video_demux,
+                pli_probe_recv,
             ))
         };
 
@@ -530,6 +565,50 @@ impl MediaSession {
                 video_ssrc,
                 cfg,
             ));
+        }
+
+        // PLI keyframe recovery: until frames actually DECODE, ask the
+        // sender for a keyframe every 500 ms (the initial SPS/PPS burst
+        // can land before our DTLS keys; senders do not repeat parameter
+        // sets unprompted). Stops on the first decoded frame, hard-stops
+        // after 90 s.
+        if let Some(probe) = pli_probe {
+            let socket = socket.clone();
+            let srtp_ctx = srtp_ctx.clone();
+            let keys_ready = keys_ready.clone();
+            let sender_ssrc = ssrc;
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+                let mut tick = tokio::time::interval(Duration::from_millis(500));
+                tick.tick().await; // skip the immediate first tick
+                while tokio::time::Instant::now() < deadline {
+                    tick.tick().await;
+                    if !keys_ready.load(std::sync::atomic::Ordering::SeqCst) {
+                        continue;
+                    }
+                    if probe.decoded.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                        return;
+                    }
+                    let media_ssrc = probe.last_ssrc.load(std::sync::atomic::Ordering::SeqCst);
+                    if media_ssrc == 0 {
+                        continue;
+                    }
+                    let pli = super::rtcp::build_pli(sender_ssrc, media_ssrc);
+                    let protected = {
+                        let mut ctx = srtp_ctx.lock().await;
+                        match srtp::protect_rtcp(&mut ctx, &pli) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::debug!("PLI protect failed: {e:#}");
+                                continue;
+                            }
+                        }
+                    };
+                    if socket.send_to(&protected, remote_addr).await.is_ok() {
+                        tracing::debug!("PLI sent (media ssrc {media_ssrc:#010x})");
+                    }
+                }
+            });
         }
 
         if let Some(we_are_client) = dtls_client {
@@ -1125,6 +1204,7 @@ async fn recv_loop_with_stun(
     spk_tx: Option<std::sync::mpsc::SyncSender<Vec<i16>>>,
     dtls_inbound: Arc<super::dtls::DtlsInbound>,
     mut video_demux: Option<(Vec<u8>, VideoRecvPipeline)>,
+    pli_probe: Option<std::sync::Arc<PliProbe>>,
 ) {
     let mut buf = [0u8; 2048];
 
@@ -1191,7 +1271,15 @@ async fn recv_loop_with_stun(
                                     let marker = pkt.marker;
                                     let payload = pkt.payload.clone();
                                     drop(ctx);
-                                    pipeline.on_rtp(&payload, marker);
+                                    pipeline.on_rtp(&payload, marker, pkt.ssrc);
+                                    if let Some(probe) = pli_probe.as_ref() {
+                                        probe
+                                            .decoded
+                                            .store(pipeline.decoded, std::sync::atomic::Ordering::SeqCst);
+                                        probe
+                                            .last_ssrc
+                                            .store(pipeline.last_ssrc, std::sync::atomic::Ordering::SeqCst);
+                                    }
                                     let mut s = stats.lock().await;
                                     s.video_packets_received = pipeline.packets;
                                     s.video_frames_received = pipeline.frames;

@@ -1888,7 +1888,7 @@ fn spawn_media_leg(
                                         if pts.contains(&pkt.payload_type) {
                                             let marker = pkt.marker;
                                             let payload = pkt.payload.clone();
-                                            pipeline.on_rtp(&payload, marker);
+                                            pipeline.on_rtp(&payload, marker, pkt.ssrc);
                                             let mut rs = vstats.lock().await;
                                             rs.packets_received = pipeline.packets as u32;
                                             rs.highest_seq = pipeline.packets as u32;
