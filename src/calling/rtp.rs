@@ -13,7 +13,7 @@
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! ```
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 /// Minimum RTP header size in bytes (no CSRC, no extension).
 pub const RTP_HEADER_SIZE: usize = 12;
@@ -113,14 +113,8 @@ pub fn decode(data: &[u8]) -> Result<RtpPacket> {
     let timestamp = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
     let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
 
-    let header_len = RTP_HEADER_SIZE + (csrc_count as usize) * 4;
-    if data.len() < header_len {
-        bail!(
-            "RTP packet too short for {} CSRCs: {} bytes",
-            csrc_count,
-            data.len()
-        );
-    }
+    let header_len = full_header_len(data)
+        .context("RTP packet has truncated extension header")?;
 
     let payload = data[header_len..].to_vec();
 

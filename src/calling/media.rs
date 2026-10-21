@@ -72,9 +72,9 @@ pub struct VideoSessionConfig {
 /// remote video SSRC; the recovery task requests keyframes until frames
 /// actually decode (senders do not repeat parameter sets unprompted).
 #[derive(Default)]
-struct PliProbe {
-    decoded: std::sync::atomic::AtomicU64,
-    last_ssrc: std::sync::atomic::AtomicU32,
+pub(crate) struct PliProbe {
+    pub(crate) decoded: std::sync::atomic::AtomicU64,
+    pub(crate) last_ssrc: std::sync::atomic::AtomicU32,
 }
 
 /// Receive-side video pipeline: RTP payload → NAL → optional H264 decode
@@ -396,6 +396,11 @@ pub struct MediaSession {
     send_handle: Option<tokio::task::JoinHandle<()>>,
     /// Handle to the recv task (for shutdown).
     recv_handle: Option<tokio::task::JoinHandle<()>>,
+    /// BUNDLE video-plane tasks (encode+send at 15fps, PLI recovery) —
+    /// MUST be aborted with the session or they encode and send into a
+    /// dead remote forever (adversarial-review finding: immortal task +
+    /// retained encoder up to 1080p/3.5Mbps per call).
+    aux_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Audio capture handle (kept alive so the stream stays open).
     #[cfg(feature = "audio")]
     _audio_capture: Option<audio::AudioCapture>,
@@ -582,6 +587,8 @@ impl MediaSession {
             ))
         };
 
+        let mut aux_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
         // BUNDLE video send loop (own SSRC + negotiated PT, shared context
         // and DTLS gate).
         if let Some(cfg) = video {
@@ -594,7 +601,7 @@ impl MediaSession {
             let srtp_ctx = srtp_ctx.clone();
             let stats = stats.clone();
             let keys_ready = keys_ready.clone();
-            tokio::spawn(video_send_loop_shared(
+            aux_handles.push(tokio::spawn(video_send_loop_shared(
                 socket,
                 remote_addr,
                 srtp_ctx,
@@ -603,7 +610,7 @@ impl MediaSession {
                 video_ssrc,
                 cfg,
                 keyframe_flag,
-            ));
+            )));
         }
 
         // PLI keyframe recovery: until frames actually DECODE, ask the
@@ -616,17 +623,33 @@ impl MediaSession {
             let srtp_ctx = srtp_ctx.clone();
             let keys_ready = keys_ready.clone();
             let sender_ssrc = ssrc;
-            tokio::spawn(async move {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+            aux_handles.push(tokio::spawn(async move {
+                // Stall-aware for the session's life: request a keyframe
+                // while video PACKETS still arrive but frames STOP
+                // decoding (covers both the pre-keys keyframe burst and
+                // mid-call IDR loss — the one-shot variant froze forever
+                // after its first success).
                 let mut tick = tokio::time::interval(Duration::from_millis(500));
                 tick.tick().await; // skip the immediate first tick
-                while tokio::time::Instant::now() < deadline {
+                let mut last_decoded: u64 = 0;
+                let mut last_decoded_at = std::time::Instant::now();
+                loop {
                     tick.tick().await;
                     if !keys_ready.load(std::sync::atomic::Ordering::SeqCst) {
                         continue;
                     }
-                    if probe.decoded.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                        return;
+                    let decoded = probe.decoded.load(std::sync::atomic::Ordering::SeqCst);
+                    if decoded > last_decoded {
+                        last_decoded = decoded;
+                        last_decoded_at = std::time::Instant::now();
+                        continue;
+                    }
+                    // No decode progress: only worth a PLI if the peer's
+                    // stream is still live (packets arriving) or we never
+                    // decoded at all.
+                    let stalled = last_decoded_at.elapsed() >= Duration::from_secs(1);
+                    if !stalled {
+                        continue;
                     }
                     let media_ssrc = probe.last_ssrc.load(std::sync::atomic::Ordering::SeqCst);
                     if media_ssrc == 0 {
@@ -647,7 +670,7 @@ impl MediaSession {
                         tracing::debug!("PLI sent (media ssrc {media_ssrc:#010x})");
                     }
                 }
-            });
+            }));
         }
 
         if let Some(we_are_client) = dtls_client {
@@ -686,6 +709,7 @@ impl MediaSession {
             stats,
             send_handle: Some(send_handle),
             recv_handle: Some(recv_handle),
+            aux_handles: Vec::new(),
             #[cfg(feature = "audio")]
             _audio_capture: audio_capture,
             #[cfg(feature = "audio")]
@@ -777,6 +801,7 @@ impl MediaSession {
             stats,
             send_handle: Some(send_handle),
             recv_handle: Some(recv_handle),
+            aux_handles: Vec::new(),
             #[cfg(feature = "audio")]
             _audio_capture: audio_capture,
             #[cfg(feature = "audio")]
@@ -817,6 +842,10 @@ impl MediaSession {
             h.abort();
             let _ = h.await;
         }
+        for h in self.aux_handles.drain(..) {
+            h.abort();
+            let _ = h.await;
+        }
         let stats = self.stats.lock().await;
         tracing::info!(
             "Media session stopped. Sent: {}, Received: {} ({} bytes)",
@@ -833,6 +862,9 @@ impl Drop for MediaSession {
             h.abort();
         }
         if let Some(h) = self.recv_handle.take() {
+            h.abort();
+        }
+        for h in self.aux_handles.drain(..) {
             h.abort();
         }
     }
@@ -1287,10 +1319,15 @@ async fn recv_loop_with_stun(
                     s.rtp_arrivals += 1;
                 }
 
-                // SRTCP first: feedback (PLI) flips the video send loop's
+                // SRTCP first (cheap RFC 5761 header gate — trying the
+                // RTCP auth path on every RTP packet doubles the crypto
+                // cost): feedback (PLI) flips the video send loop's
                 // keyframe-request flag.
-                if let Some(flag) = keyframe_flag.as_ref() {
-                    if let Ok(mut ctx) = srtp_ctx.try_lock() {
+                if let Some(flag) = keyframe_flag.as_ref()
+                    .filter(|_| super::rtcp::is_rtcp_packet(data))
+                {
+                    {
+                        let mut ctx = srtp_ctx.lock().await;
                         if let Ok(rtcp_data) = srtp::unprotect_rtcp(&mut ctx, data) {
                             for block in super::rtcp::parse_rtcp(&rtcp_data) {
                                 if let super::rtcp::RtcpBlock::Pli { .. } = block {

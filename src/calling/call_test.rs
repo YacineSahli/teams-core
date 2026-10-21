@@ -1532,7 +1532,17 @@ async fn setup_media_leg_ext(
     // Video ICE — skipped for BUNDLE (the audio transport IS the video
     // transport; same socket, same remote).
     let video_socket = Arc::new(video_socket);
-    let video_remote_addr = if bundle_video {
+    // Sending on a m-line the ANSWER rejected (port 0 / no section) is a
+    // protocol violation — check before arming the video leg.
+    let answer_accepted_video = bundle_video && {
+        let answer_video_port = remote_sdp
+            .find("m=video")
+            .and_then(|i| remote_sdp[i..].split_whitespace().nth(1))
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(0);
+        answer_video_port > 0
+    };
+    let video_remote_addr = if answer_accepted_video {
         Some(audio_remote_addr)
     } else if let Some(ref vid) = remote_offer.video {
         let vid_candidates = ice::parse_candidates_from_sdp_section(remote_sdp, "video");
@@ -1576,7 +1586,7 @@ async fn setup_media_leg_ext(
     // BUNDLE: negotiate the video PT from the answer's video m-line (we
     // offered 102/108; the answer echoes its pick). Receive demux accepts
     // both offered PTs.
-    let (video_send_pt, video_recv_pts) = if bundle_video {
+    let (video_send_pt, video_recv_pts) = if answer_accepted_video {
         let answer_pts = sdp::video_payload_types(remote_sdp);
         let send_pt = answer_pts.first().copied().unwrap_or(102);
         (send_pt, vec![102, 108])
@@ -1672,6 +1682,18 @@ fn spawn_media_leg(
     // Remote PLI (keyframe request) — the audio recv loop's RTCP branch
     // sets it, the video send loop forces an IDR.
     let keyframe_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // PLI recovery probe (mirrors the answerer's): the audio recv loop's
+    // video demux publishes decode progress + the remote video SSRC; a
+    // task below requests keyframes while packets arrive but frames stop
+    // decoding. Without this, a browser callee's keyframe burst landing
+    // inside our DTLS-keys window leaves remote video black for the
+    // whole call (adversarial-review finding; the answerer hit the
+    // identical bug live).
+    let pli_probe: Option<std::sync::Arc<media::PliProbe>> = if leg.video_bundle {
+        Some(std::sync::Arc::new(media::PliProbe::default()))
+    } else {
+        None
+    };
 
     // Audio send loop
     {
@@ -1764,6 +1786,7 @@ fn spawn_media_leg(
         // BUNDLE: video RTP arrives on THIS socket — demux by payload type
         // into the video pipeline (the separate video recv loop is not
         // spawned for bundled legs).
+        let pli_probe = pli_probe.clone();
         let mut video_demux = if leg.video_bundle {
             let video_recv_stats = video_recv_stats.clone();
             let vid_remote_ssrc = video_remote_ssrc.clone();
@@ -1812,9 +1835,16 @@ fn spawn_media_leg(
                             continue;
                         }
 
-                        let srtcp_result = {
-                            let mut ctx = srtp_ctx.lock().await;
-                            srtp::unprotect_rtcp(&mut ctx, data).ok()
+                        // Cheap RFC 5761 header gate before the RTCP auth
+                        // path (running it on every RTP packet doubles the
+                        // receive crypto cost).
+                        let srtcp_result = if rtcp::is_rtcp_packet(data) {
+                            {
+                                let mut ctx = srtp_ctx.lock().await;
+                                srtp::unprotect_rtcp(&mut ctx, data).ok()
+                            }
+                        } else {
+                            None
                         };
                         if let Some(rtcp_data) = srtcp_result {
                             tracing::debug!(
@@ -1862,6 +1892,16 @@ fn spawn_media_leg(
                                             let marker = pkt.marker;
                                             let payload = pkt.payload.clone();
                                             pipeline.on_rtp(&payload, marker, pkt.ssrc);
+                                            if let Some(probe) = pli_probe.as_ref() {
+                                                probe.decoded.store(
+                                                    pipeline.decoded,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                                probe.last_ssrc.store(
+                                                    pkt.ssrc,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                            }
                                             let mut rs = vstats.lock().await;
                                             rs.packets_received = pipeline.packets as u32;
                                             rs.highest_seq = pipeline.packets as u32;
@@ -1896,13 +1936,18 @@ fn spawn_media_leg(
                                     }
                                     drop(rssrc);
 
-                                    // Dump raw PCMU payload to file (before decode)
-                                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                                        .create(true).append(true)
-                                        .open("/tmp/received_audio.ulaw")
-                                    {
-                                        use std::io::Write;
-                                        let _ = f.write_all(&pkt.payload);
+                                    // Optional raw PCMU dump for offline echo
+                                    // analysis (TEAMSFAST_AUDIO_DUMP=1) — was an
+                                    // unconditional per-20ms append growing
+                                    // ~29MB/hour across calls.
+                                    if std::env::var("TEAMSFAST_AUDIO_DUMP").as_deref() == Ok("1") {
+                                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                                            .create(true).append(true)
+                                            .open("/tmp/received_audio.ulaw")
+                                        {
+                                            use std::io::Write;
+                                            let _ = f.write_all(&pkt.payload);
+                                        }
                                     }
 
                                     // Decode PCMU to linear PCM
@@ -1953,6 +1998,50 @@ fn spawn_media_leg(
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
+            }
+        }));
+    }
+
+    // BUNDLE PLI recovery task (audio transport = video transport).
+    if let Some(probe) = pli_probe.clone() {
+        let socket = leg.audio_socket.clone();
+        let srtp_ctx = leg.audio_srtp_ctx.clone();
+        let keys_ready = leg.audio_keys_ready.clone();
+        let sender_ssrc = ssrc;
+        let dynamic_remote = dynamic_remote_addr.clone();
+        handles.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            tick.tick().await;
+            let mut last_decoded: u64 = 0;
+            let mut last_decoded_at = std::time::Instant::now();
+            loop {
+                tick.tick().await;
+                if !keys_ready.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                let decoded = probe.decoded.load(std::sync::atomic::Ordering::SeqCst);
+                if decoded > last_decoded {
+                    last_decoded = decoded;
+                    last_decoded_at = std::time::Instant::now();
+                    continue;
+                }
+                if last_decoded_at.elapsed() < Duration::from_secs(1) {
+                    continue;
+                }
+                let media_ssrc = probe.last_ssrc.load(std::sync::atomic::Ordering::SeqCst);
+                if media_ssrc == 0 {
+                    continue;
+                }
+                let pli = rtcp::build_pli(sender_ssrc, media_ssrc);
+                let protected = {
+                    let mut ctx = srtp_ctx.lock().await;
+                    match srtp::protect_rtcp(&mut ctx, &pli) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    }
+                };
+                let remote = *dynamic_remote.lock().await;
+                let _ = socket.send_to(&protected, remote).await;
             }
         }));
     }

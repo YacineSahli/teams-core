@@ -401,6 +401,7 @@ pub async fn answer_call_with_stop(
         let http3 = http.clone();
         let tok3 = skype_token_str.to_string();
         let notif3 = notification.clone();
+        let mut stop3 = stop.clone();
         tokio::spawn(async move {
             if let Err(e) =
                 signaling::update_conversation_links(&http3, &tok3, &nl, &notif3).await
@@ -410,8 +411,17 @@ pub async fn answer_call_with_stop(
             // Keep-alive: re-register for the call's life
             // (the conversation service expires stale
             // notification links).
+            // Stop when the call does (was: up to 10 minutes of
+            // authenticated POSTs after hang-up).
             for _ in 0..20 {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {},
+                    changed = stop3.changed() => {
+                        if changed.is_err() || *stop3.borrow() {
+                            return;
+                        }
+                    }
+                }
                 if let Err(e) =
         signaling::update_conversation_links(&http3, &tok3, &nl, &notif3)
             .await
