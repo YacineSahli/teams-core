@@ -35,6 +35,9 @@ pub struct MediaStats {
     pub video_frames_received: u64,
     /// Frames the decoder produced (what the UI can show).
     pub video_frames_decoded: u64,
+    /// Non-STUN/non-DTLS datagrams that ARRIVED (pre-decrypt) — separates
+    /// "peer sends nothing" from "packets arrive but fail SRTP auth".
+    pub rtp_arrivals: u64,
 }
 
 /// A live-swappable video frame source (camera mid-call, screen share) —
@@ -682,6 +685,7 @@ impl MediaSession {
             video_packets_received: s.video_packets_received,
             video_frames_received: s.video_frames_received,
             video_frames_decoded: s.video_frames_decoded,
+            rtp_arrivals: s.rtp_arrivals,
         }
     }
 
@@ -1154,6 +1158,13 @@ async fn recv_loop_with_stun(
                         tracing::debug!("Received STUN response from {}", from);
                     }
                     continue;
+                }
+
+                // Arrived (pre-decrypt) counter — diagnostic for the
+                // "peer sends nothing vs decrypt fails" split.
+                {
+                    let mut s = stats.lock().await;
+                    s.rtp_arrivals += 1;
                 }
 
                 // Try SRTP decrypt

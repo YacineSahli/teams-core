@@ -455,11 +455,11 @@ pub async fn answer_call_with_stop(
                 if let Some(ref s) = session {
                     let stats = s.stats().await;
                     tracing::info!(
-                        "Audio stats: sent={}, recv={} ({} bytes); video sent={} ({} frames), recv={} ({} frames, {} decoded)",
+                        "Audio stats: sent={}, recv={} ({} bytes); video sent={} ({} frames), recv={} ({} frames, {} decoded); udp arrivals={}",
                         stats.packets_sent, stats.packets_received, stats.bytes_received,
                         stats.video_packets_sent, stats.video_frames_sent,
                         stats.video_packets_received, stats.video_frames_received,
-                        stats.video_frames_decoded
+                        stats.video_frames_decoded, stats.rtp_arrivals
                     );
                     result.packets_sent = stats.packets_sent;
                     result.packets_received = stats.packets_received;

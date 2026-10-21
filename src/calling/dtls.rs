@@ -156,7 +156,14 @@ pub async fn handshake_srtp(
     .await
     .context("DTLS key export timed out")?
     .context("DTLS key export failed")?;
-    let _ = dc.close().await;
+    // Keep the DTLS connection ALIVE for the call's life: a close here
+    // sends close_notify, and Chrome marks the transport dtlsState=closed
+    // — it then neither encrypts its own RTP nor decrypts ours (live
+    // 2026-10-21, browser video round: ICE connected, senders active,
+    // zero media both directions; webrtc-internals showed the closed
+    // transport). The connection is idle after key export (no internal
+    // tasks); forgetting it leaks nothing but the object.
+    std::mem::forget(dc);
 
     // RFC 5764 §4.2: client_key || server_key || client_salt || server_salt
     // (AES_CM_128_HMAC_SHA1_80: 16-byte keys, 14-byte salts).
