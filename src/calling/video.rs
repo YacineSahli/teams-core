@@ -68,7 +68,11 @@ impl VideoFrame {
             f *= 2;
         }
         if f == 1 {
-            return self.clone();
+            // Odd dimensions (a 1921x1080 portal capture) never hit an
+            // even factor — nearest-neighbor resample instead of
+            // bypassing the cap (the bypass re-triggered the software-GL
+            // starvation the cap shipped to fix).
+            return self.resampled(max_w);
         }
         let (w, h) = (self.width as usize, self.height as usize);
         let (ow, oh) = (w / f as usize, h / f as usize);
@@ -110,6 +114,39 @@ impl VideoFrame {
         VideoFrame {
             width: ow as u32,
             height: oh as u32,
+            data: out,
+        }
+    }
+
+    /// Nearest-neighbor resample to at most `max_w` wide (aspect kept).
+    fn resampled(&self, max_w: u32) -> Self {
+        let nw = max_w.min(self.width);
+        let nh = ((self.height as u64 * nw as u64) / self.width as u64).max(1) as u32;
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (ow, oh) = (nw as usize, nh as usize);
+        let (y, uv) = self.data.split_at(w * h);
+        let (u, v) = uv.split_at(w * h / 4);
+        let mut out = vec![0u8; ow * oh * 3 / 2];
+        let (oy, ouv) = out.split_at_mut(ow * oh);
+        let (ou, ov) = ouv.split_at_mut(ow * oh / 4);
+        for row in 0..oh {
+            let sy = row * h / oh;
+            for col in 0..ow {
+                oy[row * ow + col] = y[sy * w + col * w / ow];
+            }
+        }
+        for row in 0..oh / 2 {
+            let su = row * (h / 2) / (oh / 2);
+            for col in 0..ow / 2 {
+                let i = su * (w / 2) + col * (w / 2) / (ow / 2);
+                let d = row * (ow / 2) + col;
+                ou[d] = u[i];
+                ov[d] = v[i];
+            }
+        }
+        VideoFrame {
+            width: nw,
+            height: nh,
             data: out,
         }
     }
@@ -392,6 +429,14 @@ mod downscale_tests {
         // Small frames pass through untouched (same dims).
         let small = VideoFrame { width: 320, height: 240, data: vec![16; 320 * 240 * 3 / 2] };
         assert_eq!(small.downscaled(640).width, 320);
+        // Odd widths still cap (nearest-neighbor fallback — the even-
+        // factor loop used to bypass the cap entirely).
+        let odd = VideoFrame { width: 1921, height: 1080, data: vec![16; 1921 * 1080 * 3 / 2] };
+        let d = odd.downscaled(640);
+        assert_eq!(d.width, 640);
+        let expect_h = ((1080u64 * 640) / 1921) as u32; // floor aspect
+        assert_eq!(d.height, expect_h);
+        assert_eq!(d.data.len(), (640 * expect_h as usize * 3 / 2));
     }
 }
 
