@@ -1227,21 +1227,37 @@ pub async fn run_call_with_controls(
         }
     }
 
-    // 12. End call
-    let end_url = acceptance.end_url.clone().or_else(|| {
-        acceptance.call_leg_url.as_ref().map(|u| {
-            // Insert /end before query string: .../path?q=x -> .../path/end?q=x
-            if let Some(idx) = u.find('?') {
-                format!("{}/end{}", &u[..idx], &u[idx..])
-            } else {
-                format!("{}/end", u)
+    // 12. End call — try every termination link in turn. The
+    // acceptance's links/end 404s on connected consumer calls (live):
+    // without a working end the CC holds the session open to its ~2h
+    // cap and the peer's history shows multi-hour durations.
+    let mut ended = false;
+    if let Some(ref url) = acceptance.end_url.as_ref() {
+        if end_call_by_url(&http, skype_token_str, url).await.is_ok() {
+            ended = true;
+        }
+    }
+    if !ended {
+        if let Some(leg) = acceptance.call_leg_url.as_ref() {
+            // .../path?q=x -> .../path/end?q=x
+            let leg_end = match leg.find('?') {
+                Some(idx) => format!("{}/end{}", &leg[..idx], &leg[idx..]),
+                None => format!("{leg}/end"),
+            };
+            if end_call_by_url(&http, skype_token_str, &leg_end).await.is_ok() {
+                ended = true;
             }
-        })
-    });
-    if let Some(ref url) = end_url {
-        end_call_by_url(&http, skype_token_str, url).await.ok();
-    } else {
-        tracing::warn!("No end URL or call_leg_url available — cannot hang up");
+        }
+    }
+    if !ended {
+        if let Some(leave) = phase1_conversation_leave(&phase1.response_body) {
+            if leave_call_by_url(&http, skype_token_str, &leave).await.is_ok() {
+                ended = true;
+            }
+        }
+    }
+    if !ended {
+        tracing::warn!("no hang-up link worked — the CC session will cap out server-side");
     }
 
     // 13. Analyze echo and collect stats
@@ -2939,6 +2955,33 @@ fn extract_json_from_frame(frame: &str) -> Option<&str> {
 }
 
 /// End a call by posting to a specific end URL.
+/// Pull the conversation `leave` link out of a create-response body.
+fn phase1_conversation_leave(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.pointer("/links/leave")
+        .or_else(|| v.pointer("/_links/leave"))
+        .and_then(|u| u.as_str())
+        .map(str::to_string)
+}
+
+/// POST the conversation-service leave link (final hang-up fallback).
+async fn leave_call_by_url(http: &reqwest::Client, skype_token: &str, leave_url: &str) -> Result<()> {
+    tracing::info!("Leaving conversation -> POST {}", leave_url);
+    let resp = http
+        .post(leave_url)
+        .header("X-Skypetoken", skype_token)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({}))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .context("Failed to POST leave")?;
+    let status = resp.status();
+    tracing::info!("Leave conversation ({}): {}", status, "");
+    anyhow::ensure!(status.is_success(), "leave POST rejected: {status}");
+    Ok(())
+}
+
 async fn end_call_by_url(http: &reqwest::Client, skype_token: &str, end_url: &str) -> Result<()> {
     tracing::info!("Ending call -> POST {}", end_url);
 
@@ -2954,7 +2997,15 @@ async fn end_call_by_url(http: &reqwest::Client, skype_token: &str, end_url: &st
 
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
-    tracing::info!("Call ended ({}): {}", status, body);
+    tracing::info!("Call ended ({}): {}", status, &body.chars().take(300).collect::<String>());
+    if !status.is_success() {
+        // A failed end-POST leaves the session open server-side until
+        // its ~2h cap — the other side's history then shows multi-hour
+        // durations (live 2026-10-21: acceptance links/end 404s on
+        // connected calls). Surface the failure so the fallback chain
+        // can try the next link.
+        anyhow::bail!("end POST rejected: {status}");
+    }
 
     Ok(())
 }
