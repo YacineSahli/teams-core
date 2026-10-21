@@ -473,6 +473,26 @@ impl VideoPacketizer {
         }
     }
 
+    /// Track the ACTIVE encode parameters in the PACSI Stream Layout
+    /// metadata. The packetizer starts at the 320x240/256kbps default;
+    /// call this on every encoder (RE)init — a 720p share announced as
+    /// 320x240 lies to receivers about the stream (run-14 adversarial
+    /// finding). Display dims follow coded dims (no cropping).
+    pub fn set_stream_layout(&mut self, coded_w: u16, coded_h: u16, bitrate: u32) {
+        self.svc_config = SvcConfig {
+            coded_width: coded_w,
+            coded_height: coded_h,
+            display_width: coded_w,
+            display_height: coded_h,
+            bitrate,
+            ..Self::default_svc_config()
+        };
+    }
+
+    fn default_svc_config() -> SvcConfig {
+        SvcConfig::default()
+    }
+
     /// Packetize a single H.264 access unit (frame) consisting of multiple NAL units.
     ///
     /// Wraps the frame in X-H264UC SVC containers:
@@ -1074,6 +1094,29 @@ mod tests {
         let pacsi2 = &pkts2[0][12..];
         let cnt2 = pacsi2[bi_offset + 18];
         assert_eq!(cnt2, cnt1.wrapping_add(1)); // incremented by 1
+    }
+
+    /// The packetizer's Stream Layout follows encoder (re)inits: a 720p
+    /// share re-init must announce 1280x720/3072kbps in the PACSI, not
+    /// the 320x240/256kbps default (run-14 adversarial finding).
+    #[test]
+    fn set_stream_layout_tracks_reinit() {
+        let mut p = VideoPacketizer::new(1234);
+        assert_eq!(p.svc_config.coded_width, 320);
+        p.set_stream_layout(1280, 720, 3_072_000);
+        assert_eq!(p.svc_config.coded_width, 1280);
+        assert_eq!(p.svc_config.coded_height, 720);
+        assert_eq!(p.svc_config.display_width, 1280);
+        assert_eq!(p.svc_config.display_height, 720);
+        assert_eq!(p.svc_config.bitrate, 3_072_000);
+        // 15 fps idx and constrained baseline survive the update.
+        assert_eq!(p.svc_config.fps_idx, 2);
+        assert!(p.svc_config.constrained_baseline);
+        // The SEI itself carries the new dims/bitrate.
+        let sei = build_stream_layout_sei(&p.svc_config);
+        assert_eq!(&sei[28..30], &1280u16.to_be_bytes());
+        assert_eq!(&sei[30..32], &720u16.to_be_bytes());
+        assert_eq!(&sei[36..40], &3_072_000u32.to_be_bytes());
     }
 
     #[test]

@@ -36,9 +36,16 @@ pub struct SdpVideoInfo {
 ///
 /// The blob may be compressed (auf::compress with raw DEFLATE + base64 encoding).
 /// This function automatically decompresses if needed via `sdp_compress::decompress_sdp`.
+/// The offer as plain SDP, decompressing when needed (idempotent on
+/// plain text). Call this ONCE at entry and hand the result to every
+/// raw-blob helper — decompressing only inside [`parse_sdp_offer`] left
+/// the bundle/video/mid helpers reading compressed bytes.
+pub fn ensure_plain_sdp(blob: &str) -> String {
+    super::sdp_compress::decompress_sdp(blob).unwrap_or_else(|_| blob.to_string())
+}
+
 pub fn parse_sdp_offer(blob: &str) -> Result<SdpOfferInfo> {
-    let blob = super::sdp_compress::decompress_sdp(blob).unwrap_or_else(|_| blob.to_string());
-    let mut ice_ufrag = String::new();
+    let blob = ensure_plain_sdp(blob);    let mut ice_ufrag = String::new();
     let mut ice_pwd = String::new();
     let mut crypto_line = String::new();
     let mut crypto_lines = Vec::new();
@@ -996,6 +1003,61 @@ pub fn video_payload_types(blob: &str) -> Vec<u8> {
 /// The mid1 video section of a BUNDLE answer: same transport as audio
 /// (same port, credentials, candidates — JSEP BUNDLE), the offer's H264
 /// payload echoed, direction mirrored from the offer.
+/// The a=mid value of the first m=<kind> section in an SDP blob (mids
+/// belong to the OFFER; answers must echo them per JSEP).
+pub fn section_mid(blob: &str, kind: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in blob.lines() {
+        if let Some(rest) = line.strip_prefix("m=") {
+            in_section = rest.starts_with(kind);
+        } else if in_section {
+            if let Some(mid) = line.strip_prefix("a=mid:") {
+                return Some(mid.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Re-align a BUNDLE answer's mids to the OFFER's real mids (JSEP: the
+/// answer echoes the offer's mids; a mid-mismatched peer rejects the
+/// answer). Our answer builders hardcode a=mid:0/1 — true for every
+/// captured Teams web shape, but a peer that offers different mids (e.g.
+/// audio=3 video=7) gets 0/1 today. Pure post-processing: rewrites the
+/// audio section's mid, the video answer section's mid and the
+/// a=group:BUNDLE line. Offers without mids leave the answer untouched.
+pub fn align_answer_mids_to_offer(answer: &str, offer: &str) -> String {
+    let Some(audio_mid) = section_mid(offer, "audio") else {
+        return answer.to_string();
+    };
+    let video_mid = section_mid(offer, "video");
+    let mut out = answer.to_string();
+    // The group line references both mids; rebuild it first so the
+    // section rewrites can't break its match.
+    if let Some(v) = video_mid.as_deref() {
+        if let Some(i) = out.find("a=group:BUNDLE") {
+            let end = out[i..].find("\r\n").map(|e| i + e + 2).unwrap_or(out.len());
+            out.replace_range(
+                i..end,
+                &format!("a=group:BUNDLE {audio_mid} {v}\r\n"),
+            );
+        }
+    }
+    // Audio section: everything before the video m-line.
+    if let Some(vi) = out.find("m=video") {
+        let head = out[..vi].replacen("a=mid:0\r\n", &format!("a=mid:{audio_mid}\r\n"), 1);
+        let tail = if let Some(v) = video_mid.as_deref() {
+            out[vi..].replacen("a=mid:1\r\n", &format!("a=mid:{v}\r\n"), 1)
+        } else {
+            out[vi..].to_string()
+        };
+        out = format!("{head}{tail}");
+    } else {
+        out = out.replacen("a=mid:0\r\n", &format!("a=mid:{audio_mid}\r\n"), 1);
+    }
+    out
+}
+
 pub fn bundle_video_answer_section(
     local_ip: &str,
     port: u16,
@@ -1646,6 +1708,33 @@ mod hostile_sdp_tests {
         }
         // All-empty payload lists are fine (Vec::new).
         assert!(video_payload_types("m=x-data 1 RTP/SAVP 127\r\n").is_empty());
+    }
+
+    /// JSEP mid echo: the answer must carry the OFFER's real mids — the
+    /// builders hardcode 0/1 (every captured web shape), a peer offering
+    /// e.g. audio=3/video=7 gets aligned mids AND a matching group line.
+    #[test]
+    fn answer_mids_echo_the_offer() {
+        let answer = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\na=group:BUNDLE 0 1\r\nm=audio 40000 RTP/SAVP 0\r\na=mid:0\r\na=sendrecv\r\nm=video 40000 RTP/SAVP 102\r\na=mid:1\r\na=sendrecv\r\n";
+        // Standard web shape (0/1): byte-identical.
+        let standard = "v=0\r\nm=audio 1 RTP/SAVP 0\r\na=mid:0\r\nm=video 1 RTP/SAVP 102\r\na=mid:1\r\n";
+        assert_eq!(align_answer_mids_to_offer(answer, standard), answer);
+        // Creative mids: both sections + the group line follow the offer.
+        let creative = "v=0\r\nm=audio 1 RTP/SAVP 0\r\na=mid:3\r\nm=video 1 RTP/SAVP 102\r\na=mid:7\r\n";
+        let aligned = align_answer_mids_to_offer(answer, creative);
+        assert!(aligned.contains("a=group:BUNDLE 3 7\r\n"));
+        assert!(aligned.contains("a=mid:3\r\n"));
+        assert!(aligned.contains("a=mid:7\r\n"));
+        assert!(!aligned.contains("a=mid:0\r\n"));
+        assert!(!aligned.contains("a=mid:1\r\n"));
+        // Offer with no mids at all: answer untouched.
+        let midless = "v=0\r\nm=audio 1 RTP/SAVP 0\r\nm=video 1 RTP/SAVP 102\r\n";
+        assert_eq!(align_answer_mids_to_offer(answer, midless), answer);
+        // Audio-only answer (no video section): only the audio mid moves.
+        let audio_only = "v=0\r\nm=audio 40000 RTP/SAVP 0\r\na=mid:0\r\na=sendrecv\r\n";
+        let aligned_audio = align_answer_mids_to_offer(audio_only, creative);
+        assert!(aligned_audio.contains("a=mid:3\r\n"));
+        assert!(!aligned_audio.contains("a=mid:0\r\n"));
     }
 
     /// The audio-only call shape: strip_video_mline removes the video

@@ -172,8 +172,23 @@ pub async fn answer_call_with_stop(
     let mut dtls_client: Option<bool> = None;
     if let Some(ref inv) = notification.call_invitation {
         if let Some(ref mc) = inv.media_content {
-            if let Some(ref blob) = mc.blob {
-                match sdp::parse_sdp_offer(blob) {
+            if let Some(ref raw_blob) = mc.blob {
+                // Decompress AT ENTRY: parse_sdp_offer decompresses
+                // internally, but every raw-blob helper around it (bundle
+                // detection, first-video section, payload types, reject
+                // stubs, mid alignment) reads plain SDP — a compressed
+                // offer reaching those as raw bytes silently degraded to
+                // an audio-only answer (run-14 adversarial finding).
+                // Idempotent on plain text.
+                let blob = sdp::ensure_plain_sdp(raw_blob.as_str());
+                if blob != *raw_blob {
+                    tracing::info!(
+                        "Offer SDP decompressed at entry ({} -> {} bytes)",
+                        raw_blob.len(),
+                        blob.len()
+                    );
+                }
+                match sdp::parse_sdp_offer(&blob) {
                     Ok(offer_info) => {
                         let local_ip = sdp::get_local_ip();
                         let remote_audio_crypto = offer_info
@@ -213,9 +228,9 @@ pub async fn answer_call_with_stop(
                         // forces the stub path for A/B debugging.
                         let offer_dtls = blob.contains("a=fingerprint");
                         let offered_video =
-                            sdp::parse_first_video_section(blob).filter(|_| video);
+                            sdp::parse_first_video_section(&blob).filter(|_| video);
                         let bundle_video = offer_dtls
-                            && sdp::offer_is_bundle(blob)
+                            && sdp::offer_is_bundle(&blob)
                             && offered_video.is_some()
                             && std::env::var("TEAMSFAST_NO_VIDEO_ANSWER").as_deref() != Ok("1");
 
@@ -238,7 +253,7 @@ pub async fn answer_call_with_stop(
                                 .next()
                                 .unwrap_or(&sdp_out)
                                 .to_string();
-                            sdp_out = audio_part + &reject_stub_sections(blob);
+                            sdp_out = audio_part + &reject_stub_sections(&blob);
                             dtls_client = Some(true);
                         }
                         let dummy_mat = || srtp::SrtpKeyingMaterial {
@@ -254,7 +269,7 @@ pub async fn answer_call_with_stop(
                         if let (Some(local_mat), Some(remote_mat)) =
                             (local_mat, remote_mat)
                         {
-                            let candidates = ice::parse_candidates_from_sdp(blob);
+                            let candidates = ice::parse_candidates_from_sdp(&blob);
                             if candidates
                                 .iter()
                                 .any(|c| c.transport == ice::Transport::Udp && c.component == 1)
@@ -292,7 +307,7 @@ pub async fn answer_call_with_stop(
                                 let vid = offered_video.as_ref().expect("checked above");
                                 media::VideoSessionConfig {
                                     send_payload_type: vid.payload_type,
-                                    recv_payload_types: sdp::video_payload_types(blob),
+                                    recv_payload_types: sdp::video_payload_types(&blob),
                                     camera_on: controls.as_ref().map(|c| c.camera_on.clone()),
                                     camera_source: controls
                                         .as_ref()
@@ -347,13 +362,13 @@ pub async fn answer_call_with_stop(
                                                     ),
                                                 );
                                                 sdp_out.push_str(
-                                                    &reject_stub_sections_after_audio(blob, true),
+                                                    &reject_stub_sections_after_audio(&blob, true),
                                                 );
                                                 tracing::info!(
                                                     "BUNDLE video answered: PT {} dir {} ({} recv PTs)",
                                                     vid.payload_type,
                                                     vid.answer_direction(),
-                                                    sdp::video_payload_types(blob).len()
+                                                    sdp::video_payload_types(&blob).len()
                                                 );
                                             }
                                         }
@@ -371,7 +386,12 @@ pub async fn answer_call_with_stop(
                             &http,
                             skype_token_str,
                             notification,
-                            &sdp_out,
+                            // JSEP: the answer echoes the OFFER's mids —
+                            // ours are hardcoded 0/1 (true for every
+                            // captured web shape); align so a
+                            // mid-creative peer still matches. Applies to
+                            // audio-only answers too.
+                            &sdp::align_answer_mids_to_offer(&sdp_out, &blob),
                         )
                         .await
                         {

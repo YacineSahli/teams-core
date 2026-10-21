@@ -356,6 +356,15 @@ async fn video_send_loop_shared(
                                 f.width,
                                 f.height
                             );
+                            // Keep the PACSI Stream Layout metadata in
+                            // step with the (re)init — it must announce
+                            // the real dims/bitrate, not the 320x240
+                            // default the packetizer starts with.
+                            packetizer.set_stream_layout(
+                                f.width.min(u16::MAX as u32) as u16,
+                                f.height.min(u16::MAX as u32) as u16,
+                                kbps * 1000,
+                            );
                             encoder = Some(enc);
                         }
                         Err(e) => {
