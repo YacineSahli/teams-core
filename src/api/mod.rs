@@ -9,7 +9,6 @@ pub mod client;
 pub(crate) mod fake_transport;
 mod files;
 mod filesearch;
-mod graph;
 mod me;
 pub mod media;
 mod notes;

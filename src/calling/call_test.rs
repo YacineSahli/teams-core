@@ -271,7 +271,7 @@ pub async fn run_call_with_controls(
     use_camera: bool,
     use_display: bool,
     tone_mode: bool,
-    mut stop: tokio::sync::watch::Receiver<bool>,
+    stop: tokio::sync::watch::Receiver<bool>,
     mut controls: Option<CallControls>,
 ) -> Result<CallTestResult> {
     let config = Config::load_cached().context("Failed to load config")?;
@@ -1388,47 +1388,6 @@ impl MediaLegHandles {
             h.abort();
         }
     }
-}
-
-/// Set up a media leg: parse remote SDP, create SRTP contexts, run ICE checks.
-///
-/// `local_audio_crypto_line` / `local_video_crypto_line` are the crypto lines from our SDP
-/// for this leg. `remote_sdp` is the SDP from the other side (the answer for outgoing,
-/// or the notification offer for incoming).
-async fn setup_media_leg(
-    local_audio_crypto_line: &str,
-    local_video_crypto_line: &str,
-    local_audio_ufrag: &str,
-    local_audio_pwd: &str,
-    local_video_ufrag: &str,
-    local_video_pwd: &str,
-    remote_sdp: &str,
-    audio_socket: tokio::net::UdpSocket,
-    video_socket: tokio::net::UdpSocket,
-    label: &str,
-    controlling: bool,
-    video_ssrc: u32,
-    audio_ssrc: u32,
-    dtls_server: bool,
-) -> Result<MediaLeg> {
-    setup_media_leg_ext(
-        local_audio_crypto_line,
-        local_video_crypto_line,
-        local_audio_ufrag,
-        local_audio_pwd,
-        local_video_ufrag,
-        local_video_pwd,
-        remote_sdp,
-        audio_socket,
-        video_socket,
-        label,
-        controlling,
-        video_ssrc,
-        audio_ssrc,
-        dtls_server,
-        false,
-    )
-    .await
 }
 
 /// [`setup_media_leg`] with an explicit BUNDLE flag (consumer video
@@ -3115,35 +3074,6 @@ async fn fetch_me(http: &reqwest::Client, graph_token: &str) -> Result<MeRespons
         anyhow::bail!("Graph /me returned {}: {}", status, body);
     }
     resp.json().await.context("Failed to parse /me response")
-}
-
-/// Write PCM i16 samples to a WAV file (mono, given sample rate).
-fn write_wav(path: &str, samples: &[i16], sample_rate: u32) -> anyhow::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
-    let data_len = (samples.len() * 2) as u32;
-    let file_len = 36 + data_len;
-    // RIFF header
-    f.write_all(b"RIFF")?;
-    f.write_all(&file_len.to_le_bytes())?;
-    f.write_all(b"WAVE")?;
-    // fmt chunk
-    f.write_all(b"fmt ")?;
-    f.write_all(&16u32.to_le_bytes())?; // chunk size
-    f.write_all(&1u16.to_le_bytes())?; // PCM format
-    f.write_all(&1u16.to_le_bytes())?; // mono
-    f.write_all(&sample_rate.to_le_bytes())?; // sample rate
-    let byte_rate = sample_rate * 2;
-    f.write_all(&byte_rate.to_le_bytes())?; // byte rate
-    f.write_all(&2u16.to_le_bytes())?; // block align
-    f.write_all(&16u16.to_le_bytes())?; // bits per sample
-                                        // data chunk
-    f.write_all(b"data")?;
-    f.write_all(&data_len.to_le_bytes())?;
-    for &s in samples {
-        f.write_all(&s.to_le_bytes())?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -338,16 +338,6 @@ fn html_escape(text: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// Prose escape for `<p>` bodies: escape, then turn newlines into `<br>`.
-/// A literal `\n` inside `<p>` is whitespace per HTML — other clients
-/// (and our own block-noise collapsing) flatten it to a space — so the
-/// wire must carry explicit breaks. `<pre>` interiors keep raw newlines.
-fn prose_html(text: &str) -> String {
-    html_escape(text)
-        .replace("\r\n", "\n")
-        .replace('\n', "<br>")
-}
-
 /// Inline composer markers → wire HTML, one LINE at a time (markers do
 /// not span lines; an unclosed run stays literal so the author sees it).
 /// Supported shapes, chosen to round-trip with the client renderer AND
@@ -2025,17 +2015,6 @@ struct ThreadMember {
 #[derive(Debug, Deserialize)]
 struct ThreadMembersResponse {
     members: Option<Vec<ThreadMember>>,
-}
-
-/// Member MRIs for one thread (read-only). Errors (404 on system
-/// threads like `48:notes`, network) propagate to the caller, which
-/// falls back to sender/label naming — never fatal to the list.
-/// Public roster read (the call stack's consumer peer resolver).
-pub async fn thread_member_mris_pub(
-    client: &TeamsClient,
-    thread_id: &str,
-) -> Result<Vec<String>> {
-    thread_member_mris(client, thread_id).await
 }
 
 async fn thread_member_mris(client: &TeamsClient, thread_id: &str) -> Result<Vec<String>> {
