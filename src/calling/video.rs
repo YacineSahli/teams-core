@@ -10,6 +10,9 @@ use anyhow::{bail, Result};
 /// H.264 payload type (dynamic, matching our SDP).
 pub const PT_H264: u8 = 122;
 
+/// STAP-A aggregation NAL type (RFC 6184).
+pub const NAL_TYPE_STAP_A: u8 = 24;
+
 /// A raw I420 video frame handed across the embedder boundary (decoded
 /// remote video, or the local camera preview). Deliberately feature-gate
 /// free so call controls can reference it unconditionally.
@@ -572,6 +575,9 @@ pub struct VideoDepacketizer {
     fu_buffer: Vec<u8>,
     /// Whether we are currently reassembling a FU-A NAL.
     fu_in_progress: bool,
+    /// NALs decoded from a STAP-A aggregation, pending delivery (one
+    /// NAL per depacketize call).
+    pending: std::collections::VecDeque<Vec<u8>>,
     /// Stats
     pub frames_received: u64,
     pub nals_received: u64,
@@ -582,6 +588,7 @@ impl VideoDepacketizer {
         Self {
             fu_buffer: Vec::new(),
             fu_in_progress: false,
+            pending: std::collections::VecDeque::new(),
             frames_received: 0,
             nals_received: 0,
         }
@@ -596,6 +603,16 @@ impl VideoDepacketizer {
             bail!("empty RTP payload");
         }
 
+        // STAP-A aggregates several NALs in one packet — deliver them one
+        // per call from the pending queue.
+        if let Some(nal) = self.pending.pop_front() {
+            self.nals_received += 1;
+            if marker && self.pending.is_empty() {
+                self.frames_received += 1;
+            }
+            return Ok(Some(nal));
+        }
+
         let nal_type = rtp_payload[0] & 0x1F;
 
         match nal_type {
@@ -607,13 +624,38 @@ impl VideoDepacketizer {
                 }
                 Ok(Some(rtp_payload.to_vec()))
             }
+            NAL_TYPE_STAP_A => self.depacketize_stap_a(rtp_payload, marker),
             NAL_TYPE_FU_A => self.depacketize_fu_a(rtp_payload, marker),
             _ => {
-                // STAP-A (24), STAP-B (25), MTAP (26,27), FU-B (29) — not implemented
+                // STAP-B (25), MTAP (26,27), FU-B (29) — not implemented
                 tracing::debug!("Unsupported NAL aggregation type: {}", nal_type);
                 Ok(None)
             }
         }
+    }
+
+    /// STAP-A (RFC 6184 §5.7.1): payload is (16-bit NAL size || NAL byte
+    /// string)* after the aggregation header. Chrome bundles SPS+PPS
+    /// (and small SEIs) this way; dropping them starves the decoder of
+    /// parameter sets (live 2026-10-21: browser video decrypted fine,
+    /// 0 frames decoded).
+    fn depacketize_stap_a(&mut self, rtp_payload: &[u8], marker: bool) -> Result<Option<Vec<u8>>> {
+        let mut off = 1; // skip the STAP-A NAL header byte
+        while off + 2 <= rtp_payload.len() {
+            let len = u16::from_be_bytes([rtp_payload[off], rtp_payload[off + 1]]) as usize;
+            off += 2;
+            if len == 0 || off + len > rtp_payload.len() {
+                bail!("malformed STAP-A size field");
+            }
+            self.pending.push_back(rtp_payload[off..off + len].to_vec());
+            off += len;
+        }
+        let first = self.pending.pop_front();
+        self.nals_received += 1;
+        if marker && self.pending.is_empty() {
+            self.frames_received += 1;
+        }
+        Ok(first)
     }
 
     fn depacketize_fu_a(&mut self, payload: &[u8], marker: bool) -> Result<Option<Vec<u8>>> {
@@ -1012,5 +1054,39 @@ mod tests {
 
         // PRID=0, CB=1 -> byte = 0x02
         assert_eq!(sei[41], 0x02);
+    }
+}
+
+#[cfg(test)]
+mod stap_a_tests {
+    use super::*;
+
+    /// Chrome bundles SPS+PPS (and small SEIs) into STAP-A; the
+    /// depacketizer must yield them one per call (live 2026-10-21: 0
+    /// frames decoded from browser video until this existed).
+    #[test]
+    fn stap_a_yields_each_embedded_nal() {
+        let sps = vec![0x67u8, 0x42, 0xC0, 0x1F];
+        let pps = vec![0x68u8, 0xCE, 0x3C, 0x80];
+        let mut payload = vec![24u8]; // STAP-A header (NAL type 24)
+        for nal in [&sps, &pps] {
+            payload.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            payload.extend_from_slice(nal);
+        }
+        let mut d = VideoDepacketizer::new();
+        let first = d.depacketize(&payload, false).unwrap().expect("first NAL");
+        assert_eq!(first, sps);
+        let second = d.depacketize(&payload, true).unwrap().expect("second NAL");
+        assert_eq!(second, pps);
+        // A frame completes only on the marker-bearing NAL delivery.
+        assert_eq!(d.frames_received, 1);
+        assert_eq!(d.nals_received, 2);
+    }
+
+    #[test]
+    fn stap_a_malformed_size_does_not_panic() {
+        let payload = vec![24u8, 0x00, 0xFF, 0x01]; // size 255 > remaining
+        let mut d = VideoDepacketizer::new();
+        assert!(d.depacketize(&payload, false).is_err());
     }
 }

@@ -1172,6 +1172,19 @@ async fn recv_loop_with_stun(
                 match srtp::unprotect(&mut ctx, data) {
                     Ok(rtp_data) => {
                         if let Ok(pkt) = rtp::decode(&rtp_data) {
+                            // Strict payload-type routing when a video plane
+                            // exists: video set -> pipeline, PCMU -> speaker,
+                            // anything else (rtx, telephone events) dropped —
+                            // playing video bytes as audio is garbage noise.
+                            if video_demux.is_some() && pkt.payload_type != rtp::PT_PCMU {
+                                let is_video = video_demux
+                                    .as_ref()
+                                    .map(|(pts, _)| pts.contains(&pkt.payload_type))
+                                    .unwrap_or(false);
+                                if !is_video {
+                                    continue;
+                                }
+                            }
                             // BUNDLE video plane: demux by payload type.
                             if let Some((pts, pipeline)) = video_demux.as_mut() {
                                 if pts.contains(&pkt.payload_type) {

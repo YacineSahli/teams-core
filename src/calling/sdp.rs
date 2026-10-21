@@ -947,11 +947,24 @@ pub fn video_payload_types(blob: &str) -> Vec<u8> {
         return Vec::new();
     };
     let line_end = blob[start..].find("\r\n").map(|i| start + i).unwrap_or(blob.len());
-    blob[start..line_end]
+    let pts: Vec<u8> = blob[start..line_end]
         .split_whitespace()
         .skip(3) // "m=video", port, proto
         .filter_map(|pt| pt.parse::<u8>().ok())
-        .collect()
+        .collect();
+    // Exclude rtx PTs (a=rtpmap:<pt> rtx/…) — they are retransmission
+    // wrappers, not decodable media; the web pairs every codec with one.
+    let rtx: Vec<u8> = blob[start..]
+        .lines()
+        .take_while(|l| !l.trim_start().starts_with("m=") || l.trim_start().starts_with("m=video"))
+        .filter_map(|l| {
+            let l = l.trim();
+            let rest = l.strip_prefix("a=rtpmap:")?;
+            let pt = rest.split(' ').next()?.parse::<u8>().ok()?;
+            rest.split(' ').nth(1)?.starts_with("rtx/").then_some(pt)
+        })
+        .collect();
+    pts.into_iter().filter(|pt| !rtx.contains(pt)).collect()
 }
 
 /// The mid1 video section of a BUNDLE answer: same transport as audio
