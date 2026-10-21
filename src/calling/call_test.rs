@@ -732,6 +732,16 @@ pub async fn run_call_with_controls(
                         tracing::warn!("ringback: 120s deadline reached — stopping");
                         break;
                     }
+                    // Sender gone = the call task RETURNED (failed
+                    // placement, rejection, acceptance-without-SDP) — the
+                    // watch then forever serves its LAST value (Ringing),
+                    // so the liveness check must be explicit or the tone
+                    // ghosts on for up to 120s after the UI is gone
+                    // (user-reported: ringing continues after the callee
+                    // answered / the call died).
+                    if watch.has_changed().is_err() {
+                        break;
+                    }
                     if *watch.borrow_and_update() != CallPhase::Ringing {
                         break;
                     }
