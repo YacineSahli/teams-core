@@ -2051,7 +2051,9 @@ fn spawn_media_leg(
                     }
                 };
                 let remote = *dynamic_remote.lock().await;
-                let _ = socket.send_to(&protected, remote).await;
+                if socket.send_to(&protected, remote).await.is_ok() {
+                    tracing::debug!("PLI sent (media ssrc {media_ssrc:#010x})");
+                }
             }
         }));
     }
