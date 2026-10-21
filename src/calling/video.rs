@@ -715,6 +715,17 @@ impl VideoDepacketizer {
         let nal_type = fu_header & 0x1F;
         let nri = fu_indicator & 0x60;
 
+        // FU-A forensics (debug): IDR slices are ALWAYS FU-A at these
+        // sizes; a systematically-dropped start fragment is invisible
+        // without this (silent Ok(None) discard path below).
+        if nal_type == 5 || tracing::enabled!(tracing::Level::TRACE) {
+            tracing::debug!(
+                "FU-A: type={nal_type} start={is_start} end={is_end} in_progress={} len={}",
+                self.fu_in_progress,
+                payload.len()
+            );
+        }
+
         if is_start {
             // Reconstruct the NAL header byte
             let nal_header = (fu_indicator & 0x80) | nri | nal_type;
