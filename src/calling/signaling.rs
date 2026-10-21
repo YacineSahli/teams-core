@@ -1560,130 +1560,28 @@ pub async fn create_1to1_call_modalities(
     callee_mri: Option<&str>,
     include_video: bool,
 ) -> Result<(ConversationCreated, ConversationJoined)> {
-    // Consumer: the DECLARED endpoint must be the main session's
-    // REGISTERED epid — the call controller resolves endpoint-addressed
-    // deliveries (the acceptance notification) against the registrar; a
-    // random per-call id has no registration and the acceptance aborts
-    // (live: 412/430/10065 "Delivering call acceptance notification").
-    let declared_epid = if params.consumer {
-        crate::trouter::current_epid().unwrap_or_else(|| params.endpoint_id.to_string())
-    } else {
-        params.endpoint_id.to_string()
-    };
-    let tc = |path: &str| trouter_callback(params.trouter_surl, &declared_epid, path);
-    let cause_id = &params.message_id[..8.min(params.message_id.len())];
+    let callees: Vec<&str> = callee_mri.into_iter().collect();
+    create_call_modalities_n(http, epconv_url, params, sdp_offer, &callees, include_video).await
+}
 
-    let payload = serde_json::json!({
-        "conversationRequest": {
-            "conversationType": null,
-            "subject": "",
-            "suppressDialout": false,  // false = ring the callee
-            "roster": {
-                "type": "Delta",
-                "rosterUpdate": tc("conversation/rosterUpdate/")
-            },
-            "properties": {
-                "allowConversationWithoutHost": true,
-                "enableGroupCallEventMessages": true,
-                "enableGroupCallUpgradeMessage": false,
-                "enableGroupCallMeetupGeneration": false
-            },
-            "links": {
-                "conversationEnd": tc("conversation/conversationEnd/"),
-                "conversationUpdate": tc("conversation/conversationUpdate/"),
-                "localParticipantUpdate": tc("conversation/localParticipantUpdate/"),
-                "addParticipantSuccess": tc("conversation/addParticipantSuccess/"),
-                "addParticipantFailure": tc("conversation/addParticipantFailure/"),
-                "addModalitySuccess": tc("conversation/addModalitySuccess/"),
-                "addModalityFailure": tc("conversation/addModalityFailure/"),
-                "confirmUnmute": tc("conversation/confirmUnmute/"),
-                "receiveMessage": tc("conversation/receiveMessage/")
-            }
-        },
-        "groupContext": null,
-        // Consumer 1:1s create WITHOUT a group thread (web shape, HAR
-        // 2026-10-20: groupChat=null in cpconv). A thread here makes the
-        // CC build a GROUP call (isMultiParty=true, groupCallInitiator)
-        // whose acceptance waits on group-call acknowledgement machinery
-        // and times out 408/10056 (live, rig↔rig same day).
-        "groupChat": if params.consumer {
-            serde_json::json!(null)
-        } else {
-            serde_json::json!({
-                "threadId": params.thread_id,
-                "messageId": null
-            })
-        },
-        "participants": {
-            "from": {
-                "id": params.caller_mri,
-                "displayName": params.caller_display_name,
-                "endpointId": declared_epid,
-                "participantId": params.participant_id,
-                "languageId": "en-US"
-            },
-            "to": callee_mri
-                .map(|mri| {
-                    serde_json::json!([{
-                        "id": mri,
-                        "participantId": uuid::Uuid::new_v4().to_string()
-                    }])
-                })
-                .unwrap_or_else(|| serde_json::json!([]))
-        },
-        "capabilities": null,
-        "endpointCapabilities": 73463,
-        // Consumer: the web client's exact mask (HAR 2026-10-20); the
-        // work-tenant mask predates the split.
-        "clientEndpointCapabilities": if params.consumer { 109985824 } else { 9336554 },
-        "endpointMetadata": { "holographicCapabilities": 3 },
-        "meetingInfo": null,
-        "endpointState": {
-            "endpointStateSequenceNumber": 1,
-            "endpointProperties": {
-                "additionalEndpointProperties": {
-                    "infoShownInReportMode": "FullInformation"
-                }
-            }
-        },
-        "callInvitation": {
-            "callModalities": if include_video {
-                serde_json::json!(["Audio", "Video"])
-            } else {
-                serde_json::json!(["Audio"])
-            },
-            "replaces": null,
-            "transferor": null,
-            "links": {
-                "progress": tc("call/progress/"),
-                "mediaAnswer": tc("call/mediaAnswer/"),
-                "acceptance": tc("call/acceptance/"),
-                "redirection": tc("call/redirection/"),
-                "end": tc("call/end/")
-            },
-            "clientContentForMediaController": {
-                "controlVideoStreaming": tc("call/controlVideoStreaming/"),
-                "csrcInfo": tc("call/csrcInfo/"),
-                "dominantSpeakerInfo": tc("call/dominantSpeakerInfo/")
-            },
-            "pstnContent": {
-                "emergencyCallCountry": "",
-                "platformName": "teams-cli",
-                "publicApiCall": false
-            },
-            "mediaContent": {
-                "contentType": "application/sdp",
-                "blob": sdp_offer
-            }
-        },
-        "debugContent": {
-            "ecsEtag": "\"0\"",
-            "causeId": cause_id
-        }
-    });
+/// N-party create: the single-shot cpconv/epconv POST with
+/// `participants.to` carrying EVERY callee (the web's create takes an
+/// array; a group dial declares them all at create time, then each gets
+/// the explicit invite — the invite is the dial signal, live A/B#3
+/// 2026-10-20). One callee = the 1:1 shape byte-for-byte.
+pub async fn create_call_modalities_n(
+    http: &reqwest::Client,
+    epconv_url: &str,
+    params: &ConversationCallParams<'_>,
+    sdp_offer: &str,
+    callees: &[&str],
+    include_video: bool,
+) -> Result<(ConversationCreated, ConversationJoined)> {
+    let payload = single_shot_call_payload(params, sdp_offer, callees, include_video);
 
     tracing::info!(
-        "1:1 call: POST {} (single-shot epconv with SDP)",
+        "call create ({} callee(s)): POST {} (single-shot with SDP)",
+        callees.len(),
         epconv_url
     );
 
@@ -1757,6 +1655,140 @@ pub async fn create_1to1_call_modalities(
     };
 
     Ok((created, joined))
+}
+
+/// The single-shot create body (pure, no network): `participants.to`
+/// carries one entry per callee — the web's create takes an array, and a
+/// group dial declares every callee at create time. One callee (or none,
+/// the channel-call shape) keeps the historical payloads byte-for-byte.
+pub fn single_shot_call_payload(
+    params: &ConversationCallParams<'_>,
+    sdp_offer: &str,
+    callees: &[&str],
+    include_video: bool,
+) -> serde_json::Value {
+    // Consumer: the DECLARED endpoint must be the main session's
+    // REGISTERED epid — the call controller resolves endpoint-addressed
+    // deliveries (the acceptance notification) against the registrar; a
+    // random per-call id has no registration and the acceptance aborts
+    // (live: 412/430/10065 "Delivering call acceptance notification").
+    let declared_epid = if params.consumer {
+        crate::trouter::current_epid().unwrap_or_else(|| params.endpoint_id.to_string())
+    } else {
+        params.endpoint_id.to_string()
+    };
+    let tc = |path: &str| trouter_callback(params.trouter_surl, &declared_epid, path);
+    let cause_id = &params.message_id[..8.min(params.message_id.len())];
+
+    serde_json::json!({
+        "conversationRequest": {
+            "conversationType": null,
+            "subject": "",
+            "suppressDialout": false,  // false = ring the callee
+            "roster": {
+                "type": "Delta",
+                "rosterUpdate": tc("conversation/rosterUpdate/")
+            },
+            "properties": {
+                "allowConversationWithoutHost": true,
+                "enableGroupCallEventMessages": true,
+                "enableGroupCallUpgradeMessage": false,
+                "enableGroupCallMeetupGeneration": false
+            },
+            "links": {
+                "conversationEnd": tc("conversation/conversationEnd/"),
+                "conversationUpdate": tc("conversation/conversationUpdate/"),
+                "localParticipantUpdate": tc("conversation/localParticipantUpdate/"),
+                "addParticipantSuccess": tc("conversation/addParticipantSuccess/"),
+                "addParticipantFailure": tc("conversation/addParticipantFailure/"),
+                "addModalitySuccess": tc("conversation/addModalitySuccess/"),
+                "addModalityFailure": tc("conversation/addModalityFailure/"),
+                "confirmUnmute": tc("conversation/confirmUnmute/"),
+                "receiveMessage": tc("conversation/receiveMessage/")
+            }
+        },
+        "groupContext": null,
+        // Consumer 1:1s create WITHOUT a group thread (web shape, HAR
+        // 2026-10-20: groupChat=null in cpconv). A thread here makes the
+        // CC build a GROUP call (isMultiParty=true, groupCallInitiator)
+        // whose acceptance waits on group-call acknowledgement machinery
+        // and times out 408/10056 (live, rig↔rig same day).
+        "groupChat": if params.consumer {
+            serde_json::json!(null)
+        } else {
+            serde_json::json!({
+                "threadId": params.thread_id,
+                "messageId": null
+            })
+        },
+        "participants": {
+            "from": {
+                "id": params.caller_mri,
+                "displayName": params.caller_display_name,
+                "endpointId": declared_epid,
+                "participantId": params.participant_id,
+                "languageId": "en-US"
+            },
+            "to": callees
+                .iter()
+                .map(|mri| {
+                    serde_json::json!({
+                        "id": mri,
+                        "participantId": uuid::Uuid::new_v4().to_string()
+                    })
+                })
+                .collect::<Vec<_>>()
+        },
+        "capabilities": null,
+        "endpointCapabilities": 73463,
+        // Consumer: the web client's exact mask (HAR 2026-10-20); the
+        // work-tenant mask predates the split.
+        "clientEndpointCapabilities": if params.consumer { 109985824 } else { 9336554 },
+        "endpointMetadata": { "holographicCapabilities": 3 },
+        "meetingInfo": null,
+        "endpointState": {
+            "endpointStateSequenceNumber": 1,
+            "endpointProperties": {
+                "additionalEndpointProperties": {
+                    "infoShownInReportMode": "FullInformation"
+                }
+            }
+        },
+        "callInvitation": {
+            "callModalities": if include_video {
+                serde_json::json!(["Audio", "Video"])
+            } else {
+                serde_json::json!(["Audio"])
+            },
+            "replaces": null,
+            "transferor": null,
+            "links": {
+                "progress": tc("call/progress/"),
+                "mediaAnswer": tc("call/mediaAnswer/"),
+                "acceptance": tc("call/acceptance/"),
+                "redirection": tc("call/redirection/"),
+                "end": tc("call/end/")
+            },
+            "clientContentForMediaController": {
+                "controlVideoStreaming": tc("call/controlVideoStreaming/"),
+                "csrcInfo": tc("call/csrcInfo/"),
+                "dominantSpeakerInfo": tc("call/dominantSpeakerInfo/")
+            },
+            "pstnContent": {
+                "emergencyCallCountry": "",
+                "platformName": "teams-cli",
+                "publicApiCall": false
+            },
+            "mediaContent": {
+                "contentType": "application/sdp",
+                "blob": sdp_offer
+            }
+        },
+        "debugContent": {
+            "ecsEtag": "\"0\"",
+            "causeId": cause_id
+        }
+    })
 }
 
 /// Invite a user into the conversation via POST /conv/{id}/add.
@@ -2022,6 +2054,52 @@ mod tests {
         let h = headers_for(&r);
         assert_eq!(h.get("ms-teams-partition").unwrap(), "euwe01");
         assert_eq!(h.get("ms-teams-region").unwrap(), "euwe");
+    }
+
+    #[test]
+    fn single_shot_payload_carries_every_callee() {
+        // The N-party create shape: participants.to is an ARRAY — one
+        // entry per callee, each with its own participantId (the web's
+        // create takes the array; a group dial declares all members at
+        // create time). One callee keeps the 1:1 shape, none keeps the
+        // channel-call shape.
+        let eu = TeamsRegion::default();
+        let params = ConversationCallParams {
+            ic3_token: "",
+            skype_token: "",
+            consumer: true,
+            trouter_surl: "",
+            caller_mri: "",
+            caller_display_name: "",
+            endpoint_id: "",
+            participant_id: "",
+            thread_id: "",
+            chain_id: "",
+            message_id: "0123456789abcdef",
+            caller_oid: "",
+            tenant_id: "",
+            region: &eu,
+        };
+        let two = single_shot_call_payload(&params, "v=0", &["8:a", "8:b"], false);
+        let to = two["participants"]["to"].as_array().unwrap();
+        assert_eq!(to.len(), 2);
+        assert_eq!(to[0]["id"], "8:a");
+        assert_eq!(to[1]["id"], "8:b");
+        // Distinct participant ids.
+        assert_ne!(to[0]["participantId"], to[1]["participantId"]);
+
+        let one = single_shot_call_payload(&params, "v=0", &["8:a"], false);
+        assert_eq!(one["participants"]["to"].as_array().unwrap().len(), 1);
+
+        let none = single_shot_call_payload(&params, "v=0", &[], false);
+        assert_eq!(none["participants"]["to"].as_array().unwrap().len(), 0);
+
+        // The video flag still drives the declared modalities.
+        let video = single_shot_call_payload(&params, "v=0", &["8:a", "8:b"], true);
+        assert_eq!(
+            video["callInvitation"]["callModalities"],
+            serde_json::json!(["Audio", "Video"])
+        );
     }
 
     #[test]

@@ -366,18 +366,21 @@ pub async fn run_call_with_controls(
     // 1. --echo: call the Echo bot
     // 2. --thread <id>: call a specific 1:1 thread
     // 3. otherwise: channel call via TEAMS_AV_TEST_THREAD_ID env var
-    let (thread_id, callee_mri) = if echo {
-        (signaling::echo_thread_id(caller_oid), None)
+    let (thread_id, callees): (String, Vec<String>) = if echo {
+        (signaling::echo_thread_id(caller_oid), Vec::new())
     } else if let Some(ref tid) = thread_override {
         // Extract callee OID from 1:1 thread format: 19:{oid1}_{oid2}@unq.gbl.spaces.
         // Consumer 1:1s are server-assigned GUID threads — the callee
         // comes from the roster (the one non-self member).
         if tid.contains("@unq.gbl.spaces") {
             let callee_oid = extract_callee_oid_from_thread(tid, caller_oid);
-            let callee_mri = callee_oid.map(|oid| format!("8:orgid:{}", oid));
-            (tid.clone(), callee_mri)
+            let callees = callee_oid
+                .map(|oid| format!("8:orgid:{}", oid))
+                .into_iter()
+                .collect();
+            (tid.clone(), callees)
         } else {
-            let raw_peer = consumer_thread_peer(
+            let raw_peers = consumer_thread_members(
                 &http,
                 &chat_service_base(&config),
                 skype_token_str,
@@ -389,16 +392,20 @@ pub async fn run_call_with_controls(
                     tracing::warn!("consumer peer resolve failed: {e:#}");
                     e
                 })
-                .ok();
+                .unwrap_or_default();
             // A freshly-created 1:1 roster carries the callee in UPN
             // form (8:user@host) when the thread was created from the
             // UPN — the calling CC cannot route that form and rejects
             // the invite fan-out with call/end 403 subCode 10124
             // ("callee to interact with caller", live 2026-10-20).
             // Resolve the endpoint-registered form via the sticky
-            // OneToOneChat roster instead.
-            let callee_mri = match raw_peer {
-                Some(ref m) if m.contains('@') => {
+            // OneToOneChat roster instead. The sticky resolver maps THE
+            // 1:1 peer; with several UPN-form members only the sticky
+            // one is resolvable (the rest dial raw, likely gating).
+            let upn_forms = raw_peers.iter().filter(|m| m.contains('@')).count();
+            let mut callees: Vec<String> = Vec::new();
+            for m in &raw_peers {
+                if m.contains('@') && upn_forms == 1 {
                     match consumer_endpoint_mri(
                         &http,
                         &chat_service_base(&config),
@@ -412,31 +419,44 @@ pub async fn run_call_with_controls(
                                 "consumer callee {m} resolved to endpoint MRI {resolved} \
                                  (sticky OneToOneChat roster)"
                             );
-                            Some(resolved)
+                            callees.push(resolved);
                         }
                         None => {
                             tracing::warn!(
                                 "consumer callee {m} is UPN-form and no sticky OneToOneChat \
                                  roster resolved an endpoint MRI — the invite will likely gate"
                             );
-                            Some(m.clone())
+                            callees.push(m.clone());
                         }
                     }
+                } else {
+                    callees.push(m.clone());
                 }
-                other => other,
-            };
-            (tid.clone(), callee_mri)
+            }
+            // QA knob for the N-party wire shape without a third
+            // account: append one extra (unreachable) callee and verify
+            // the CC accepts a multi-entry participants.to + still rings
+            // the real member.
+            if let Ok(extra) = std::env::var("TEAMSFAST_EXTRA_CALLEE") {
+                if !extra.trim().is_empty() {
+                    tracing::info!("QA: appending extra callee for the N-party shape probe");
+                    callees.push(extra.trim().to_string());
+                }
+            }
+            (tid.clone(), callees)
         }
     } else {
         let tid = std::env::var("TEAMS_AV_TEST_THREAD_ID").context(
             "TEAMS_AV_TEST_THREAD_ID env var not set. Set it to the thread ID of the av-test channel.",
         )?;
         anyhow::ensure!(!tid.is_empty(), "TEAMS_AV_TEST_THREAD_ID is empty");
-        (tid, None)
+        (tid, Vec::new())
     };
 
-    // Determine if this is a 1:1 call (echo or thread override with callee)
-    let is_1to1_call = echo || callee_mri.is_some();
+    // Determine if this is a 1:1-style call (echo, or thread override
+    // with at least one resolved callee — the N-party create uses the
+    // same single-shot shape with a multi-entry participants.to).
+    let is_1to1_call = echo || !callees.is_empty();
 
     // Get tenant ID. Consumer threads carry the all-zeros tenant in
     // their properties (addedByTenantId) — that is the value to send.
@@ -486,14 +506,14 @@ pub async fn run_call_with_controls(
     println!();
     if echo {
         println!("=== Call Test (Echo / Call Quality Tester) ===");
-    } else if callee_mri.is_some() {
-        println!("=== Call Test (1:1 Call) ===");
+    } else if !callees.is_empty() {
+        println!("=== Call Test ({} callee(s)) ===", callees.len());
     } else {
         println!("=== Call Test (av-test channel) ===");
     }
     println!("Caller:   {} ({})", display_name, mail);
     println!("Thread:   {}", thread_id);
-    if let Some(ref mri) = callee_mri {
+    for mri in &callees {
         println!("Callee:   {}", mri);
     }
     println!("Duration: {}s", duration_secs);
@@ -790,13 +810,14 @@ pub async fn run_call_with_controls(
         } else {
             &epconv_url
         };
-        tracing::info!("Creating 1:1 call (single-shot create with SDP at {create_url})...");
-        let (created, joined) = signaling::create_1to1_call_modalities(
+        tracing::info!("Creating call (single-shot create with SDP at {create_url})...");
+        let callee_refs: Vec<&str> = callees.iter().map(String::as_str).collect();
+        let (created, joined) = signaling::create_call_modalities_n(
             &http,
             create_url,
             &conv_params,
             &offer_sdp,
-            callee_mri.as_deref(),
+            &callee_refs,
             use_camera,
         )
         .await?;
@@ -839,7 +860,7 @@ pub async fn run_call_with_controls(
     if echo {
         tracing::info!("Inviting Echo bot...");
         signaling::invite_echo_bot(&http, &phase1.conversation_controller, &conv_params).await?;
-    } else if let Some(ref mri) = callee_mri {
+    } else if !callees.is_empty() {
         // A/B #3: the callee is declared in participants.to AND gets the
         // explicit invite. A/B #2 (declaration only, invite skipped)
         // placed the call (201) but the CC never dialed — zero call
@@ -847,24 +868,29 @@ pub async fn run_call_with_controls(
         // its own invite) answered fine. participants.to alone doesn't
         // ring anyone; the invite is the dial signal. Keeping both: the
         // declaration should still bind the real media leg (A/B #1's
-        // invite-only produced a placeholder leg).
-        tracing::info!("Inviting user {} (declared at create + invite)...", mri);
-        if let Err(e) = signaling::invite_user(
-            &http,
-            &phase1.conversation_controller,
-            &conv_params,
-            mri,
-            use_camera,
-        )
-        .await
-        {
-            // The callee is already declared in participants.to at
-            // create — the fork dials them regardless. The explicit
-            // invite can 404 "conversation could not be resolved" on a
-            // fresh conversation (region/replication lag on the conv
-            // service); treat it as best-effort and keep waiting for
-            // the ring instead of aborting the call.
-            tracing::warn!("User invite failed (continuing — callee declared at create): {e:#}");
+        // invite-only produced a placeholder leg). N-party: EVERY callee
+        // gets the invite.
+        for mri in &callees {
+            tracing::info!("Inviting user {} (declared at create + invite)...", mri);
+            if let Err(e) = signaling::invite_user(
+                &http,
+                &phase1.conversation_controller,
+                &conv_params,
+                mri,
+                use_camera,
+            )
+            .await
+            {
+                // The callee is already declared in participants.to at
+                // create — the fork dials them regardless. The explicit
+                // invite can 404 "conversation could not be resolved" on a
+                // fresh conversation (region/replication lag on the conv
+                // service); treat it as best-effort and keep waiting for
+                // the ring instead of aborting the call.
+                tracing::warn!(
+                    "User invite failed (continuing — callee declared at create): {e:#}"
+                );
+            }
         }
     }
 
@@ -3066,6 +3092,44 @@ fn extract_claim_from_skype_token(token: &str, claim: &str) -> Option<String> {
 
 /// The one non-self member of a consumer 1:1 thread (8:live: MRI),
 /// read from the chat service with the skype token.
+/// All non-self, non-bot members of a consumer thread roster (the N-party
+/// dial list). Order preserved as the roster returns it.
+async fn consumer_thread_members(
+    http: &reqwest::Client,
+    chat_service: &str,
+    skype_token: &str,
+    thread_id: &str,
+    self_mri: &str,
+) -> anyhow::Result<Vec<String>> {
+    let url = format!("{chat_service}/v1/threads/{thread_id}/members");
+    let resp = http
+        .get(&url)
+        .header("X-SkypeToken", skype_token)
+        .send()
+        .await
+        .context("peer roster read failed")?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "peer roster HTTP {}",
+        resp.status()
+    );
+    let v: serde_json::Value = resp.json().await?;
+    let members: Vec<String> = v
+        .get("members")
+        .and_then(|m| m.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(members
+        .into_iter()
+        .filter(|m| m != self_mri && !m.starts_with("28:"))
+        .collect())
+}
+
 async fn consumer_thread_peer(
     http: &reqwest::Client,
     chat_service: &str,
