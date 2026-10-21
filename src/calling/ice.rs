@@ -862,7 +862,7 @@ pub async fn check_candidate(
             }
 
             match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
-                Ok(Ok((len, from))) => {
+                Ok(Ok((len, _))) => {
                     let data = &buf[..len];
 
                     if is_stun_response(data) {

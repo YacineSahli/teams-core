@@ -283,6 +283,8 @@ pub async fn run_call_with_controls(
         "Skype token expired. Sign in again."
     );
     let skype_token_str = &skype_token.token;
+    // Consumed only under feature gates below.
+    let _ = &tone_mode;
 
     // Consumer: the IC3 Gateway is AAD-only (AADSTS9002332) — the
     // skype token IS the call credential (X-Skypetoken on call control).
@@ -1677,6 +1679,8 @@ fn spawn_media_leg(
 ) -> MediaLegHandles {
     let label = leg.label.clone();
     let mut handles = Vec::new();
+    // Consumed only under feature gates below.
+    let _ = &camera_gate;
 
     let ssrc = leg.audio_ssrc;
 
@@ -2058,6 +2062,7 @@ fn spawn_media_leg(
         let screen_source = leg.screen_source.take();
         let camera_slot = leg.camera_source.take();
         let keyframe_flag = keyframe_flag.clone();
+        let _ = &keyframe_flag;
 
         handles.push(tokio::spawn(async move {
             let mut packetizer = video::VideoPacketizer::new(video_ssrc);
@@ -2351,9 +2356,9 @@ fn spawn_media_leg(
 
             // Decode when ANY sink wants frames: the CLI's SDL display or
             // the embedder's remote-video sink.
-            #[cfg(feature = "video-capture")]
+            #[cfg(all(feature = "video-cam", feature = "video-capture"))]
             let has_display = display_tx.as_ref().is_some();
-            #[cfg(not(feature = "video-capture"))]
+            #[cfg(all(feature = "video-cam", not(feature = "video-capture")))]
             let has_display = false;
             #[cfg(feature = "video-cam")]
             let wants_decode = has_display || remote_tx.as_ref().is_some();

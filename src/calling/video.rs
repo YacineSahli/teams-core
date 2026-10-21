@@ -74,7 +74,7 @@ impl VideoFrame {
         let (ow, oh) = (w / f as usize, h / f as usize);
         let (y, uv) = self.data.split_at(w * h);
         let (u, v) = uv.split_at(w * h / 4);
-        let (uw, uh) = (w / 2, h / 2);
+        let (uw, _uh) = (w / 2, h / 2);
         let mut out = vec![0u8; ow * oh * 3 / 2];
         let (oy_plane, ouv) = out.split_at_mut(ow * oh);
         let (ou, ov) = ouv.split_at_mut(ow * oh / 4);

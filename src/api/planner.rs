@@ -400,7 +400,8 @@ async fn patch_task(
     etag: &str,
     body: &serde_json::Value,
 ) -> Result<PlannerTaskInfo> {
-    let path = task_path(task_id)?;
+    // Validate the task id up front (the inner call recomputes the path).
+    task_path(task_id)?;
     check_etag(etag)?;
     let config = crate::config::Config::load_cached()?;
     let token = config

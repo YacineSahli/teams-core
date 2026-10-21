@@ -156,7 +156,7 @@ pub async fn negotiate(
 
 /// Get a socket.io session ID by sending an authenticated GET request.
 pub async fn get_session_id(
-    http: &reqwest::Client,
+    _http: &reqwest::Client,
     session: &SessionResponse,
     skype_token: &str,
     epid: &str,
