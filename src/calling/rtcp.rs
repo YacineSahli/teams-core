@@ -71,8 +71,10 @@ pub fn is_rtcp_packet(data: &[u8]) -> bool {
     if data.len() < 8 {
         return false;
     }
-    let pt = data[1];
-    pt >= 200 && pt <= 204
+    // RFC 5761 mux demux: RTCP payload types are 200..=207 (SR, RR,
+    // SDES, BYE, APP, RTPFB, PSFB, AVB) — RTP's 7-bit PT can never
+    // reach 200, so byte 1 alone decides.
+    (200..=207).contains(&data[1])
 }
 
 /// Get current NTP timestamp (seconds since 1900-01-01, 32.32 fixed point).

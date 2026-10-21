@@ -88,7 +88,13 @@ fn raw_inflate(data: &[u8], dictionary: Option<&[u8]>) -> Result<String> {
     let mut output = vec![0u8; data.len() * 4];
     let mut total_out = 0;
 
+    // Hard caps: a malformed deflate stream can make NO progress while
+    // still reporting Ok (live-found by the hostile-input test — the loop
+    // spun forever on garbage, wedging the backend thread with zero log
+    // output), and a malicious stream can claim unbounded size.
+    const MAX_OUTPUT: usize = 8 * 1024 * 1024;
     loop {
+        let (in_before, out_before) = (decompress.total_in(), decompress.total_out());
         let status = decompress
             .decompress(
                 &data[decompress.total_in() as usize..],
@@ -102,9 +108,17 @@ fn raw_inflate(data: &[u8], dictionary: Option<&[u8]>) -> Result<String> {
         match status {
             Status::StreamEnd => break,
             Status::Ok | Status::BufError => {
+                // No forward progress on either side = corrupt stream —
+                // bail instead of spinning.
+                if decompress.total_in() == in_before && decompress.total_out() == out_before {
+                    anyhow::bail!("inflate made no progress (corrupt stream)");
+                }
+                if output.len() >= MAX_OUTPUT {
+                    anyhow::bail!("decompressed SDP exceeds {} bytes", MAX_OUTPUT);
+                }
                 // Need more output space
                 if output.len() - total_out < 1024 {
-                    output.resize(output.len() * 2, 0);
+                    output.resize((output.len() * 2).min(MAX_OUTPUT), 0);
                 }
             }
         }

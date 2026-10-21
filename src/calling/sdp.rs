@@ -1556,3 +1556,38 @@ m=x-data 52710 RTP/SAVP 127\r\n";
         assert!(parse_first_video_section(offer).is_none());
     }
 }
+
+#[cfg(test)]
+mod hostile_sdp_tests {
+    use super::*;
+
+    /// Hostile/malformed offers must degrade to None/empty — never panic
+    /// (a malformed blob reaching the answer path kills the backend
+    /// thread: rt.block_on has no catch_unwind).
+    #[test]
+    fn hostile_blobs_never_panic() {
+        let hostiles = [
+            "",                                   // empty
+            "m=video",                            // bare m-line
+            "m=video\r\n",                        // nothing after
+            "m=video 0 RTP/SAVP\r\n",             // no PTs
+            "m=video 0 RTP/SAVP 999\r\n",         // PT out of u8 range
+            "m=video 0 RTP/SAVP 102\r\na=rtpmap:102\r\n", // rtpmap no name
+            "m=video 0 RTP/SAVP 102\r\na=rtpmap:x H264/90000\r\n", // non-numeric PT
+            "m=video 0 RTP/SAVP 102\r\na=rtpmap:102 H264/90000\r\na=fmtp:102", // fmtp no params
+            "m=video 0 RTP/SAVP 102\r\na=recvonly",       // no trailing CRLF
+            "m=\r\nm=video 1 RTP/SAVP 102\r\n",   // empty m-line before
+            "a=group:BUNDLE",                     // group, no sections
+            "m=video 99999999999999999999 RTP/SAVP 102\r\n", // huge port
+            "\u{0}\u{1}\u{2}m=video 1 RTP/SAVP 102\r\n",     // leading binary junk
+        ];
+        for blob in hostiles {
+            let _ = parse_first_video_section(blob);
+            let _ = offer_is_bundle(blob);
+            let _ = video_payload_types(blob);
+            let _ = parse_sdp_offer(blob);
+        }
+        // All-empty payload lists are fine (Vec::new).
+        assert!(video_payload_types("m=x-data 1 RTP/SAVP 127\r\n").is_empty());
+    }
+}
