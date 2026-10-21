@@ -500,6 +500,10 @@ pub async fn answer_call_with_stop(
     if let Some(mut s) = session {
         s.stop().await;
     }
+    // Tell the CC we're gone (best-effort): without an end POST the
+    // session lives to its ~2h cap and the peer's call history shows
+    // multi-hour durations (the caller-side chain got the same fix).
+    let _ = decline_call(notification).await;
     Ok(result)
 }
 
