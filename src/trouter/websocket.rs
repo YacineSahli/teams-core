@@ -20,6 +20,14 @@ impl TrouterSocket {
     /// No auth headers or messages needed on the WebSocket itself.
     pub async fn connect(session: &SessionResponse, session_id: &str, epid: &str) -> Result<Self> {
         let ws_url = session.ws_url(session_id, epid);
+        Self::connect_url(&ws_url).await
+    }
+
+    /// Connect to an already-built trouter WebSocket URL — the reconnect
+    /// path: the URL (session id + connect params) is deterministic for a
+    /// session's lifetime, so a recycled socket is replaced with a fresh
+    /// connection to the same URL.
+    pub async fn connect_url(ws_url: &str) -> Result<Self> {
         let ws_url = ws_url
             .replace("https://", "wss://")
             .replace("http://", "ws://");

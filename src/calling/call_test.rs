@@ -1129,8 +1129,28 @@ pub async fn run_call_with_controls(
     // URL here; the main loop owns conv_params.
     let (late_ack_tx, mut late_ack_rx) = tokio::sync::mpsc::channel::<String>(4);
     let ws_pump = std::sync::Arc::clone(&ws_shared);
+    // Reconnect context: the call's dedicated socket is RECYCLED by the
+    // service mid-call as a matter of course (live: Normal close 2m13s
+    // into a healthy call) — that is a transport event, never a remote
+    // hang-up. The media rides UDP and is unaffected; the pump swaps in
+    // a fresh socket on the same URL and keeps watching for REAL end
+    // frames. Before this, every recycle hung the call up on the spot
+    // and the post-mortem hang-up chain ran against a half-torn session
+    // (leave 400 → the CC session capped out server-side → 2h history).
+    let pump_ws_url = trouter_session
+        .ws_url(&session_id, &epid)
+        .replace("https://", "wss://")
+        .replace("http://", "ws://");
+    let mut pump_stop = stop.clone();
+    let mut pump_end = end_rx.clone();
     tokio::spawn(async move {
+        let mut backoff_secs = 1u64;
         loop {
+            // The pump must never outlive the call: check the call's own
+            // end conditions before every recv and while reconnecting.
+            if *pump_stop.borrow() || *pump_end.borrow() {
+                return;
+            }
             let frame = {
                 let mut g = match ws_pump.lock().await {
                     g => g,
@@ -1139,6 +1159,7 @@ pub async fn run_call_with_controls(
             };
             match frame {
                 Ok(Some(text)) => {
+                    backoff_secs = 1;
                     if text.starts_with("2::") {
                         if let Ok(mut g) = ws_pump.try_lock() {
                             let _ = g.send_text("2::").await;
@@ -1176,10 +1197,28 @@ pub async fn run_call_with_controls(
                         return;
                     }
                 }
-                _ => {
-                    tracing::info!("Call socket closed");
-                    let _ = end_tx.send(true);
-                    return;
+                Ok(None) | Err(_) => {
+                    tracing::warn!(
+                        "call socket closed — reconnecting (call continues; transport recycle)"
+                    );
+                    loop {
+                        if *pump_stop.borrow() || *pump_end.borrow() {
+                            return;
+                        }
+                        match websocket::TrouterSocket::connect_url(&pump_ws_url).await {
+                            Ok(ws) => {
+                                *ws_pump.lock().await = ws;
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "call socket reconnect failed: {e:#} — retry in {backoff_secs}s"
+                                );
+                                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                                backoff_secs = (backoff_secs * 2).min(30);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1264,8 +1303,11 @@ pub async fn run_call_with_controls(
     let rec = recorder.lock().await;
     let echo_result = test_tone::detect_echo(rec.samples(), 1000.0, 8000.0);
 
-    // Dump received audio to raw files for offline analysis
-    {
+    // Dump received audio to raw files for offline analysis (QA only:
+    // every call wrote /tmp/received_audio.pcm by default — call audio
+    // is user content and must not hit disk unasked, same gate as the
+    // ulaw dump).
+    if std::env::var("TEAMSFAST_AUDIO_DUMP").as_deref() == Ok("1") {
         let pcm_path = "/tmp/received_audio.pcm";
         let samples = rec.samples();
         let mut f = std::fs::File::create(pcm_path).ok();
