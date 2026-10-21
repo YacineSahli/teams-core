@@ -461,3 +461,35 @@ mod pli_tests {
         assert_eq!(&p[8..12], &0x22222222u32.to_be_bytes());
     }
 }
+
+#[cfg(test)]
+mod pli_roundtrip_tests {
+    use super::*;
+
+    /// build -> protect-free parse roundtrip: the wire shape we emit must
+    /// parse back into the Pli block (both SSRCs intact).
+    #[test]
+    fn pli_build_parse_roundtrip() {
+        let pli = build_pli(0xAABBCCDD, 0x11223344);
+        let blocks = parse_rtcp(&pli);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            RtcpBlock::Pli {
+                sender_ssrc,
+                media_ssrc,
+            } => {
+                assert_eq!(*sender_ssrc, 0xAABBCCDD);
+                assert_eq!(*media_ssrc, 0x11223344);
+            }
+            other => panic!("expected Pli, got {other:?}"),
+        }
+    }
+
+    /// PSFB with a different FMT (e.g. 3 = FIR-ish) must not parse as PLI.
+    #[test]
+    fn psfb_other_fmt_not_pli() {
+        let mut pkt = build_pli(1, 2);
+        pkt[0] = (pkt[0] & 0xE0) | 3; // FMT=3
+        assert!(matches!(parse_rtcp(&pkt)[0], RtcpBlock::Unknown(_)));
+    }
+}

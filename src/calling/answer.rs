@@ -669,3 +669,54 @@ async fn broker_acceptance_echo(http: reqwest::Client, skype_token: String, url:
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FOUR_MLINE_OFFER: &str = "v=0\r\n\
+a=group:BUNDLE 0 1 2 3\r\n\
+m=audio 52710 RTP/SAVP 105 111 0\r\n\
+a=mid:0\r\n\
+m=video 52710 RTP/SAVP 102 45 103\r\n\
+a=mid:1\r\n\
+m=video 52710 RTP/SAVP 102 45\r\n\
+a=mid:2\r\n\
+m=x-data 52710 RTP/SAVP 127 126\r\n\
+a=mid:3\r\n";
+
+    #[test]
+    fn stub_sections_reject_everything_after_audio() {
+        let stubs = reject_stub_sections(FOUR_MLINE_OFFER);
+        // Three stubs (video, video, x-data), port 0, mids echoed, proto
+        // and payload list from the offer.
+        assert_eq!(stubs.matches("m=video 0 RTP/SAVP").count(), 2);
+        assert!(stubs.contains("m=x-data 0 RTP/SAVP 127 126\r\n"));
+        assert!(stubs.contains("a=mid:1\r\n"));
+        assert!(stubs.contains("a=mid:2\r\n"));
+        assert!(stubs.contains("a=mid:3\r\n"));
+    }
+
+    #[test]
+    fn stub_sections_skip_first_video_when_bundle_answered() {
+        // BUNDLE video answered for real: only mid2/mid3 get stubs.
+        let stubs = reject_stub_sections_after_audio(FOUR_MLINE_OFFER, true);
+        assert_eq!(stubs.matches("m=video 0 RTP/SAVP").count(), 1);
+        assert!(!stubs.contains("a=mid:1\r\n"));
+        assert!(stubs.contains("a=mid:2\r\n"));
+        assert!(stubs.contains("a=mid:3\r\n"));
+    }
+
+    #[test]
+    fn bundle_group_inserted_once_before_first_m_line() {
+        let answer = "v=0\r\no=- 1 0 IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5000 RTP/SAVP 0\r\n".to_string();
+        let with_group = insert_bundle_group(answer.clone());
+        let m_pos = with_group.find("m=audio").unwrap();
+        let g_pos = with_group.find("a=group:BUNDLE 0 1\r\n").unwrap();
+        assert!(g_pos < m_pos);
+        // Idempotent.
+        assert_eq!(insert_bundle_group(with_group.clone()), with_group);
+        // No m-line: unchanged.
+        assert_eq!(insert_bundle_group("v=0\r\n".to_string()), "v=0\r\n");
+    }
+}

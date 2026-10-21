@@ -187,7 +187,7 @@ pub fn generate_sdp_answer(local_ip: &str, offer: &SdpOfferInfo) -> String {
 pub fn generate_sdp_answer_with_port(
     local_ip: &str,
     local_port: u16,
-    offer: &SdpOfferInfo,
+    _offer: &SdpOfferInfo,
 ) -> String {
     let our_ufrag = generate_ice_ufrag();
     let our_pwd = generate_ice_pwd();
@@ -236,7 +236,7 @@ pub fn generate_sdp_answer_with_port(
 pub fn generate_sdp_answer_with_crypto(
     local_ip: &str,
     local_port: u16,
-    offer: &SdpOfferInfo,
+    _offer: &SdpOfferInfo,
 ) -> (String, String) {
     let our_ufrag = generate_ice_ufrag();
     let our_pwd = generate_ice_pwd();
@@ -1477,5 +1477,71 @@ a=ice-pwd:Tp0Tz1Pw0Tz1Pw0Tz1Pw0Tz1P\r\n";
         let vid = parse_first_video_section(&r.sdp).expect("own offer parses");
         assert_eq!(vid.payload_type, 102);
         assert!(!vid.recvonly); // sendrecv offer
+    }
+}
+
+#[cfg(test)]
+mod bundle_edge_tests {
+    use super::*;
+
+    /// rtx payload types (a=rtpmap:<pt> rtx/…) must be excluded from the
+    /// receive demux set — they are retransmission wrappers; feeding them
+    /// to the depacketizer corrupts NAL reassembly (browser round
+    /// 2026-10-21).
+    #[test]
+    fn video_payload_types_exclude_rtx() {
+        let offer = "m=video 52710 RTP/SAVP 102 104 45 103 107 46\r\n\
+a=rtpmap:102 H264/90000\r\n\
+a=rtpmap:104 H264/90000\r\n\
+a=rtpmap:45 AV1/90000\r\n\
+a=rtpmap:103 rtx/90000\r\n\
+a=rtpmap:107 rtx/90000\r\n\
+a=rtpmap:46 rtx/90000\r\n\
+m=x-data 52710 RTP/SAVP 127\r\n";
+        let pts = video_payload_types(offer);
+        assert_eq!(pts, vec![102, 104, 45]);
+    }
+
+    #[test]
+    fn offered_video_direction_matrix() {
+        let base = "m=video 1 RTP/SAVP 102\r\na=rtpmap:102 H264/90000\r\na=fmtp:102 packetization-mode=1\r\n";
+        assert_eq!(
+            parse_first_video_section(&format!("{base}a=recvonly\r\n"))
+                .unwrap()
+                .answer_direction(),
+            "sendonly"
+        );
+        assert_eq!(
+            parse_first_video_section(&format!("{base}a=sendonly\r\n"))
+                .unwrap()
+                .answer_direction(),
+            "recvonly"
+        );
+        assert_eq!(
+            parse_first_video_section(&format!("{base}a=inactive\r\n"))
+                .unwrap()
+                .answer_direction(),
+            "inactive"
+        );
+        // No direction attr (MS-native) = sendrecv.
+        assert_eq!(
+            parse_first_video_section(base).unwrap().answer_direction(),
+            "sendrecv"
+        );
+    }
+
+    /// pm=0-only H264 offers still answer (fallback to any H264 PT).
+    #[test]
+    fn offered_video_pm0_fallback() {
+        let offer = "m=video 1 RTP/SAVP 104\r\na=rtpmap:104 H264/90000\r\na=fmtp:104 packetization-mode=0\r\n";
+        let vid = parse_first_video_section(offer).unwrap();
+        assert_eq!(vid.payload_type, 104);
+    }
+
+    /// AV1-only offers cannot be answered by our encoder.
+    #[test]
+    fn offered_video_av1_only_is_none() {
+        let offer = "m=video 1 RTP/SAVP 45\r\na=rtpmap:45 AV1/90000\r\n";
+        assert!(parse_first_video_section(offer).is_none());
     }
 }

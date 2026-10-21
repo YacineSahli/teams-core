@@ -544,7 +544,6 @@ impl MediaSession {
                 last_ssrc: std::sync::atomic::AtomicU32::new(0),
             })
         });
-        let pli_probe_pub = pli_probe.clone();
         // PLI from the REMOTE side -> the video send loop emits a keyframe.
         let keyframe_flag = video.as_ref().map(|_| {
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
@@ -1424,5 +1423,83 @@ mod tests {
         assert!(stats.packets_sent >= 1, "sent: {}", stats.packets_sent);
 
         session.stop().await;
+    }
+}
+
+#[cfg(test)]
+mod source_pick_tests {
+    use super::*;
+
+    fn frame(level: u8) -> video::VideoFrame {
+        video::VideoFrame {
+            width: 4,
+            height: 4,
+            data: vec![level; 4 * 4 * 3 / 2],
+        }
+    }
+
+    fn slot_with(frames: Vec<video::VideoFrame>) -> VideoSourceSlot {
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        for f in frames {
+            tx.send(f).unwrap();
+        }
+        // A live capture thread keeps its sender — dry ticks must read
+        // Empty (sticky), not Disconnected.
+        std::mem::forget(tx);
+        std::sync::Arc::new(std::sync::Mutex::new(Some(rx)))
+    }
+
+    #[test]
+    fn no_sources_picks_none() {
+        assert!(pick_source_frame(&None, &None, &None, &mut None).is_none());
+    }
+
+    #[test]
+    fn camera_latest_wins() {
+        let cam = slot_with(vec![frame(1), frame(2), frame(3)]);
+        let picked = pick_source_frame(&None, &Some(cam), &None, &mut None).unwrap();
+        // Drained to the LATEST frame — a stale backlog must not lag.
+        assert_eq!(picked.data[0], 3);
+    }
+
+    #[test]
+    fn camera_gate_off_blocks() {
+        let cam = slot_with(vec![frame(9)]);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        assert!(pick_source_frame(&None, &Some(cam), &Some(rx), &mut None).is_none());
+    }
+
+    #[test]
+    fn screen_overrides_camera() {
+        let screen = slot_with(vec![frame(50)]);
+        let cam = slot_with(vec![frame(9)]);
+        let picked = pick_source_frame(&Some(screen), &Some(cam), &None, &mut None).unwrap();
+        assert_eq!(picked.data[0], 50);
+    }
+
+    #[test]
+    fn screen_is_sticky_between_ticks() {
+        // First tick delivers the frame; the slot then runs DRY — the
+        // held frame must persist (a 10fps source on a 15fps send tick
+        // must not flap to the camera).
+        let screen = slot_with(vec![frame(42)]);
+        let mut last = None;
+        let first = pick_source_frame(&Some(screen.clone()), &None, &None, &mut last).unwrap();
+        assert_eq!(first.data[0], 42);
+        let held = pick_source_frame(&Some(screen), &None, &None, &mut last).unwrap();
+        assert_eq!(held.data[0], 42);
+    }
+
+    #[test]
+    fn disconnected_screen_falls_through() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<video::VideoFrame>(8);
+        drop(tx); // disconnected
+        let screen: VideoSourceSlot = std::sync::Arc::new(std::sync::Mutex::new(Some(rx)));
+        let cam = slot_with(vec![frame(7)]);
+        let picked =
+            pick_source_frame(&Some(screen.clone()), &Some(cam), &None, &mut None).unwrap();
+        assert_eq!(picked.data[0], 7);
+        // And the dead slot was cleared.
+        assert!(screen.lock().unwrap().is_none());
     }
 }

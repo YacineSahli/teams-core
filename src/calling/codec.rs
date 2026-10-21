@@ -377,3 +377,81 @@ mod black_stream_tests {
         assert!(decoded >= 4, "only {decoded}/6 black frames decoded");
     }
 }
+
+#[cfg(test)]
+mod one_encoder_law_tests {
+    use super::*;
+
+    /// THE law (live 2026-10-20): one stream, ONE encoder. Two encoders
+    /// interleaved on one SSRC produce two unrelated H264 reference
+    /// chains — the receiver decodes the first IDR(s) then rejects every
+    /// P-slice with dsRefLost. This documents the failure so a future
+    /// "fallback encoder" refactor fails HERE first.
+    #[test]
+    fn two_interleaved_encoders_break_decoding() {
+        let (w, h) = (320u32, 240u32);
+        let mut enc_a = H264Encoder::new(w, h, 15.0, 256).unwrap();
+        let mut enc_b = H264Encoder::new(w, h, 15.0, 256).unwrap();
+        let mut dec = H264Decoder::new().unwrap();
+        let mut packetizer = crate::calling::video::VideoPacketizer::new(0x1);
+        let mut depacketizer = crate::calling::video::VideoDepacketizer::new();
+        let mut yuv = vec![100u8; (w * h * 3 / 2) as usize];
+
+        let mut decoded = 0usize;
+        for round in 0..6 {
+            // Alternate encoders — the buggy fallback pattern.
+            let enc = if round % 2 == 0 { &mut enc_a } else { &mut enc_b };
+            yuv[0] = round * 40;
+            let nals = enc.encode(&yuv).unwrap();
+            for pkt in &packetizer.packetize_frame(&nals) {
+                let marker = pkt[1] & 0x80 != 0;
+                let payload = &pkt[crate::calling::rtp::RTP_HEADER_SIZE..];
+                if let Ok(Some(nal)) = depacketizer.depacketize(payload, marker) {
+                    if matches!(nal[0] & 0x1F, 14 | 30) {
+                        continue;
+                    }
+                    if let Ok(Some(_)) = dec.decode(&nal) {
+                        decoded += 1;
+                    }
+                }
+            }
+        }
+        // Only the initial IDR(s) of the first chain decode; the
+        // interleaved chain's P-slices fail (live rig: 3 frames then
+        // permanent dsRefLost).
+        assert!(
+            decoded <= 3,
+            "interleaved encoders unexpectedly decoded {decoded}/6"
+        );
+
+        // The control: the SAME six frames through ONE encoder decode
+        // almost entirely — the gap between the two numbers is the law.
+        let mut enc = H264Encoder::new(w, h, 15.0, 256).unwrap();
+        let mut dec = H264Decoder::new().unwrap();
+        let mut decoded_one = 0usize;
+        for round in 0..6 {
+            yuv[0] = round * 40;
+            let nals = enc.encode(&yuv).unwrap();
+            for pkt in &packetizer.packetize_frame(&nals) {
+                let marker = pkt[1] & 0x80 != 0;
+                let payload = &pkt[crate::calling::rtp::RTP_HEADER_SIZE..];
+                if let Ok(Some(nal)) = depacketizer.depacketize(payload, marker) {
+                    if matches!(nal[0] & 0x1F, 14 | 30) {
+                        continue;
+                    }
+                    if let Ok(Some(_)) = dec.decode(&nal) {
+                        decoded_one += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            decoded_one >= 5,
+            "single-encoder control decoded only {decoded_one}/6"
+        );
+        assert!(
+            decoded_one > decoded,
+            "the one-encoder law regressed: interleaved {decoded} vs single {decoded_one}"
+        );
+    }
+}

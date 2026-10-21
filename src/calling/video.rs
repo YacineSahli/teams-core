@@ -1090,3 +1090,34 @@ mod stap_a_tests {
         assert!(d.depacketize(&payload, false).is_err());
     }
 }
+
+#[cfg(all(test, feature = "video-cam"))]
+mod i420_color_tests {
+    use super::*;
+
+    /// I420 black is Y=0/UV=128 — NOT all-zero. Zero chroma converts to
+    /// solid RGB(0,135,0) GREEN on every YUV→RGB renderer (live
+    /// 2026-10-21: the caller's remote tile was a uniform green field).
+    #[test]
+    fn black_i420_renders_dark_not_green() {
+        let f = VideoFrame {
+            width: 8,
+            height: 8,
+            data: crate::calling::codec::black_i420(8, 8),
+        };
+        let rgba = f.to_rgba();
+        // Every pixel near-black in ALL channels — no green channel spike.
+        for px in rgba.chunks(4) {
+            assert!(px[1] <= 8, "green channel spiked: {}", px[1]);
+            assert!(px[0] <= 8 && px[2] <= 8, "not dark: {:?}", px);
+        }
+        // The all-zero buffer this replaced would be exactly (0,135,0).
+        let zeroed = VideoFrame {
+            width: 8,
+            height: 8,
+            data: vec![0u8; 8 * 8 * 3 / 2],
+        };
+        let zr = zeroed.to_rgba();
+        assert_eq!(&zr[0..3], &[0, 135, 0]);
+    }
+}
