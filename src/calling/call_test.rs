@@ -1706,6 +1706,9 @@ fn spawn_media_leg(
     // Dynamic remote address — updated when we receive STUN checks from a new peer.
     // In Teams, the MCU's actual relay address may differ from the SDP candidate.
     let dynamic_remote_addr = Arc::new(Mutex::new(leg.audio_remote_addr));
+    // Remote PLI (keyframe request) — the audio recv loop's RTCP branch
+    // sets it, the video send loop forces an IDR.
+    let keyframe_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Audio send loop
     {
@@ -1811,6 +1814,7 @@ fn spawn_media_leg(
         } else {
             None
         };
+        let keyframe_flag = keyframe_flag.clone();
         handles.push(tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             loop {
@@ -1856,6 +1860,12 @@ fn spawn_media_leg(
                                 rtcp_data.len()
                             );
                             let blocks = rtcp::parse_rtcp(&rtcp_data);
+                            for block in &blocks {
+                                if let rtcp::RtcpBlock::Pli { .. } = block {
+                                    keyframe_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    tracing::info!("[{}] PLI received — keyframe requested", label);
+                                }
+                            }
                             let mut rs = recv_stats.lock().await;
                             for block in &blocks {
                                 match block {
@@ -2047,6 +2057,7 @@ fn spawn_media_leg(
         let preview_tx = leg.preview_tx.take();
         let screen_source = leg.screen_source.take();
         let camera_slot = leg.camera_source.take();
+        let keyframe_flag = keyframe_flag.clone();
 
         handles.push(tokio::spawn(async move {
             let mut packetizer = video::VideoPacketizer::new(video_ssrc);
@@ -2080,6 +2091,15 @@ fn spawn_media_leg(
                 if let Some(ref gate) = keys_gate {
                     if !gate.load(std::sync::atomic::Ordering::SeqCst) {
                         continue;
+                    }
+                }
+
+                // Remote PLI: force an IDR next frame.
+                #[cfg(feature = "video-cam")]
+                if keyframe_flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    if let Some(ref mut enc) = encoder {
+                        enc.force_keyframe();
+                        tracing::info!("[{}] keyframe forced (PLI)", label);
                     }
                 }
 

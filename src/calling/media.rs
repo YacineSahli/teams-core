@@ -90,6 +90,10 @@ pub struct VideoRecvPipeline {
     pub decoded: u64,
     /// Last observed source SSRC (PLI target).
     pub last_ssrc: u32,
+    /// TEST HOOK (TEAMSFAST_DROP_KEYFRAMES_SECS): discard parameter-set
+    /// and IDR NALs for the first N seconds — simulates the browser
+    /// round's missed-keyframe window (PLI recovery verification).
+    drop_keyframes_until: Option<std::time::Instant>,
 }
 
 impl VideoRecvPipeline {
@@ -111,6 +115,11 @@ impl VideoRecvPipeline {
             frames: 0,
             decoded: 0,
             last_ssrc: 0,
+            drop_keyframes_until: std::env::var("TEAMSFAST_DROP_KEYFRAMES_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|secs| *secs > 0)
+                .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs(secs)),
         }
     }
 
@@ -135,6 +144,14 @@ impl VideoRecvPipeline {
                 let nal_type = nal[0] & 0x1F;
                 if matches!(nal_type, 14 | 30) {
                     return;
+                }
+                // Test hook: starve the decoder of keyframes for a while.
+                if let Some(until) = self.drop_keyframes_until {
+                    if std::time::Instant::now() < until
+                        && matches!(nal_type, 5 | 7 | 8 | 24)
+                    {
+                        return;
+                    }
                 }
                 #[cfg(feature = "video-cam")]
                 if let Some(ref mut dec) = self.decoder {
@@ -233,6 +250,7 @@ fn pick_source_frame(
 /// (per-SSRC rollover), own SSRC + payload type; sends gated until DTLS
 /// keys land (same gate flag as audio).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn video_send_loop_shared(
     socket: Arc<UdpSocket>,
     remote_addr: SocketAddr,
@@ -241,6 +259,7 @@ async fn video_send_loop_shared(
     stats: Arc<Mutex<MediaStats>>,
     ssrc: u32,
     cfg: VideoSessionConfig,
+    keyframe_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let mut packetizer = video::VideoPacketizer::new(ssrc);
     let mut interval = time::interval(Duration::from_millis(video::FRAME_INTERVAL_MS));
@@ -264,6 +283,20 @@ async fn video_send_loop_shared(
         if !keys_ready.load(std::sync::atomic::Ordering::SeqCst) {
             continue;
         }
+
+        // Remote PLI (packet loss / key-missed): force an IDR next frame.
+        let keyframe_requested = keyframe_flag
+            .as_ref()
+            .map(|f| f.swap(false, std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(false);
+        #[cfg(feature = "video-cam")]
+        if keyframe_requested {
+            if let Some(ref mut enc) = encoder {
+                enc.force_keyframe();
+                tracing::info!("keyframe forced (PLI)");
+            }
+        }
+        let _ = keyframe_requested;
 
         let frame = pick_source_frame(
             &cfg.screen_source,
@@ -512,6 +545,10 @@ impl MediaSession {
             })
         });
         let pli_probe_pub = pli_probe.clone();
+        // PLI from the REMOTE side -> the video send loop emits a keyframe.
+        let keyframe_flag = video.as_ref().map(|_| {
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+        });
 
         let local_pwd = local_creds.pwd.clone();
         let recv_handle = {
@@ -520,6 +557,7 @@ impl MediaSession {
             let stats = stats.clone();
             let dtls_inbound = dtls_inbound.clone();
             let pli_probe_recv = pli_probe.clone();
+            let keyframe_flag_recv = keyframe_flag.clone();
             let video_demux = video.as_ref().map(|cfg| {
                 let pipeline = VideoRecvPipeline::new(cfg.remote_frames.clone());
                 // PLI probe: the recv loop publishes decode progress + the
@@ -541,6 +579,7 @@ impl MediaSession {
                 dtls_inbound,
                 video_demux,
                 pli_probe_recv,
+                keyframe_flag_recv,
             ))
         };
 
@@ -564,6 +603,7 @@ impl MediaSession {
                 stats,
                 video_ssrc,
                 cfg,
+                keyframe_flag,
             ));
         }
 
@@ -1205,6 +1245,7 @@ async fn recv_loop_with_stun(
     dtls_inbound: Arc<super::dtls::DtlsInbound>,
     mut video_demux: Option<(Vec<u8>, VideoRecvPipeline)>,
     pli_probe: Option<std::sync::Arc<PliProbe>>,
+    keyframe_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let mut buf = [0u8; 2048];
 
@@ -1245,6 +1286,22 @@ async fn recv_loop_with_stun(
                 {
                     let mut s = stats.lock().await;
                     s.rtp_arrivals += 1;
+                }
+
+                // SRTCP first: feedback (PLI) flips the video send loop's
+                // keyframe-request flag.
+                if let Some(flag) = keyframe_flag.as_ref() {
+                    if let Ok(mut ctx) = srtp_ctx.try_lock() {
+                        if let Ok(rtcp_data) = srtp::unprotect_rtcp(&mut ctx, data) {
+                            for block in super::rtcp::parse_rtcp(&rtcp_data) {
+                                if let super::rtcp::RtcpBlock::Pli { .. } = block {
+                                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    tracing::info!("PLI received — keyframe requested");
+                                }
+                            }
+                            continue;
+                        }
+                    }
                 }
 
                 // Try SRTP decrypt

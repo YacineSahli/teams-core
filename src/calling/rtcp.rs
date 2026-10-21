@@ -53,6 +53,11 @@ pub enum RtcpBlock {
     ReceiverReport {
         ssrc: u32,
     },
+    /// Payload-specific feedback PLI (RFC 4585): keyframe request.
+    Pli {
+        sender_ssrc: u32,
+        media_ssrc: u32,
+    },
     Sdes,
     Unknown(u8),
 }
@@ -324,6 +329,13 @@ pub fn parse_rtcp(data: &[u8]) -> Vec<RtcpBlock> {
             }
             PT_SDES => {
                 blocks.push(RtcpBlock::Sdes);
+            }
+            206 if pkt.len() >= 12 && (pkt[0] & 0x1F) == 1 => {
+                // PSFB PLI: sender SSRC + media SSRC.
+                blocks.push(RtcpBlock::Pli {
+                    sender_ssrc: u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]),
+                    media_ssrc: u32::from_be_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]),
+                });
             }
             other => {
                 blocks.push(RtcpBlock::Unknown(other));

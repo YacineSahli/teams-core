@@ -79,6 +79,12 @@ impl H264Encoder {
         (self.width, self.height)
     }
 
+    /// Force the next encoded frame to be an IDR (keyframe) — the answer
+    /// to an RTCP PLI from the remote side.
+    pub fn force_keyframe(&mut self) {
+        self.encoder.force_intra_frame();
+    }
+
     pub fn encode(&mut self, yuv_data: &[u8]) -> Result<Vec<Vec<u8>>> {
         let expected_size = (self.width * self.height * 3 / 2) as usize;
         if yuv_data.len() < expected_size {
