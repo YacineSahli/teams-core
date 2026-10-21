@@ -780,10 +780,7 @@ pub async fn run_call_with_controls(
     let offer_sdp: String = if use_camera {
         offer_result.sdp.clone()
     } else {
-        match offer_result.sdp.find("m=video") {
-            Some(idx) => offer_result.sdp[..idx].to_string(),
-            None => offer_result.sdp.clone(),
-        }
+        sdp::strip_video_mline(&offer_result.sdp)
     };
     let (phase1, _phase2) = if is_1to1_call {
         // 1:1 call: single POST with SDP (cpconv for consumer — see

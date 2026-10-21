@@ -727,6 +727,15 @@ pub fn generate_av_sdp_offer(p: &AvSdpParams) -> AvSdpResult {
     sdp.push_str("a=fmtp:122 packetization-mode=1;mst-mode=NI-TC\r\n");
     sdp.push_str("a=rtpmap:121 x-rtvc1/90000\r\n");
     sdp.push_str("a=rtpmap:123 x-ulpfecuc/90000\r\n");
+    // STANDARD RTCP feedback (RFC 4585/5104) alongside the MS x-message
+    // line: a WebRTC peer only honors PLI/FIR when the SDP negotiated
+    // them — meeting/group video legs answered by browsers hit the exact
+    // consumer-path bug otherwise (Chrome ignores PLIs; video goes black
+    // after any keyframe loss). Same three lines as the BUNDLE offer;
+    // SFB-shaped peers ignore what they don't negotiate.
+    sdp.push_str("a=rtcp-fb:* ccm fir\r\n");
+    sdp.push_str("a=rtcp-fb:* nack\r\n");
+    sdp.push_str("a=rtcp-fb:* nack pli\r\n");
     sdp.push_str("a=rtcp-fb:* x-message app send:src,x-pli recv:src,x-pli\r\n");
     sdp.push_str("a=x-signaling-fb:* x-message app send:src,csrc,vc recv:src\r\n");
     sdp.push_str("a=rtcp-rsize\r\n");
@@ -767,6 +776,19 @@ pub fn generate_av_sdp_offer(p: &AvSdpParams) -> AvSdpResult {
         audio_pwd: p.audio_pwd.to_string(),
         video_ufrag: p.video_ufrag.to_string(),
         video_pwd: p.video_pwd.to_string(),
+    }
+}
+
+/// Strip the video m-line (and everything after it) from an offer — the
+/// audio-only call shape: the callee preps its accept from the DECLARED
+/// modalities and a video m-line it cannot answer (X-H264UC) kills the
+/// accept client-side (CallEndReasonMediaOfferProcessingError,
+/// HAR-captured 2026-10-20). Pure so the call placement path stays
+/// unit-testable.
+pub fn strip_video_mline(sdp: &str) -> String {
+    match sdp.find("m=video") {
+        Some(idx) => sdp[..idx].to_string(),
+        None => sdp.to_string(),
     }
 }
 
@@ -1161,8 +1183,7 @@ a=rtpmap:8 PCMA/8000\r\n";
     }
 
     #[test]
-    fn test_generate_av_sdp_offer() {
-        let result = generate_av_sdp_offer(&AvSdpParams {
+    fn test_generate_av_sdp_offer() {        let result = generate_av_sdp_offer(&AvSdpParams {
             local_ip: "192.168.1.100",
             audio_port: 20000,
             video_port: 20002,
@@ -1221,6 +1242,27 @@ a=rtpmap:8 PCMA/8000\r\n";
             "missing video x-ssrc-range"
         );
         assert!(sdp.contains("a=x-caps:121"), "missing x-caps for PT 121");
+
+        // STANDARD rtcp-fb on the video m-line (meeting/group joins
+        // answered by WebRTC peers): PLI/FIR only fire when negotiated —
+        // the MS x-message line alone does not count (live consumer-path
+        // evidence 2026-10-21). All three must sit in the VIDEO section.
+        {
+            let video_idx = sdp.find("m=video").unwrap();
+            let video_section = &sdp[video_idx..];
+            assert!(
+                video_section.contains("a=rtcp-fb:* ccm fir"),
+                "video missing standard ccm fir"
+            );
+            assert!(
+                video_section.contains("a=rtcp-fb:* nack\r\n"),
+                "video missing standard nack"
+            );
+            assert!(
+                video_section.contains("a=rtcp-fb:* nack pli"),
+                "video missing standard nack pli"
+            );
+        }
 
         // MID attributes
         let audio_idx = sdp.find("m=audio").unwrap();
@@ -1604,5 +1646,65 @@ mod hostile_sdp_tests {
         }
         // All-empty payload lists are fine (Vec::new).
         assert!(video_payload_types("m=x-data 1 RTP/SAVP 127\r\n").is_empty());
+    }
+
+    /// The audio-only call shape: strip_video_mline removes the video
+    /// m-line and everything after it, leaving a complete audio offer.
+    #[test]
+    fn strip_video_mline_shapes_audio_only_offer() {
+        let result = generate_av_sdp_offer(&AvSdpParams {
+            local_ip: "192.168.1.100",
+            audio_port: 20000,
+            video_port: 20002,
+            audio_ufrag: "auFr",
+            audio_pwd: "audioPassword123456789==",
+            video_ufrag: "viFr",
+            video_pwd: "videoPassword123456789==",
+            audio_candidates: &[],
+            video_candidates: &[],
+            video_ssrc_base: 1000,
+            audio_ssrc: 5555,
+        });
+        let stripped = strip_video_mline(&result.sdp);
+        assert!(!stripped.contains("m=video"));
+        assert!(stripped.contains("m=audio 20000 RTP/SAVP 0"));
+        // The audio section stays intact (crypto last, CRLF-terminated).
+        assert!(stripped.contains("a=ice-ufrag:auFr"));
+        assert!(stripped.ends_with("\r\n"));
+        // Idempotent on an already-audio-only offer.
+        assert_eq!(strip_video_mline(&stripped), stripped);
+    }
+
+    /// The meeting/group join offer with camera on: m=video present AND
+    /// the STANDARD rtcp-fb lines the join's WebRTC peers need to answer
+    /// our PLIs (the prompt's P1 acceptance: join SDP carries m=video +
+    /// rtcp-fb). Camera off strips the m-line (offer matches the
+    /// declared ["Audio"] modalities).
+    #[test]
+    fn join_offer_video_shape() {
+        let params = AvSdpParams {
+            local_ip: "10.0.0.2",
+            audio_port: 30000,
+            video_port: 30002,
+            audio_ufrag: "auFr",
+            audio_pwd: "audioPassword123456789==",
+            video_ufrag: "viFr",
+            video_pwd: "videoPassword123456789==",
+            audio_candidates: &[],
+            video_candidates: &[],
+            video_ssrc_base: 2000,
+            audio_ssrc: 6666,
+        };
+        let video_on = generate_av_sdp_offer(&params).sdp;
+        assert!(video_on.contains("m=video 30002 RTP/SAVP 122 121 123"));
+        for line in ["a=rtcp-fb:* ccm fir", "a=rtcp-fb:* nack pli"] {
+            assert!(
+                video_on[video_on.find("m=video").unwrap()..].contains(line),
+                "join video section missing {line}"
+            );
+        }
+        let video_off = strip_video_mline(&video_on);
+        assert!(!video_off.contains("m=video"));
+        assert!(!video_off.contains("nack pli"));
     }
 }
