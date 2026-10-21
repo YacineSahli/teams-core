@@ -150,63 +150,78 @@ impl VideoRecvPipeline {
                 );
             }
         }
-        match self.depacketizer.depacketize(payload, marker) {
-            Ok(Some(nal)) => {
-                self.frames = self.depacketizer.frames_received;
-                if self.depacketizer.frames_received % 50 == 1 {
-                    tracing::info!(
-                        "Recv video NAL: type={}, size={} bytes (frames: {})",
-                        nal[0] & 0x1F,
-                        nal.len(),
-                        self.depacketizer.frames_received
-                    );
+        if let Ok(Some(first)) = self.depacketizer.depacketize(payload, marker) {
+            self.frames = self.depacketizer.frames_received;
+            // A STAP-A yields SEVERAL NALs — deliver them ALL within
+            // THIS packet's processing (deferring delivery to the NEXT
+            // packet swallows that packet: live 2026-10-21, every IDR's
+            // FU-A START fragment was eaten as a STAP-A's second
+            // delivery — 224 fragments, 0 starts, decode never started).
+            let mut nal = first;
+            loop {
+                self.process_nal(nal);
+                match self.depacketizer.take_pending() {
+                    Some(next) => nal = next,
+                    None => return,
                 }
-                // Skip SVC container NALs (PACSI 30 / prefix 14): openh264
-                // rejects them with bitstream errors that kill every
-                // P-frame after the IDR (live-verified 2026-10-20).
-                let nal_type = nal[0] & 0x1F;
-                if matches!(nal_type, 14 | 30) {
-                    return;
-                }
-                // Test hook: starve the decoder of keyframes for a while.
-                if let Some(until) = self.drop_keyframes_until {
-                    if std::time::Instant::now() < until
-                        && matches!(nal_type, 5 | 7 | 8 | 24)
-                    {
-                        return;
-                    }
-                }
-                #[cfg(feature = "video-cam")]
-                if let Some(ref mut dec) = self.decoder {
-                    match dec.decode(&nal) {
-                        Ok(Some(frame)) => {
-                            self.decoded += 1;
-                            if self.decoded % 25 == 1 {
-                                tracing::info!(
-                                    "Recv video frame decoded: {}x{} ({} decoded)",
-                                    frame.width,
-                                    frame.height,
-                                    self.decoded
-                                );
-                            }
-                            if let Some(ref tx) = self.remote_tx {
-                                let _ = tx.try_send(video::VideoFrame {
-                                    width: frame.width,
-                                    height: frame.height,
-                                    data: frame.data,
-                                });
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => tracing::debug!("video decode error: {e:#}"),
-                    }
-                }
-                #[cfg(not(feature = "video-cam"))]
-                let _ = &self.remote_tx;
             }
-            Ok(None) => {}
-            Err(e) => tracing::debug!("video depacketize error: {e:#}"),
         }
+    }
+
+    /// Decode/forward one complete NAL (from this packet or a STAP-A's
+    /// pending queue).
+    fn process_nal(&mut self, nal: Vec<u8>) {
+        if nal.is_empty() {
+            return;
+        }
+        if self.depacketizer.frames_received % 50 == 1 {
+            tracing::info!(
+                "Recv video NAL: type={}, size={} bytes (frames: {})",
+                nal[0] & 0x1F,
+                nal.len(),
+                self.depacketizer.frames_received
+            );
+        }
+        // Skip SVC container NALs (PACSI 30 / prefix 14): openh264
+        // rejects them with bitstream errors that kill every P-frame
+        // after the IDR (live-verified 2026-10-20).
+        let nal_type = nal[0] & 0x1F;
+        if matches!(nal_type, 14 | 30) {
+            return;
+        }
+        // Test hook: starve the decoder of keyframes for a while.
+        if let Some(until) = self.drop_keyframes_until {
+            if std::time::Instant::now() < until && matches!(nal_type, 5 | 7 | 8 | 24) {
+                return;
+            }
+        }
+        #[cfg(feature = "video-cam")]
+        if let Some(ref mut dec) = self.decoder {
+            match dec.decode(&nal) {
+                Ok(Some(frame)) => {
+                    self.decoded += 1;
+                    if self.decoded % 25 == 1 {
+                        tracing::info!(
+                            "Recv video frame decoded: {}x{} ({} decoded)",
+                            frame.width,
+                            frame.height,
+                            self.decoded
+                        );
+                    }
+                    if let Some(ref tx) = self.remote_tx {
+                        let _ = tx.try_send(video::VideoFrame {
+                            width: frame.width,
+                            height: frame.height,
+                            data: frame.data,
+                        });
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::debug!("video decode error: {e:#}"),
+            }
+        }
+        #[cfg(not(feature = "video-cam"))]
+        let _ = &self.remote_tx;
     }
 }
 

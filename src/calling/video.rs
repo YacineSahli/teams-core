@@ -703,6 +703,18 @@ impl VideoDepacketizer {
         Ok(first)
     }
 
+    /// Pop the next NAL buffered by a STAP-A aggregation. Callers MUST
+    /// drain these within the SAME packet's processing — deferring
+    /// delivery to the NEXT packet swallows that packet's own content
+    /// (live 2026-10-21: every IDR's FU-A START fragment was eaten as a
+    /// STAP-A's second delivery — 224 fragments, 0 starts, video never
+    /// decoded).
+    pub fn take_pending(&mut self) -> Option<Vec<u8>> {
+        let nal = self.pending.pop_front()?;
+        self.nals_received += 1;
+        Some(nal)
+    }
+
     fn depacketize_fu_a(&mut self, payload: &[u8], marker: bool) -> Result<Option<Vec<u8>>> {
         if payload.len() < 2 {
             bail!("FU-A packet too short");
@@ -1137,6 +1149,41 @@ mod stap_a_tests {
         // A frame completes only on the marker-bearing NAL delivery.
         assert_eq!(d.frames_received, 1);
         assert_eq!(d.nals_received, 2);
+    }
+
+    /// THE bug (live 2026-10-21): a STAP-A's second NAL was delivered on
+    /// the NEXT depacketize call, consuming that packet's content — the
+    /// next packet after SPS/PPS is always the IDR's FU-A START, so every
+    /// keyframe lost its start fragment (224 fragments observed, 0 starts,
+    /// decode never began). Pending must drain within the same packet.
+    #[test]
+    fn stap_a_pending_does_not_swallow_next_packet() {
+        // Packet 1: STAP-A(SPS, PPS)
+        let sps = vec![0x67u8, 0x42, 0xC0, 0x1F];
+        let pps = vec![0x68u8, 0xCE, 0x3C, 0x80];
+        let mut stap = vec![24u8];
+        for nal in [&sps, &pps] {
+            stap.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            stap.extend_from_slice(nal);
+        }
+        // Packet 2: FU-A START of an IDR (type 5)
+        let fu_start = vec![0x7Cu8, 0x85, 0xAA, 0xBB]; // FU-A hdr, S|type5, payload
+        // Packet 3: FU-A END of the IDR
+        let fu_end = vec![0x7Cu8, 0x45, 0xCC]; // E|type5, payload
+
+        let mut d = VideoDepacketizer::new();
+        let sps_out = d.depacketize(&stap, false).unwrap().unwrap();
+        assert_eq!(sps_out, sps);
+        // Drain pending NOW (the production on_rtp does): PPS delivered
+        // without touching the next packet.
+        let pps_out = d.take_pending().unwrap();
+        assert_eq!(pps_out, pps);
+        assert!(d.take_pending().is_none());
+
+        // The following packet's FU-A START is honored.
+        assert!(d.depacketize(&fu_start, false).unwrap().is_none()); // start: no complete NAL yet
+        let idr = d.depacketize(&fu_end, true).unwrap().expect("IDR reassembled");
+        assert_eq!(idr, vec![0x65u8, 0xAA, 0xBB, 0xCC]); // reconstructed IDR header + payloads
     }
 
     #[test]
