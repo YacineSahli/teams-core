@@ -680,7 +680,7 @@ pub async fn run_call_with_controls(
     // 1 s on / 4 s off. Exits when the phase leaves Ringing (connected)
     // or the call task ends (phase sender dropped / stop signalled).
     #[cfg(feature = "audio")]
-    {
+    if std::env::var("TEAMSFAST_NO_RINGBACK").as_deref() != Ok("1") {
         let rb_phase = phase_tx.as_ref().map(|tx| tx.subscribe());
         let rb_stop = stop.clone();
         std::thread::Builder::new()
