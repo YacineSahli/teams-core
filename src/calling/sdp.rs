@@ -954,9 +954,13 @@ pub fn video_payload_types(blob: &str) -> Vec<u8> {
         .collect();
     // Exclude rtx PTs (a=rtpmap:<pt> rtx/…) — they are retransmission
     // wrappers, not decodable media; the web pairs every codec with one.
+    // Scan ONLY the first video section (skip(1) drops its own m= line;
+    // stop at the next m= line — the screenshare section carries its own
+    // rtx PTs that may collide with main PTs here).
     let rtx: Vec<u8> = blob[start..]
         .lines()
-        .take_while(|l| !l.trim_start().starts_with("m=") || l.trim_start().starts_with("m=video"))
+        .skip(1)
+        .take_while(|l| !l.trim_start().starts_with("m="))
         .filter_map(|l| {
             let l = l.trim();
             let rest = l.strip_prefix("a=rtpmap:")?;
@@ -1490,12 +1494,19 @@ mod bundle_edge_tests {
     /// 2026-10-21).
     #[test]
     fn video_payload_types_exclude_rtx() {
-        let offer = "m=video 52710 RTP/SAVP 102 104 45 103 107 46\r\n\
+        // mid1 with rtx pairs, then a SECOND video section (screenshare)
+        // whose rtx declarations include PT 45 — a MAIN codec of mid1. A
+        // scan leaking past the section boundary would wrongly strip 45
+        // from the demux set.
+        let offer = "m=video 52710 RTP/SAVP 102 104 45 103 107\r\n\
 a=rtpmap:102 H264/90000\r\n\
 a=rtpmap:104 H264/90000\r\n\
 a=rtpmap:45 AV1/90000\r\n\
 a=rtpmap:103 rtx/90000\r\n\
 a=rtpmap:107 rtx/90000\r\n\
+m=video 52710 RTP/SAVP 102 46\r\n\
+a=rtpmap:102 H264/90000\r\n\
+a=rtpmap:45 rtx/90000\r\n\
 a=rtpmap:46 rtx/90000\r\n\
 m=x-data 52710 RTP/SAVP 127\r\n";
         let pts = video_payload_types(offer);
