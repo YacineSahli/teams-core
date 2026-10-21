@@ -127,6 +127,29 @@ impl VideoRecvPipeline {
     pub fn on_rtp(&mut self, payload: &[u8], marker: bool, ssrc: u32) {
         self.packets += 1;
         self.last_ssrc = ssrc;
+        // Keyframe forensics: SPS/PPS/IDR first bytes + running counts —
+        // Chrome answered a PLI with SPS/PPS but no IDR ever landed
+        // (live 2026-10-21), and the byte shapes decide the next fix.
+        if !payload.is_empty() {
+            let nal_type = if payload[0] & 0x1F == 24 {
+                // STAP-A: first embedded NAL's header is at offset 3.
+                payload.get(3).map(|b| b & 0x1F).unwrap_or(99)
+            } else {
+                payload[0] & 0x1F
+            };
+            if matches!(nal_type, 5 | 7 | 8) {
+                let head: Vec<String> = payload
+                    .iter()
+                    .take(10)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                tracing::info!(
+                    "KEYFRAME NAL type {nal_type} len {} head {}",
+                    payload.len(),
+                    head.join("")
+                );
+            }
+        }
         match self.depacketizer.depacketize(payload, marker) {
             Ok(Some(nal)) => {
                 self.frames = self.depacketizer.frames_received;

@@ -992,6 +992,9 @@ pub fn bundle_video_answer_section(
     if let Some(ref fmtp) = vid.fmtp {
         out.push_str(&format!("a=fmtp:{} {}\r\n", vid.payload_type, fmtp));
     }
+    out.push_str("a=rtcp-fb:* ccm fir\r\n");
+    out.push_str("a=rtcp-fb:* nack\r\n");
+    out.push_str("a=rtcp-fb:* nack pli\r\n");
     out.push_str("a=rtcp-fb:* x-message app send:src,x-pli recv:src,x-pli\r\n");
     out.push_str("a=x-signaling-fb:* x-message app send:src,vc recv:src\r\n");
     out.push_str("a=rtcp-rsize\r\n");
@@ -1080,6 +1083,13 @@ pub fn generate_bundle_sdp_offer(
     sdp.push_str("a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f\r\n");
     sdp.push_str("a=rtpmap:108 H264/90000\r\n");
     sdp.push_str("a=fmtp:108 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n");
+    // STANDARD RTCP feedback (RFC 4585/5104): a WebRTC sender only honors
+    // PLI/FIR when the SDP negotiated them — the MS x-message lines do
+    // not count (live 2026-10-21: Chrome ignored 40+ PLIs until this
+    // landed; the web's own offers carry these exact lines).
+    sdp.push_str("a=rtcp-fb:* ccm fir\r\n");
+    sdp.push_str("a=rtcp-fb:* nack\r\n");
+    sdp.push_str("a=rtcp-fb:* nack pli\r\n");
     sdp.push_str("a=rtcp-fb:* x-message app send:src,x-pli recv:src,x-pli\r\n");
     sdp.push_str("a=x-signaling-fb:* x-message app send:src,vc recv:src\r\n");
     sdp.push_str("a=rtcp-rsize\r\n");
@@ -1445,6 +1455,9 @@ a=ice-pwd:Tp0Tz1Pw0Tz1Pw0Tz1Pw0Tz1P\r\n";
         assert!(section.contains(&cand.to_sdp_line()));
         // No SDES crypto ever on DTLS-only offers.
         assert!(!section.contains("a=crypto:"));
+        // Standard RTCP feedback negotiated (PLI/FIR honored by WebRTC).
+        assert!(section.contains("a=rtcp-fb:* nack pli\r\n"));
+        assert!(section.contains("a=rtcp-fb:* ccm fir\r\n"));
     }
 
     #[test]
@@ -1477,6 +1490,8 @@ a=ice-pwd:Tp0Tz1Pw0Tz1Pw0Tz1Pw0Tz1P\r\n";
         // DTLS capability declared; NO SDES crypto anywhere.
         assert!(r.sdp.contains("a=setup:actpass\r\n"));
         assert!(!r.sdp.contains("a=crypto:"));
+        // Standard RTCP feedback declared on the video m-line.
+        assert!(r.sdp.contains("a=rtcp-fb:* nack pli\r\n"));
         // Our answerer can parse it back.
         let vid = parse_first_video_section(&r.sdp).expect("own offer parses");
         assert_eq!(vid.payload_type, 102);
