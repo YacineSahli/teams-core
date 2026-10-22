@@ -1357,6 +1357,9 @@ pub async fn run_call_with_controls(
     });
     tracing::info!("Call active, running for up to {}s...", duration_secs);
     let started = std::time::Instant::now();
+    // Caller-side frozen-recv watchdog state.
+    let mut last_caller_recv: u32 = 0;
+    let mut caller_recv_stalled_since: Option<std::time::Instant> = None;
     loop {
         // Drain late callAcceptance acks forwarded by the frame pump
         // (the acceptance frame arrives after connect; acking it from
@@ -1378,6 +1381,32 @@ pub async fn run_call_with_controls(
         }
         if started.elapsed() >= Duration::from_secs(duration_secs) {
             break;
+        }
+        // CALLER-side frozen-recv watchdog (the answerer has one): when
+        // the peer hangs up, the CC may never deliver an end frame to
+        // the caller (message_loss on a trouter recycle dropped it,
+        // live 2026-10-22) — the caller then streams into the void
+        // until the duration cap. Once we have RECEIVED media, a recv
+        // counter frozen for 45s means the session is dead.
+        {
+            let frozen = {
+                let rs = outgoing_handles.recv_stats.lock().await;
+                rs.packets_received
+            };
+            if frozen == 0 {
+                caller_recv_stalled_since = None;
+            } else if frozen == last_caller_recv {
+                let since = caller_recv_stalled_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= Duration::from_secs(45) {
+                    tracing::warn!(
+                        "caller watchdog: recv frozen at {frozen} for 45s — remote gone, ending call"
+                    );
+                    break;
+                }
+            } else {
+                last_caller_recv = frozen;
+                caller_recv_stalled_since = None;
+            }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
