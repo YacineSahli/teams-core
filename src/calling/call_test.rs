@@ -332,7 +332,8 @@ pub async fn run_call_with_controls(
 
     // Live controls: split the pair up front (mic gate → audio send,
     // camera gate + preview tee → video send, remote sink → video
-    // receive, phase → the embedder's UI).
+    // receive, phase → the embedder's UI, renegotiation inbox → the
+    // main loop's answer drain below).
     let (
         mic_gate,
         camera_gate,
@@ -341,6 +342,7 @@ pub async fn run_call_with_controls(
         phase_tx,
         screen_slot,
         camera_slot,
+        reneg_rx,
     ) = match controls.take() {
         Some(c) => (
             Some(c.mic_on),
@@ -350,8 +352,9 @@ pub async fn run_call_with_controls(
             Some(c.phase),
             Some(c.screen_source),
             Some(c.camera_source),
+            Some(c.renegotiations),
         ),
-        None => (None, None, None, None, None, None, None),
+        None => (None, None, None, None, None, None, None, None),
     };
 
     // Extract caller MRI from skype token (JWT)
@@ -1390,6 +1393,39 @@ pub async fn run_call_with_controls(
         }
         if started.elapsed() >= Duration::from_secs(duration_secs) {
             break;
+        }
+        // Mid-call renegotiation offers from the CALLEE (real web peers
+        // share / camera-flip via a NEW m-line; our own rig share rides
+        // the existing video leg and never lands here). Answer on the
+        // session transport, building from OUR original offer — the
+        // caller is the DTLS server (their acceptance answered active),
+        // so setup rewrites to passive (no role restart). The channel
+        // is drained fully BEFORE awaiting: holding the Receiver's
+        // borrow across an await makes the task !Send (mpsc Receiver
+        // is Send but not Sync).
+        {
+            let mut pending: Vec<(String, String)> = Vec::new();
+            if let Some(rx) = reneg_rx.as_ref() {
+                while let Ok(item) = rx.try_recv() {
+                    pending.push(item);
+                }
+            }
+            for (url, reoff) in pending {
+                tracing::info!("CALLQA renegotiation=received offer_bytes={}", reoff.len());
+                let answer = sdp::build_renegotiation_answer_as_caller(&reoff, &offer_sdp);
+                match signaling::post_renegotiation_answer(
+                    &http,
+                    skype_token_str,
+                    &url,
+                    &answer,
+                    consumer,
+                )
+                .await
+                {
+                    Ok(()) => tracing::info!("CALLQA renegotiation=answered"),
+                    Err(e) => tracing::warn!("renegotiation answer failed: {e:#}"),
+                }
+            }
         }
         // CALLER-side frozen-recv watchdog (the answerer has one): when
         // the peer hangs up, the CC may never deliver an end frame to

@@ -2009,6 +2009,138 @@ pub fn build_renegotiation_answer(offer: &str, original_answer: &str) -> String 
     out
 }
 
+/// Caller-side twin of [`build_renegotiation_answer`]: the caller never
+/// sent an answer, so the template is the OFFER WE SENT — our ICE/DTLS
+/// credentials live there. Two deltas from the callee variant: every
+/// copied `a=setup:` line is rewritten to `passive` (our offer said
+/// actpass and the callee's acceptance answered `active`, making US the
+/// DTLS server — a renegotiation must not restart or flip roles), and
+/// directions mirror from the incoming offer as usual. A NEW sendonly
+/// share section is accepted recvonly on the same transport with its
+/// fresh mid and `a=label:applicationsharing-video`; port-0/x-data
+/// sections are rejected; the offer group line is echoed. Shapes from
+/// the live caller-view capture 2026-10-22 (each share gets a FRESH
+/// mid — 4, then 5 — stopped mids never return).
+pub fn build_renegotiation_answer_as_caller(offer: &str, our_offer: &str) -> String {
+    let (orig_session, orig_sections) = split_sections(our_offer);
+    let (_offer_session, offer_sections) = split_sections(offer);
+
+    // Answer section templates by mid (from our original offer), plus
+    // the transport attrs from the original mid:1 video (fallback:
+    // first section) for brand-new sections.
+    let orig_by_mid: std::collections::HashMap<&str, &MSection> = orig_sections
+        .iter()
+        .filter_map(|s| s.mid.as_deref().map(|m| (m, s)))
+        .collect();
+    let transport = orig_by_mid
+        .get("1")
+        .copied()
+        .or_else(|| orig_sections.first());
+    let transport_lines: Vec<&str> = our_offer
+        .lines()
+        .skip_while(|l| {
+            // skip to the transport section's m= line
+            match transport {
+                Some(t) => !l.starts_with(&t.mline),
+                None => true,
+            }
+        })
+        .take_while(|l| !l.starts_with("a=label:"))
+        .collect::<Vec<&str>>();
+    let port = transport
+        .and_then(|t| t.mline.split(' ').nth(1))
+        .unwrap_or("0")
+        .to_string();
+
+    let mut out = String::new();
+    for line in &orig_session {
+        // Our offer's own group line is superseded by the incoming
+        // offer's (it names the NEW mid) — emit exactly one group.
+        if line.starts_with("a=group:BUNDLE") {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    if let Some(grp) = offer.lines().find(|l| l.starts_with("a=group:BUNDLE")) {
+        out.push_str(grp);
+        out.push_str("\r\n");
+    }
+
+    for sec in &offer_sections {
+        let port0 = sec.mline.split(' ').nth(1) == Some("0");
+        if let (Some(mid), false) = (sec.mid.as_deref(), port0) {
+            if let Some(orig) = orig_by_mid.get(mid) {
+                // Existing m-line: mirror our original offer section,
+                // with the direction mirrored from THIS offer and setup
+                // rewritten to passive (we stay the DTLS server).
+                let answer_dir = match sec.direction {
+                    Some("recvonly") => "a=sendonly",
+                    Some("inactive") => "a=inactive",
+                    Some("sendonly") => "a=recvonly",
+                    _ => "a=sendrecv",
+                };
+                let mut started = false;
+                for l in our_offer.lines() {
+                    if l.starts_with(&orig.mline) {
+                        started = true;
+                    } else if started && l.starts_with("m=") {
+                        break;
+                    }
+                    if started && !l.trim().is_empty() {
+                        if l.starts_with("a=sendrecv")
+                            || l.starts_with("a=sendonly")
+                            || l.starts_with("a=recvonly")
+                            || l.starts_with("a=inactive")
+                        {
+                            out.push_str(answer_dir);
+                        } else if l.starts_with("a=setup:") {
+                            out.push_str("a=setup:passive");
+                        } else {
+                            out.push_str(l);
+                        }
+                        out.push_str("\r\n");
+                    }
+                }
+                continue;
+            }
+            if sec.mline.starts_with("m=video") && sec.direction == Some("sendonly") {
+                // NEW share section: recvonly on our transport.
+                out.push_str(&format!("m=video {port} RTP/SAVP 102\r\n"));
+                for l in &transport_lines {
+                    if l.starts_with("m=") || l.starts_with("a=label:") {
+                        continue;
+                    }
+                    if l.starts_with("a=mid:") {
+                        out.push_str(&format!("a=mid:{mid}\r\n"));
+                    } else if l.starts_with("a=sendrecv")
+                        || l.starts_with("a=sendonly")
+                        || l.starts_with("a=recvonly")
+                        || l.starts_with("a=inactive")
+                    {
+                        out.push_str("a=recvonly\r\n");
+                    } else if l.starts_with("a=setup:") {
+                        out.push_str("a=setup:passive\r\n");
+                    } else {
+                        out.push_str(l);
+                        out.push_str("\r\n");
+                    }
+                }
+                out.push_str("a=label:applicationsharing-video\r\n");
+                continue;
+            }
+        }
+        // Reject: port-0, midless (x-data), or unknown sections.
+        let kind = sec.mline.split(' ').next().unwrap_or("m=x-data");
+        let pts = sec.mline.splitn(4, ' ').nth(3).unwrap_or("34");
+        out.push_str(&format!("{kind} 0 RTP/SAVP {pts}\r\nc=IN IP4 127.0.0.1\r\n"));
+        if let Some(mid) = &sec.mid {
+            out.push_str(&format!("a=mid:{mid}\r\n"));
+        }
+    }
+    out
+}
+
     // ---- renegotiation answer (shapes from the live 2026-10-22 browser
     // share capture, identifiers/creds scrubbed to synthetic values) ----
 
@@ -2056,3 +2188,72 @@ pub fn build_renegotiation_answer(offer: &str, original_answer: &str) -> String 
         let share = answer.split("a=mid:5\r\n").nth(1).unwrap().split("m=").next().unwrap();
         assert!(share.trim_start().starts_with("a=recvonly"));
     }
+
+    // Our original OFFER as the caller would have sent it: synthetic
+    // creds distinct from the offer fixtures (caller side of the
+    // transport; actpass — we were the DTLS offerer).
+    const RENEG_OUR_OFFER: &str = "v=0\r\no=- 333 1 IN IP4 127.0.0.1\r\ns=-\r\nb=CT:4000\r\nt=0 0\r\na=extmap-allow-mixed\r\na=msid-semantic: WMS *\r\na=group:BUNDLE 0 1\r\nm=audio 50004 RTP/SAVP 105 111 0 8\r\nc=IN IP4 198.51.100.4\r\na=setup:actpass\r\na=mid:0\r\na=sendrecv\r\na=ice-ufrag:calu\r\na=ice-pwd:callerpwd00000000\r\na=fingerprint:sha-256 33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:33\r\na=rtcp-mux\r\na=label:main-audio\r\nm=video 50004 RTP/SAVP 102 104 108\r\nc=IN IP4 198.51.100.4\r\na=setup:actpass\r\na=mid:1\r\na=sendrecv\r\na=ice-ufrag:calu\r\na=ice-pwd:callerpwd00000000\r\na=fingerprint:sha-256 33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:33\r\na=rtcp-mux\r\na=rtcp-fb:* nack pli\r\na=label:main-video\r\n";
+
+    #[test]
+    fn renegotiation_answer_as_caller_accepts_share() {
+        let answer =
+            build_renegotiation_answer_as_caller(RENEG_OFFER_SHARE_START, RENEG_OUR_OFFER);
+        // The offer's group (with the NEW mid) is echoed — exactly once
+        // (our offer's own group line must not also survive).
+        assert_eq!(answer.matches("a=group:BUNDLE").count(), 1);
+        assert!(answer.contains("a=group:BUNDLE 0 1 4\r\n"));
+        // Existing sections copied with OUR transport (the offer's
+        // creds must never leak in — this is the caller-side trap).
+        let audio = answer.split("m=audio").nth(1).unwrap().split("m=").next().unwrap();
+        assert!(audio.contains("a=mid:0\r\n"));
+        assert!(audio.contains("a=sendrecv\r\n"));
+        assert!(audio.contains("a=ice-ufrag:calu\r\n"));
+        assert!(!audio.contains("a=ice-ufrag:synu"));
+        // The caller stays the DTLS server: setup rewritten passive,
+        // actpass must be gone everywhere.
+        assert!(answer.contains("a=setup:passive\r\n"));
+        assert!(!answer.contains("actpass"));
+        // The share: NEW mid answered recvonly on OUR transport. The
+        // share's own m-line is unique (single PT 102; the main video
+        // section carries 102 104 108).
+        let share = answer
+            .split("m=video 50004 RTP/SAVP 102\r\n")
+            .nth(1)
+            .unwrap()
+            .split("m=")
+            .next()
+            .unwrap();
+        assert!(share.contains("a=setup:passive\r\n"));
+        assert!(share.contains("a=mid:4\r\n"));
+        assert!(share.contains("a=recvonly\r\n"));
+        assert!(share.contains("a=ice-ufrag:calu\r\n"));
+        assert!(share.contains("a=label:applicationsharing-video\r\n"));
+        // x-data rejected (port 0, midless in the offer).
+        assert!(answer.contains("m=x-data 0 RTP/SAVP 34\r\n"));
+    }
+
+    #[test]
+    fn renegotiation_answer_as_caller_mirrors_camera_off() {
+        let answer =
+            build_renegotiation_answer_as_caller(RENEG_OFFER_CAMERA_OFF, RENEG_OUR_OFFER);
+        assert!(answer.contains("a=group:BUNDLE 0 1 5\r\n"));
+        assert_eq!(answer.matches("a=group:BUNDLE").count(), 1);
+        // Offer flipped mid:1 to recvonly (peer stopped its camera) —
+        // our answer keeps SENDING: sendonly.
+        let main = answer.split("a=mid:1\r\n").nth(1).unwrap().split("m=").next().unwrap();
+        assert!(main.trim_start().starts_with("a=sendonly"));
+        // The share on the fresh mid 5 still accepted recvonly, on our
+        // transport, still passive.
+        let share = answer
+            .split("m=video 50004 RTP/SAVP 102\r\n")
+            .nth(1)
+            .unwrap()
+            .split("m=")
+            .next()
+            .unwrap();
+        assert!(share.contains("a=setup:passive\r\n"));
+        assert!(share.contains("a=mid:5\r\n"));
+        assert!(share.contains("a=recvonly\r\n"));
+        assert!(share.contains("a=ice-ufrag:calu\r\n"));
+    }
+
