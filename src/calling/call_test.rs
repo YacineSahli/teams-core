@@ -3268,6 +3268,36 @@ async fn leave_call_by_url(
     params: &signaling::ConversationCallParams<'_>,
     leave_url: &str,
 ) -> Result<()> {
+    // The leave BODY is required (browser-caller HAR 2026-10-22: the
+    // web posts participants.from + both transaction-end blocks and
+    // gets 204; our empty-object body 400'd on every consumer call —
+    // the caller hang-up chain has never worked). endpointId must be
+    // the REGISTERED epid on consumer, same rule as the create.
+    let declared_epid = if params.consumer {
+        crate::trouter::current_epid().unwrap_or_else(|| params.endpoint_id.to_string())
+    } else {
+        params.endpoint_id.to_string()
+    };
+    let body = serde_json::json!({
+        "participants": {"from": {
+            "id": params.caller_mri,
+            "displayName": params.caller_display_name,
+            "endpointId": declared_epid,
+            "participantId": params.participant_id,
+            "languageId": "en-us"
+        }},
+        "conversationTransactionEnd": {
+            "reason": "noError",
+            "code": 0,
+            "phrase": "ConversationEndNoModalityConnected"
+        },
+        "callTransactionEnd": {
+            "code": 0,
+            "subCode": 0,
+            "phrase": "CallEndReasonLocalUserInitiated",
+            "resultCategories": ["Success"]
+        }
+    });
     tracing::info!("Leaving conversation -> POST {}", leave_url);
     let resp = http
         .post(leave_url)
@@ -3279,7 +3309,7 @@ async fn leave_call_by_url(
         .header("Referer", "https://teams.microsoft.com/")
         .teams_headers(params.region)
         .header("x-ms-migration", "True")
-        .json(&serde_json::json!({}))
+        .json(&body)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
