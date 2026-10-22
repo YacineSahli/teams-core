@@ -825,7 +825,24 @@ pub async fn run_call_with_controls(
     } else {
         // Channel call: two-phase (create conversation, then join with SDP)
         tracing::info!("Phase 1: Creating conversation...");
-        let created = signaling::create_conversation(&http, &epconv_url, &conv_params).await?;
+        let mut created = signaling::create_conversation(&http, &epconv_url, &conv_params).await?;
+        // Consumer: the epconv response's controllers/links come back on
+        // the WORK proxy (flightproxy.teams.microsoft.com/api/v2/ep/…)
+        // which rejects our X-Skypetoken requests with a bare 400 (live
+        // 2026-10-22, both modalities, overnight-persistent — not a
+        // cooldown). The consumer twin accepts the identical join
+        // (A/B-probed: host-swap alone still 400s; host+cp-path swap
+        // 201s). Rewrite BOTH the controller and every link in the body
+        // (hang-up parses the leave link from it later).
+        if consumer {
+            created.conversation_controller =
+                signaling::consumerize_conv_urls(&created.conversation_controller);
+            created.response_body = signaling::consumerize_conv_urls(&created.response_body);
+            tracing::info!(
+                "Consumer controller/links rewritten: {}",
+                created.conversation_controller
+            );
+        }
         tracing::info!(
             "Phase 1 complete: conversationController = {}",
             created.conversation_controller

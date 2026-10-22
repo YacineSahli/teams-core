@@ -369,6 +369,21 @@ pub async fn join_conversation_with_sdp_video(
     .await
 }
 
+/// Rewrite work-proxy conversation URLs to the consumer twin (live
+/// 2026-10-22: the consumer epconv response started returning
+/// controllers and links on `api.flightproxy.teams.microsoft.com/api/v2/
+/// ep/conv-…` — that proxy 400s our X-Skypetoken joins and hang-ups —
+/// while the working cpconv flow's URLs live on
+/// `api.flightproxy.skype.com/api/v2/cp/conv-…`. Same rewrite for both
+/// families: host swap + `ep/` → `cp/` path swap. Consumer URLs already
+/// in the right shape and unrelated hosts pass through unchanged.
+pub fn consumerize_conv_urls(text: &str) -> String {
+    text.replace(
+        "api.flightproxy.teams.microsoft.com/api/v2/ep/",
+        "api.flightproxy.skype.com/api/v2/cp/",
+    )
+}
+
 /// Phase 2 with explicit `callModalities` (see [`join_call_modalities`]):
 /// a receive-capable join declares what it can take (video, screen
 /// share); the SDP direction says what it sends.
@@ -2100,6 +2115,28 @@ mod tests {
             video["callInvitation"]["callModalities"],
             serde_json::json!(["Audio", "Video"])
         );
+    }
+
+    #[test]
+    fn consumerize_conv_urls_rewrites_the_work_proxy() {
+        // Work-proxy controller/link → consumer twin (host + path family).
+        let work = "https://api.flightproxy.teams.microsoft.com/api/v2/ep/conv-euwe-06-prod-aks.conv.skype.com/conv/ABC?i=1&e=2";
+        assert_eq!(
+            consumerize_conv_urls(work),
+            "https://api.flightproxy.skype.com/api/v2/cp/conv-euwe-06-prod-aks.conv.skype.com/conv/ABC?i=1&e=2"
+        );
+        // A body full of links rewrites everywhere (leave, addParticipant…).
+        let body = format!(
+            "{{\"leave\":\"{work}/leave\",\"add\":\"{work}/add\"}}"
+        );
+        let out = consumerize_conv_urls(&body);
+        assert!(!out.contains("teams.microsoft.com"));
+        assert_eq!(out.matches("flightproxy.skype.com/api/v2/cp/").count(), 2);
+        // Consumer-shaped and unrelated URLs pass through byte-identical.
+        let consumer_url = "https://api.flightproxy.skype.com/api/v2/cp/conv-frce-06.conv.skype.com/conv/X/leave";
+        assert_eq!(consumerize_conv_urls(consumer_url), consumer_url);
+        let other = "https://cc-euwe-01-prod-aks.cc.skype.com:443/cc/v1/callHub/xyz";
+        assert_eq!(consumerize_conv_urls(other), other);
     }
 
     #[test]
