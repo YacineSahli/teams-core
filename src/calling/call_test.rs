@@ -106,6 +106,10 @@ pub struct CallControls {
     /// Mid-call camera source (camera-on-later); takes precedence over
     /// the pre-spawn capture when set.
     pub camera_source: CameraSlot,
+    /// Mid-call renegotiation offers forwarded by the embedder (trouter
+    /// mediaRenegotiation deliveries): (mediaAnswer URL, offer SDP).
+    /// The answer loop answers them on the session transport.
+    pub renegotiations: std::sync::mpsc::Receiver<(String, String)>,
 }
 
 /// The UI-side twin of [`CallControls`].
@@ -117,6 +121,8 @@ pub struct CallControlsHandle {
     pub local_preview: Option<std::sync::mpsc::Receiver<crate::calling::video::VideoFrame>>,
     pub screen_source: ScreenShareSlot,
     pub camera_source: CameraSlot,
+    /// Forward renegotiation offers to the active call's answer loop.
+    pub renegotiations: std::sync::mpsc::SyncSender<(String, String)>,
 }
 
 /// Shared slot carrying the call's screen-share frame source. The embedder
@@ -178,6 +184,7 @@ pub fn call_controls(local_preview: bool) -> (CallControls, CallControlsHandle) 
         (None, None)
     };
     let (phase_tx, phase_rx) = tokio::sync::watch::channel(CallPhase::Connecting);
+    let (reneg_tx, reneg_rx) = std::sync::mpsc::sync_channel::<(String, String)>(8);
     let screen_source: ScreenShareSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let camera_source: CameraSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
     (
@@ -189,6 +196,7 @@ pub fn call_controls(local_preview: bool) -> (CallControls, CallControlsHandle) 
             phase: phase_tx,
             screen_source: screen_source.clone(),
             camera_source: camera_source.clone(),
+            renegotiations: reneg_rx,
         },
         CallControlsHandle {
             mic_on: mic_tx,
@@ -198,6 +206,7 @@ pub fn call_controls(local_preview: bool) -> (CallControls, CallControlsHandle) 
             local_preview: prev_rx,
             screen_source,
             camera_source,
+            renegotiations: reneg_tx,
         },
     )
 }

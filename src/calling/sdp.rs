@@ -1838,3 +1838,221 @@ mod hostile_sdp_tests {
         assert!(out2.contains("a=mid:4\r\n"), "audio mid must follow the offer");
         assert!(!out2.contains("a=mid:9"), "video mid must not leak into the audio answer");
     }
+
+/// One parsed m-section of an SDP blob.
+struct MSection {
+    mline: String,
+    mid: Option<String>,
+    direction: Option<&'static str>,
+    label: Option<String>,
+}
+
+fn split_sections(blob: &str) -> (Vec<&str>, Vec<MSection>) {
+    let mut session: Vec<&str> = Vec::new();
+    let mut sections: Vec<MSection> = Vec::new();
+    let mut mline: Option<String> = None;
+    let mut mid = None;
+    let mut direction = None;
+    let mut label = None;
+    for line in blob.lines().filter(|l| !l.trim().is_empty()) {
+        if line.starts_with("m=") {
+            if let Some(m) = mline.take() {
+                sections.push(MSection { mline: m, mid: mid.take(), direction: direction.take(), label: label.take() });
+            }
+            mline = Some(line.to_string());
+            // If session lines were being collected and this is the
+            // first m=, stop collecting.
+            continue;
+        }
+        if mline.is_none() {
+            session.push(line);
+        } else {
+            if line.starts_with("a=mid:") {
+                mid = Some(line.strip_prefix("a=mid:").unwrap_or("").to_string());
+            } else if line.starts_with("a=sendrecv") {
+                direction = Some("sendrecv");
+            } else if line.starts_with("a=sendonly") {
+                direction = Some("sendonly");
+            } else if line.starts_with("a=recvonly") {
+                direction = Some("recvonly");
+            } else if line.starts_with("a=inactive") {
+                direction = Some("inactive");
+            } else if line.starts_with("a=label:") {
+                label = Some(line.strip_prefix("a=label:").unwrap_or("").to_string());
+            }
+        }
+    }
+    if let Some(m) = mline.take() {
+        sections.push(MSection { mline: m, mid, direction, label });
+    }
+    (session, sections)
+}
+
+/// Build a RENEGOTIATION answer (mid-call modality change: the peer
+/// starts a screen share, stops the camera, …) by transforming OUR
+/// ORIGINAL answer. The offers reuse the original ICE/DTLS (no restart
+/// — captured live 2026-10-22), so the answer keeps our transport
+/// verbatim; each offer m-line is answered in order: an m-line our
+/// original answer already carries is copied (mirroring direction
+/// changes: recvonly offer → sendonly answer), a NEW sendonly video
+/// section (the share — `a=label:applicationsharing-video`, a FRESH
+/// mid per renegotiation) is accepted recvonly on the same transport,
+/// and everything else (port-0 x-data, unknown) is rejected. The offer
+/// group line is echoed.
+pub fn build_renegotiation_answer(offer: &str, original_answer: &str) -> String {
+    let (orig_session, orig_sections) = split_sections(original_answer);
+    let (_offer_session, offer_sections) = split_sections(offer);
+
+    // Answer section templates by mid (from our original answer), plus
+    // the transport attrs from the original mid:1 video (fallback:
+    // first section) for brand-new sections.
+    let orig_by_mid: std::collections::HashMap<&str, &MSection> = orig_sections
+        .iter()
+        .filter_map(|s| s.mid.as_deref().map(|m| (m, s)))
+        .collect();
+    let transport = orig_by_mid
+        .get("1")
+        .copied()
+        .or_else(|| orig_sections.first());
+    let transport_lines: Vec<&str> = original_answer
+        .lines()
+        .skip_while(|l| {
+            // skip to the transport section's m= line
+            match transport {
+                Some(t) => !l.starts_with(&t.mline),
+                None => true,
+            }
+        })
+        .take_while(|l| !l.starts_with("a=label:"))
+        .collect::<Vec<&str>>();
+    let port = transport
+        .and_then(|t| t.mline.split(' ').nth(1))
+        .unwrap_or("0")
+        .to_string();
+
+    let mut out = String::new();
+    for line in &orig_session {
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    if let Some(grp) = offer.lines().find(|l| l.starts_with("a=group:BUNDLE")) {
+        out.push_str(grp);
+        out.push_str("\r\n");
+    }
+
+    for sec in &offer_sections {
+        let port0 = sec.mline.split(' ').nth(1) == Some("0");
+        if let (Some(mid), false) = (sec.mid.as_deref(), port0) {
+            if let Some(orig) = orig_by_mid.get(mid) {
+                // Existing m-line: mirror our original section, with the
+                // direction mirrored from THIS offer.
+                let answer_dir = match sec.direction {
+                    Some("recvonly") => "a=sendonly",
+                    Some("inactive") => "a=inactive",
+                    Some("sendonly") => "a=recvonly",
+                    _ => "a=sendrecv",
+                };
+                let mut started = false;
+                for l in original_answer.lines() {
+                    if l.starts_with(&orig.mline) {
+                        started = true;
+                    } else if started && l.starts_with("m=") {
+                        break;
+                    }
+                    if started && !l.trim().is_empty() {
+                        if l.starts_with("a=sendrecv")
+                            || l.starts_with("a=sendonly")
+                            || l.starts_with("a=recvonly")
+                            || l.starts_with("a=inactive")
+                        {
+                            out.push_str(answer_dir);
+                        } else {
+                            out.push_str(l);
+                        }
+                        out.push_str("\r\n");
+                    }
+                }
+                continue;
+            }
+            if sec.mline.starts_with("m=video") && sec.direction == Some("sendonly") {
+                // NEW share section: recvonly on our transport.
+                out.push_str(&format!("m=video {port} RTP/SAVP 102\r\n"));
+                for l in &transport_lines {
+                    if l.starts_with("m=") || l.starts_with("a=label:") {
+                        continue;
+                    }
+                    if l.starts_with("a=mid:") {
+                        out.push_str(&format!("a=mid:{mid}\r\n"));
+                    } else if l.starts_with("a=sendrecv")
+                        || l.starts_with("a=sendonly")
+                        || l.starts_with("a=recvonly")
+                        || l.starts_with("a=inactive")
+                    {
+                        out.push_str("a=recvonly\r\n");
+                    } else {
+                        out.push_str(l);
+                        out.push_str("\r\n");
+                    }
+                }
+                out.push_str("a=label:applicationsharing-video\r\n");
+                continue;
+            }
+        }
+        // Reject: port-0, midless (x-data), or unknown sections.
+        let kind = sec.mline.split(' ').next().unwrap_or("m=x-data");
+        let pts = sec.mline.splitn(4, ' ').nth(3).unwrap_or("34");
+        out.push_str(&format!("{kind} 0 RTP/SAVP {pts}\r\nc=IN IP4 127.0.0.1\r\n"));
+        if let Some(mid) = &sec.mid {
+            out.push_str(&format!("a=mid:{mid}\r\n"));
+        }
+    }
+    out
+}
+
+    // ---- renegotiation answer (shapes from the live 2026-10-22 browser
+    // share capture, identifiers/creds scrubbed to synthetic values) ----
+
+    const RENEG_OFFER_SHARE_START: &str = "v=0\r\no=- 111 3 IN IP4 127.0.0.1\r\ns=-\r\nb=CT:4000\r\nt=0 0\r\na=extmap-allow-mixed\r\na=msid-semantic: WMS *\r\na=group:BUNDLE 0 1 4\r\nm=audio 50000 RTP/SAVP 105 111 0 8\r\nc=IN IP4 203.0.113.7\r\na=setup:actpass\r\na=mid:0\r\na=sendrecv\r\na=ice-ufrag:synu\r\na=ice-pwd:syntheticpwd000000\r\na=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\na=rtcp-mux\r\na=label:main-audio\r\nm=video 50000 RTP/SAVP 102 104 108 45 103 107\r\nc=IN IP4 203.0.113.7\r\na=setup:actpass\r\na=mid:1\r\na=sendrecv\r\na=ice-ufrag:synu\r\na=ice-pwd:syntheticpwd000000\r\na=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\na=rtcp-mux\r\na=label:main-video\r\nm=video 50000 RTP/SAVP 102 104 108 45 103 107\r\nc=IN IP4 203.0.113.7\r\na=setup:actpass\r\na=mid:4\r\na=sendonly\r\na=ice-ufrag:synu\r\na=ice-pwd:syntheticpwd000000\r\na=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\na=rtcp-mux\r\na=label:applicationsharing-video\r\nm=x-data 0 RTP/SAVP 34\r\nc=IN IP4 203.0.113.7\r\na=label:data\r\n";
+
+    const RENEG_OFFER_CAMERA_OFF: &str = "v=0\r\no=- 111 4 IN IP4 127.0.0.1\r\ns=-\r\nb=CT:4000\r\nt=0 0\r\na=group:BUNDLE 0 1 5\r\nm=audio 50000 RTP/SAVP 105 111 0 8\r\nc=IN IP4 203.0.113.7\r\na=mid:0\r\na=sendrecv\r\na=ice-ufrag:synu\r\na=ice-pwd:syntheticpwd000000\r\na=rtcp-mux\r\na=label:main-audio\r\nm=video 50000 RTP/SAVP 102 104 108 45 103 107\r\nc=IN IP4 203.0.113.7\r\na=mid:1\r\na=recvonly\r\na=ice-ufrag:synu\r\na=ice-pwd:syntheticpwd000000\r\na=rtcp-mux\r\na=label:main-video\r\nm=video 50000 RTP/SAVP 102 104 108 45 103 107\r\nc=IN IP4 203.0.113.7\r\na=mid:5\r\na=sendonly\r\na=ice-ufrag:synu\r\na=ice-pwd:syntheticpwd000000\r\na=rtcp-mux\r\na=label:applicationsharing-video\r\nm=x-data 0 RTP/SAVP 34\r\na=label:data\r\n";
+
+    const RENEG_ORIG_ANSWER: &str = "v=0\r\no=- 222 2 IN IP4 127.0.0.1\r\ns=-\r\nb=CT:4000\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 40000 RTP/SAVP 0\r\nc=IN IP4 192.0.2.9\r\na=rtpmap:0 PCMU/8000\r\na=ptime:20\r\na=rtcp:40000\r\na=rtcp-mux\r\na=setup:active\r\na=mid:0\r\na=sendrecv\r\na=ice-ufrag:ouru\r\na=ice-pwd:ourpwd00000000000\r\na=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:11\r\na=candidate:1 1 UDP 2130706431 192.0.2.9 40000 typ host\r\na=label:main-audio\r\nm=video 40000 RTP/SAVP 102\r\nc=IN IP4 192.0.2.9\r\na=rtpmap:102 H264/90000\r\na=fmtp:102 packetization-mode=1;profile-level-id=42e01f\r\na=rtcp-fb:* ccm fir\r\na=rtcp-fb:* nack\r\na=rtcp-fb:* nack pli\r\na=rtcp-mux\r\na=setup:active\r\na=mid:1\r\na=sendrecv\r\na=ice-ufrag:ouru\r\na=ice-pwd:ourpwd00000000000\r\na=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:11\r\na=candidate:1 1 UDP 2130706431 192.0.2.9 40000 typ host\r\na=label:main-video\r\n";
+
+    #[test]
+    fn renegotiation_answer_accepts_share() {
+        let answer = build_renegotiation_answer(RENEG_OFFER_SHARE_START, RENEG_ORIG_ANSWER);
+        // The offer's group (with the NEW mid) is echoed.
+        assert!(answer.contains("a=group:BUNDLE 0 1 4\r\n"));
+        // Existing sections copied with our transport.
+        let audio = answer.split("m=audio").nth(1).unwrap().split("m=").next().unwrap();
+        assert!(audio.contains("a=mid:0\r\n"));
+        assert!(audio.contains("a=sendrecv\r\n"));
+        assert!(audio.contains("a=ice-ufrag:ouru\r\n"));
+        let main_video = answer.split("a=mid:1\r\n").nth(0).unwrap();
+        assert!(main_video.contains("m=video 40000 RTP/SAVP 102\r\n"));
+        // The share: NEW mid answered recvonly on the same transport.
+        let share = answer.split("a=mid:4\r\n").nth(0).unwrap();
+        assert!(
+            share.contains("m=video 40000 RTP/SAVP 102\r\n"),
+            "share section must ride our transport port"
+        );
+        let share_sec = answer.split("a=mid:4\r\n").nth(1).unwrap().split("m=").next().unwrap();
+        assert!(share_sec.trim_start().starts_with("a=recvonly"));
+        assert!(share_sec.contains("a=ice-ufrag:ouru\r\n"));
+        assert!(share_sec.contains("a=label:applicationsharing-video\r\n"));
+        // x-data rejected (port 0, midless in the offer).
+        assert!(answer.contains("m=x-data 0 RTP/SAVP 34\r\n"));
+    }
+
+    #[test]
+    fn renegotiation_answer_mirrors_camera_off() {
+        let answer = build_renegotiation_answer(RENEG_OFFER_CAMERA_OFF, RENEG_ORIG_ANSWER);
+        assert!(answer.contains("a=group:BUNDLE 0 1 5\r\n"));
+        // Offer flipped mid:1 to recvonly (peer stopped its camera) —
+        // our answer keeps SENDING: sendonly.
+        let main = answer.split("a=mid:1\r\n").nth(1).unwrap().split("m=").next().unwrap();
+        assert!(main.trim_start().starts_with("a=sendonly"));
+        // The share on the fresh mid 5 still accepted recvonly.
+        let share = answer.split("a=mid:5\r\n").nth(1).unwrap().split("m=").next().unwrap();
+        assert!(share.trim_start().starts_with("a=recvonly"));
+    }

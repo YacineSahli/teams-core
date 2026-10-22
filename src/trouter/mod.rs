@@ -438,7 +438,12 @@ pub fn data_frame_event(payload: &str) -> Option<String> {
         .and_then(|(_, u)| u.as_str())
         .unwrap_or_default()
         .to_string();
-    let is_call_callback = url.contains("conversationEnd") || url.contains("/call/end");
+    // mediaRenegotiation deliveries (mid-call modality changes: peer
+    // screen share / camera flips — captured live 2026-10-22) are
+    // published the same way so the embedder can answer them.
+    let is_call_callback = url.contains("conversationEnd")
+        || url.contains("/call/end")
+        || url.contains("/call/mediaRenegotiation/");
 
     if body_val.is_object() {
         if is_call_callback {

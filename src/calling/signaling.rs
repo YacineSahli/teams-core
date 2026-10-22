@@ -2201,3 +2201,39 @@ mod tests {
         assert_eq!(h.get("ms-teams-ring").unwrap(), "general");
     }
 }
+
+/// POST a RENEGOTIATION answer to the offer's `links.mediaAnswer` URL
+/// (mid-call modality change: the peer started a screen share). Same
+/// consumer envelope as the initial media answer.
+pub async fn post_renegotiation_answer(
+    http: &reqwest::Client,
+    skype_token: &str,
+    media_answer_url: &str,
+    sdp_answer: &str,
+    consumer: bool,
+) -> Result<()> {
+    let media_content = serde_json::json!({
+        "blob": sdp_answer,
+        "contentType": "application/sdp"
+    });
+    let payload = if consumer {
+        serde_json::json!({ "mediaAnswer": { "mediaContent": media_content } })
+    } else {
+        serde_json::json!({ "mediaContent": media_content })
+    };
+    tracing::info!("Answering renegotiation -> POST {}", media_answer_url);
+    let resp = http
+        .post(media_answer_url)
+        .header("X-Skypetoken", skype_token)
+        .header("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&payload)
+        .send()
+        .await
+        .context("renegotiation answer POST failed")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    tracing::info!("Renegotiation answer response: {} ({})", status, &body.chars().take(200).collect::<String>());
+    anyhow::ensure!(status.is_success(), "renegotiation answer rejected: {status} {body}");
+    Ok(())
+}

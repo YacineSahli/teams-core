@@ -166,6 +166,17 @@ pub async fn answer_call_with_stop(
     // 2026-10-20). The bound RTP port is patched into the SDP first.
     let mut audio_plan: Option<AudioPlan> = None;
     let mut consumer_sdp: Option<String> = None;
+    // The answer SDP we SENT (renegotiation offers are answered by
+    // transforming it — same BUNDLE transport, no ICE restart).
+    let mut original_answer: Option<String> = None;
+    // Consumer answers wrap the mediaAnswer envelope (same rule as
+    // send_media_answer: fork-attach links present).
+    let consumer = notification
+        .call_invitation
+        .as_ref()
+        .and_then(|i| i.links.as_ref())
+        .and_then(|l| l.attach.as_ref())
+        .is_some();
     let mut session: Option<media::MediaSession> = None;
     // DTLS-SRTP when the caller's offer declares a fingerprint (WebRTC
     // peers); we answered `a=setup:active` → we are the DTLS client.
@@ -403,6 +414,7 @@ pub async fn answer_call_with_stop(
                         // Consumer acceptance embeds the SDP itself
                         // (aligned, like the mediaAnswer above).
                         consumer_sdp = Some(sdp::align_answer_mids_to_offer(&sdp_out, &blob));
+                        original_answer = Some(sdp_out.clone());
                     }
                     Err(e) => {
                         tracing::warn!("Could not parse SDP offer (may be compressed): {e:#}");
@@ -486,6 +498,39 @@ pub async fn answer_call_with_stop(
     loop {
         tokio::select! {
             _ = stats_tick.tick() => {
+                // Mid-call renegotiation offers (peer screen share /
+                // camera flips) forwarded by the embedder: answer on
+                // the session transport. Latest-wins state: each answer
+                // becomes the base for the next.
+                if controls.is_some() && original_answer.is_some() {
+                    while let Ok((url, offer)) =
+                        controls.as_ref().unwrap().renegotiations.try_recv()
+                    {
+                        let orig = original_answer.clone().unwrap_or_default();
+                        tracing::info!(
+                            "CALLQA renegotiation=received offer_bytes={}",
+                            offer.len()
+                        );
+                        let answer = sdp::build_renegotiation_answer(&offer, &orig);
+                        match signaling::post_renegotiation_answer(
+                            &http,
+                            skype_token_str,
+                            &url,
+                            &answer,
+                            consumer,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!("CALLQA renegotiation=answered");
+                                original_answer = Some(answer);
+                            }
+                            Err(e) => {
+                                tracing::warn!("renegotiation answer failed: {e:#}")
+                            }
+                        }
+                    }
+                }
                 if let Some(ref s) = session {
                     let stats = s.stats().await;
                     tracing::info!(
