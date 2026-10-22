@@ -949,6 +949,7 @@ pub async fn run_call_with_controls(
         &mut ws,
         Duration::from_secs(60),
         std::sync::Arc::clone(&latest_links),
+        stop.clone(),
     )
     .await
     {
@@ -963,6 +964,11 @@ pub async fn run_call_with_controls(
         }
         Err(e) => {
             tracing::warn!("No call acceptance received: {:#}", e);
+            // Local hang-up while ringing OR ring timeout: tear the
+            // ringing call down server-side too — otherwise the callee
+            // keeps ringing until its own timeout (live 2026-10-22,
+            // pairdecline round 2: B rang 30s+ past A's hang-up).
+            cancel_ringing_call(&http, &conv_params, &latest_links, &phase1.response_body).await;
             println!("call_accepted=false");
             return Ok(CallTestResult::failed(None));
         }
@@ -3128,6 +3134,7 @@ async fn wait_for_call_acceptance(
     latest_links: std::sync::Arc<
         tokio::sync::Mutex<std::collections::HashMap<String, String>>,
     >,
+    stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<CallAcceptanceResponse> {
     let deadline = tokio::time::Instant::now() + timeout;
 
@@ -3277,6 +3284,16 @@ async fn wait_for_call_acceptance(
             _ = tokio::time::sleep_until(deadline) => {
                 anyhow::bail!("Timeout waiting for call acceptance ({}s)", timeout.as_secs());
             }
+            // Local hang-up while still ringing: exit NOW so the call
+            // slot frees and the ringing teardown POSTs below run —
+            // without this the caller wedges in the 60s acceptance
+            // wait while the callee keeps ringing (live 2026-10-22,
+            // pairdecline round 2).
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                if *stop.borrow() {
+                    anyhow::bail!("cancelled locally (hang-up while ringing)");
+                }
+            }
         }
     }
 }
@@ -3295,6 +3312,38 @@ fn extract_json_from_frame(frame: &str) -> Option<&str> {
 }
 
 /// End a call by posting to a specific end URL.
+/// Best-effort server teardown of a RINGING (not yet accepted) call:
+/// local hang-up or ring timeout. Fresh conversationUpdate links first
+/// (their e= epochs are live — the same lesson as the connected-call
+/// hang-up chain), then the create-response leave link. If none lands
+/// the callee's own ring timeout bounds the damage.
+async fn cancel_ringing_call(
+    http: &reqwest::Client,
+    conv_params: &signaling::ConversationCallParams<'_>,
+    latest_links: &std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+    >,
+    phase1_body: &str,
+) {
+    let links = latest_links.lock().await.clone();
+    if let Some(leave) = links.get("leave") {
+        tracing::info!("Cancelling ringing call via fresh leave link");
+        if leave_call_by_url(http, conv_params, leave).await.is_ok() {
+            return;
+        }
+    }
+    if let Some(end) = links.get("end") {
+        tracing::info!("Cancelling ringing call via fresh end link");
+        if end_call_by_url(http, conv_params, end).await.is_ok() {
+            return;
+        }
+    }
+    if let Some(leave) = phase1_conversation_leave(phase1_body) {
+        tracing::info!("Cancelling ringing call via create-response leave link");
+        let _ = leave_call_by_url(http, conv_params, &leave).await;
+    }
+}
+
 /// Pull the conversation `leave` link out of a create-response body.
 fn phase1_conversation_leave(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
