@@ -1932,6 +1932,14 @@ pub fn build_renegotiation_answer(offer: &str, original_answer: &str) -> String 
 
     let mut out = String::new();
     for line in &orig_session {
+        // Our original answer's group line is superseded by the
+        // incoming offer's (it names the NEW mid) — emit exactly one
+        // group. (The duplicate this loop used to emit was
+        // live-accepted by Chrome, but one correct line is what RFC
+        // 5888 asks for.)
+        if line.starts_with("a=group:BUNDLE") {
+            continue;
+        }
         out.push_str(line);
         out.push_str("\r\n");
     }
@@ -2153,7 +2161,8 @@ pub fn build_renegotiation_answer_as_caller(offer: &str, our_offer: &str) -> Str
     #[test]
     fn renegotiation_answer_accepts_share() {
         let answer = build_renegotiation_answer(RENEG_OFFER_SHARE_START, RENEG_ORIG_ANSWER);
-        // The offer's group (with the NEW mid) is echoed.
+        // The offer's group (with the NEW mid) is echoed — exactly once.
+        assert_eq!(answer.matches("a=group:BUNDLE").count(), 1);
         assert!(answer.contains("a=group:BUNDLE 0 1 4\r\n"));
         // Existing sections copied with our transport.
         let audio = answer.split("m=audio").nth(1).unwrap().split("m=").next().unwrap();
@@ -2180,6 +2189,7 @@ pub fn build_renegotiation_answer_as_caller(offer: &str, our_offer: &str) -> Str
     fn renegotiation_answer_mirrors_camera_off() {
         let answer = build_renegotiation_answer(RENEG_OFFER_CAMERA_OFF, RENEG_ORIG_ANSWER);
         assert!(answer.contains("a=group:BUNDLE 0 1 5\r\n"));
+        assert_eq!(answer.matches("a=group:BUNDLE").count(), 1);
         // Offer flipped mid:1 to recvonly (peer stopped its camera) —
         // our answer keeps SENDING: sendonly.
         let main = answer.split("a=mid:1\r\n").nth(1).unwrap().split("m=").next().unwrap();
