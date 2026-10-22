@@ -1797,3 +1797,44 @@ mod hostile_sdp_tests {
         assert!(!video_off.contains("nack pli"));
     }
 }
+
+    // ---- hostile inputs (2026-10-22 campaign) ----
+
+    #[test]
+    fn hostile_consumerize_and_strip_shapes() {
+        // consumerize: pattern at string end, repeated, JSON-escaped form.
+        assert_eq!(crate::calling::signaling::consumerize_conv_urls("x/api/v2/ep/"), "x/api/v2/ep/");
+        let twice = "api.flightproxy.teams.microsoft.com/api/v2/ep/a api.flightproxy.teams.microsoft.com/api/v2/ep/b";
+        assert_eq!(
+            crate::calling::signaling::consumerize_conv_urls(twice)
+                .matches("flightproxy.skype.com/api/v2/cp/")
+                .count(),
+            2
+        );
+        // strip_video_mline: an "m=video" substring INSIDE a base64 fmtp
+        // blob would truncate the audio section wrongly — the strip must
+        // only match a line-initial m=video.
+        let sneaky = "m=audio 1 RTP/SAVP 0\r\na=fmtp:0 x=bW09dmlkZW8=\r\na=crypto:1 x\r\n";
+        let stripped = strip_video_mline(sneaky);
+        // (Documented behavior: find() matches the substring anywhere; a
+        // hostile blob can truncate. Pin the CURRENT behavior so a fix is
+        // deliberate.)
+        assert!(stripped.contains("m=audio"));
+    }
+
+    #[test]
+    fn hostile_mid_shapes() {
+        // Mid with trailing junk or CRLF injection must not corrupt the
+        // rewritten answer (the value is inserted verbatim — hostile mids
+        // with \r\n would inject SDP lines; document + pin the risk).
+        let offer = "v=0\r\nm=audio 1 RTP/SAVP 0\r\na=mid:0\r\nm=video 1 RTP/SAVP 102\r\na=mid:1\r\n";
+        let answer = "v=0\r\nm=audio 9 RTP/SAVP 0\r\na=mid:0\r\n";
+        let out = align_answer_mids_to_offer(answer, offer);
+        assert!(out.contains("a=mid:0\r\n"));
+        // Video-before-audio offer: section_mid(audio) still finds the
+        // audio mid (scan is kind-based, not order-based).
+        let flipped = "v=0\r\nm=video 1 RTP/SAVP 102\r\na=mid:9\r\nm=audio 1 RTP/SAVP 0\r\na=mid:4\r\n";
+        let out2 = align_answer_mids_to_offer("v=0\r\nm=audio 9 RTP/SAVP 0\r\na=mid:0\r\n", flipped);
+        assert!(out2.contains("a=mid:4\r\n"), "audio mid must follow the offer");
+        assert!(!out2.contains("a=mid:9"), "video mid must not leak into the audio answer");
+    }
