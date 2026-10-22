@@ -135,7 +135,7 @@ pub async fn handshake_srtp(
     };
 
     let conn = Arc::new(QueueConn {
-        socket,
+        socket: Arc::downgrade(&socket),
         remote,
         inbound,
     });
@@ -213,7 +213,15 @@ pub fn placeholder_context() -> srtp::SrtpContext {
 /// [webrtc_util::Conn] feeding the DTLS engine from the shared inbound
 /// queue and sending records to the fixed remote.
 struct QueueConn {
-    socket: Arc<tokio::net::UdpSocket>,
+    // WEAK on purpose: the DTLS connection is deliberately kept alive
+    // for the call's life (std::mem::forget below — closing it sends
+    // close_notify and the browser kills the whole transport, live
+    // 2026-10-21). With a strong handle that forgotten object pinned
+    // the MEDIA UDP SOCKET forever: exactly one leaked socket per
+    // connected call on BOTH sides (leak-verification 2026-10-22).
+    // Strong refs exist for the entire handshake; the conn is idle
+    // after key export, so post-call sends (none) find nothing.
+    socket: std::sync::Weak<tokio::net::UdpSocket>,
     remote: SocketAddr,
     inbound: Arc<DtlsInbound>,
 }
@@ -251,21 +259,30 @@ impl webrtc_util::Conn for QueueConn {
     }
 
     async fn send(&self, buf: &[u8]) -> webrtc_util::Result<usize> {
-        self.socket
+        let socket = self.socket.upgrade().ok_or_else(|| {
+            webrtc_util::Error::Other("media socket gone (call ended)".to_string())
+        })?;
+        socket
             .send_to(buf, self.remote)
             .await
             .map_err(webrtc_util::Error::from)
     }
 
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> webrtc_util::Result<usize> {
-        self.socket
+        let socket = self.socket.upgrade().ok_or_else(|| {
+            webrtc_util::Error::Other("media socket gone (call ended)".to_string())
+        })?;
+        socket
             .send_to(buf, target)
             .await
             .map_err(webrtc_util::Error::from)
     }
 
     fn local_addr(&self) -> webrtc_util::Result<SocketAddr> {
-        self.socket
+        let socket = self.socket.upgrade().ok_or_else(|| {
+            webrtc_util::Error::Other("media socket gone (call ended)".to_string())
+        })?;
+        socket
             .local_addr()
             .map_err(webrtc_util::Error::from)
     }
