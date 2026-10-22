@@ -29,7 +29,7 @@ mod write_fakes;
 use anyhow::Result;
 
 // Re-export data types for TUI integration
-pub use chat::{create_one_to_one_personal, 
+pub use chat::{create_group_from_thread_personal, create_one_to_one_personal, 
     ChatInfo, ChatMemberInfo, CustomReaction, MessageInfo, MessagesPage, ReactionCount, Reactor,
     ReadReceipt, RosterSource, REACTION_EMOJI,
 };

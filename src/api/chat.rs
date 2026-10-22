@@ -2428,6 +2428,82 @@ pub fn one_to_one_thread_body(me: &str, peer: &str) -> serde_json::Value {
 /// 19:…@thread.v2 id (NOT the derived @unq.gbl.spaces form).
 /// `peer` is the peer's skypeid (live:<handle> / live:.cid.<hex>) or
 /// full 8:live: MRI.
+/// Consumer group-chat create: members lifted from another thread's
+/// roster (MRIs preserved verbatim — consumer rosters carry the
+/// endpoint-registered forms thread creation needs; the AAD UPN→OID
+/// resolution of [`create_group_chat_data`] does not exist on consumer).
+/// Topic optional (a properties field, like the work shape).
+pub async fn create_group_from_thread_personal(
+    client: &TeamsClient,
+    source_thread: &str,
+    topic: Option<&str>,
+) -> Result<ChatInfo> {
+    let me = client
+        .skypeid()
+        .context("personal group needs config.skypeid (re-login)")?;
+    let base = client.chat_service_url();
+    let roster_url = format!("{base}/v1/threads/{}/members", source_thread.trim());
+    let resp = client
+        .chat_get(&roster_url)
+        .await
+        .context("source thread roster read failed")?;
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .context("source thread roster parse failed")?;
+    // Roster ids verbatim; bots (28:) and every self spelling out.
+    let is_self = |id: &str| {
+        let id = id.trim().trim_start_matches("8:").to_lowercase();
+        let me = me.to_lowercase();
+        id == me || id == format!("live:{me}")
+    };
+    let mut member_ids: Vec<String> = v
+        .get("members")
+        .and_then(|m| m.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+                .map(str::to_string)
+                .filter(|id| !id.starts_with("28:") && !is_self(id))
+                .collect()
+        })
+        .unwrap_or_default();
+    anyhow::ensure!(!member_ids.is_empty(), "source thread has no other members");
+    member_ids.push(format!("8:{me}"));
+    let mut properties = serde_json::json!({"threadType": "chat"});
+    if let Some(t) = topic.filter(|t| !t.trim().is_empty()) {
+        properties["topic"] = serde_json::Value::String(t.trim().to_string());
+    }
+    let body = serde_json::json!({
+        "members": member_ids
+            .iter()
+            .map(|m| serde_json::json!({"id": m, "role": "Admin"}))
+            .collect::<Vec<_>>(),
+        "properties": properties,
+    });
+    let resp = client
+        .chat_post(&thread_create_url(&base), &body)
+        .await
+        .context("consumer group thread create failed")?;
+    let thread = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|l| l.split('?').next())
+        .and_then(|l| l.rsplit('/').next())
+        .map(|id| id.replace("%3A", ":").replace("%3a", ":").replace("%40", "@"))
+        .context("consumer group create answered no thread id")?;
+    Ok(ChatInfo {
+        id: thread,
+        name: topic.unwrap_or("").trim().to_string(),
+        is_group: true,
+        last_message_time: None,
+        last_message_sender: None,
+        last_message_preview: None,
+        last_read_ms: None,
+    })
+}
+
 pub async fn create_one_to_one_personal(
     client: &TeamsClient,
     peer: &str,

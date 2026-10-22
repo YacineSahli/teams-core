@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 
 #[cfg(feature = "video-cam")]
 use crate::calling::{camera, codec};
+use crate::calling::signaling::TeamsHeaders;
 #[cfg(feature = "video-capture")]
 use crate::calling::display;
 use crate::calling::{ice, media, recording, rtcp, rtp, sdp, signaling, srtp, test_tone, video};
@@ -915,7 +916,22 @@ pub async fn run_call_with_controls(
     tracing::info!("Waiting for media answer on Trouter...");
     // 60s: official Teams rings the callee for ~45s+ before voicemail;
     // 30s cut off humans mid-ring (echo answers in ~2s).
-    let acceptance = match wait_for_call_acceptance(&mut ws, Duration::from_secs(60)).await {
+    // Latest conversationUpdate link set (name -> URL). The frames carry
+    // FRESH e= epochs; the create-response/acceptance links go stale and
+    // the hang-up chain 404/400s with them (live 2026-10-22: caller
+    // hang-up NEVER succeeded on consumer — every app-placed call capped
+    // out server-side at ~2h). Latest-wins per key. Harvested both
+    // during the acceptance wait and in the post-connect pump.
+    let latest_links: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let acceptance = match wait_for_call_acceptance(
+        &mut ws,
+        Duration::from_secs(60),
+        std::sync::Arc::clone(&latest_links),
+    )
+    .await
+    {
         Ok(acc) => {
             if let Some(ref reason) = acc.rejection_reason {
                 tracing::warn!("Call rejected: {}", reason);
@@ -1181,8 +1197,9 @@ pub async fn run_call_with_controls(
         .ws_url(&session_id, &epid)
         .replace("https://", "wss://")
         .replace("http://", "ws://");
-    let mut pump_stop = stop.clone();
-    let mut pump_end = end_rx.clone();
+    let pump_stop = stop.clone();
+    let pump_end = end_rx.clone();
+    let pump_links = std::sync::Arc::clone(&latest_links);
     tokio::spawn(async move {
         let mut backoff_secs = 1u64;
         loop {
@@ -1206,6 +1223,21 @@ pub async fn run_call_with_controls(
                         }
                         continue;
                     }
+                    // Harvest the freshest conversationUpdate link set
+                    // (leave/end carry fresh e= epochs; the stale ones
+                    // 400 at hang-up).
+                    if text.contains("conversationUpdate") {
+                        if let Some(v) = extract_call_payload(&text) {
+                            if let Some(links) = v.get("links").and_then(|l| l.as_object()) {
+                                let mut g = pump_links.lock().await;
+                                for (name, url) in links {
+                                    if let Some(u) = url.as_str() {
+                                        g.insert(name.clone(), u.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if let Some(v) = extract_call_payload(&text) {
                         if v.get("callAcceptance").is_some() {
                             let ack = v
@@ -1221,6 +1253,26 @@ pub async fn run_call_with_controls(
                                 None => tracing::warn!(
                                     "callAcceptance frame carried no acknowledgement URL"
                                 ),
+                            }
+                            // This late frame carries the FULL link set
+                            // (callLeg, updateCallState, …) — the SDP
+                            // frame the acceptance wait consumed has a
+                            // minimal set, so the hang-up chain would
+                            // never see a callLeg. Harvest latest-wins.
+                            if let Some(links) =
+                                v.pointer("/callAcceptance/links").and_then(|l| l.as_object())
+                            {
+                                let mut g = pump_links.lock().await;
+                                for (name, url) in links {
+                                    if let Some(u) = url.as_str() {
+                                        g.insert(name.clone(), u.to_string());
+                                    }
+                                }
+                                tracing::info!(
+                                    "harvested {} acceptance links (callLeg: {})",
+                                    links.len(),
+                                    g.contains_key("callLeg")
+                                );
                             }
                             continue;
                         }
@@ -1312,7 +1364,7 @@ pub async fn run_call_with_controls(
     // cap and the peer's history shows multi-hour durations.
     let mut ended = false;
     if let Some(ref url) = acceptance.end_url.as_ref() {
-        if end_call_by_url(&http, skype_token_str, url).await.is_ok() {
+        if end_call_by_url(&http, &conv_params, url).await.is_ok() {
             ended = true;
         }
     }
@@ -1323,15 +1375,51 @@ pub async fn run_call_with_controls(
                 Some(idx) => format!("{}/end{}", &leg[..idx], &leg[idx..]),
                 None => format!("{leg}/end"),
             };
-            if end_call_by_url(&http, skype_token_str, &leg_end).await.is_ok() {
+            if end_call_by_url(&http, &conv_params, &leg_end).await.is_ok() {
                 ended = true;
             }
         }
     }
     if !ended {
         if let Some(leave) = phase1_conversation_leave(&phase1.response_body) {
-            if leave_call_by_url(&http, skype_token_str, &leave).await.is_ok() {
+            if leave_call_by_url(&http, &conv_params, &leave).await.is_ok() {
                 ended = true;
+            }
+        }
+    }
+    // FRESH links from the latest conversationUpdate (the frame stream
+    // refreshes the e= epochs; every statically-parsed link 404/400s on
+    // connected consumer calls — live 2026-10-22: the caller hang-up
+    // chain NEVER succeeded before this).
+    if !ended {
+        let links = latest_links.lock().await.clone();
+        if let Some(leave) = links.get("leave") {
+            tracing::info!("Trying fresh conversationUpdate leave link");
+            if leave_call_by_url(&http, &conv_params, leave).await.is_ok() {
+                ended = true;
+            }
+        }
+        if !ended {
+            if let Some(end) = links.get("end") {
+                tracing::info!("Trying fresh conversationUpdate end link");
+                if end_call_by_url(&http, &conv_params, end).await.is_ok() {
+                    ended = true;
+                }
+            }
+        }
+        // The late acceptance frame's callLeg (the SDP-frame parse never
+        // has it): .../path?q=x -> .../path/end?q=x, same synthesis as
+        // the acceptance.call_leg_url step.
+        if !ended {
+            if let Some(leg) = links.get("callLeg") {
+                let leg_end = match leg.find('?') {
+                    Some(idx) => format!("{}/end{}", &leg[..idx], &leg[idx..]),
+                    None => format!("{leg}/end"),
+                };
+                tracing::info!("Trying harvested callLeg end link");
+                if end_call_by_url(&http, &conv_params, &leg_end).await.is_ok() {
+                    ended = true;
+                }
             }
         }
     }
@@ -2884,6 +2972,9 @@ fn decompress_gzip_base64(b64: &str) -> Option<String> {
 async fn wait_for_call_acceptance(
     ws: &mut websocket::TrouterSocket,
     timeout: Duration,
+    latest_links: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+    >,
 ) -> Result<CallAcceptanceResponse> {
     let deadline = tokio::time::Instant::now() + timeout;
 
@@ -2913,6 +3004,20 @@ async fn wait_for_call_acceptance(
                                     else if text.contains("conversationEnd") { "conversationEnd" }
                                     else { "conversationUpdate" },
                                     serde_json::to_string(&v).unwrap_or_default());
+                            }
+
+                            // Harvest the freshest conversationUpdate
+                            // link set for the hang-up chain (same
+                            // latest-wins harvest as the pump).
+                            if text.contains("conversationUpdate") {
+                                if let Some(links) = v.get("links").and_then(|l| l.as_object()) {
+                                    let mut g = latest_links.lock().await;
+                                    for (name, url) in links {
+                                        if let Some(u) = url.as_str() {
+                                            g.insert(name.clone(), u.to_string());
+                                        }
+                                    }
+                                }
                             }
 
                             // Check for sessionRejection
@@ -3047,12 +3152,25 @@ fn phase1_conversation_leave(body: &str) -> Option<String> {
 }
 
 /// POST the conversation-service leave link (final hang-up fallback).
-async fn leave_call_by_url(http: &reqwest::Client, skype_token: &str, leave_url: &str) -> Result<()> {
+/// Carries the FULL conv-service header set (chain/message ids, teams
+/// headers) like every other conv POST — the bare X-Skypetoken form
+/// 400s (live 2026-10-22, fresh and stale links alike).
+async fn leave_call_by_url(
+    http: &reqwest::Client,
+    params: &signaling::ConversationCallParams<'_>,
+    leave_url: &str,
+) -> Result<()> {
     tracing::info!("Leaving conversation -> POST {}", leave_url);
     let resp = http
         .post(leave_url)
-        .header("X-Skypetoken", skype_token)
+        .headers(signaling::call_auth(params))
         .header("Content-Type", "application/json")
+        .header("x-microsoft-skype-chain-id", params.chain_id)
+        .header("x-microsoft-skype-message-id", params.message_id)
+        .header("x-microsoft-skype-client", signaling::SKYPE_CLIENT_HEADER)
+        .header("Referer", "https://teams.microsoft.com/")
+        .teams_headers(params.region)
+        .header("x-ms-migration", "True")
         .json(&serde_json::json!({}))
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -3064,13 +3182,23 @@ async fn leave_call_by_url(http: &reqwest::Client, skype_token: &str, leave_url:
     Ok(())
 }
 
-async fn end_call_by_url(http: &reqwest::Client, skype_token: &str, end_url: &str) -> Result<()> {
+async fn end_call_by_url(
+    http: &reqwest::Client,
+    params: &signaling::ConversationCallParams<'_>,
+    end_url: &str,
+) -> Result<()> {
     tracing::info!("Ending call -> POST {}", end_url);
 
     let resp = http
         .post(end_url)
-        .header("X-Skypetoken", skype_token)
+        .headers(signaling::call_auth(params))
         .header("Content-Type", "application/json")
+        .header("x-microsoft-skype-chain-id", params.chain_id)
+        .header("x-microsoft-skype-message-id", params.message_id)
+        .header("x-microsoft-skype-client", signaling::SKYPE_CLIENT_HEADER)
+        .header("Referer", "https://teams.microsoft.com/")
+        .teams_headers(params.region)
+        .header("x-ms-migration", "True")
         .json(&serde_json::json!({}))
         .timeout(std::time::Duration::from_secs(10))
         .send()
