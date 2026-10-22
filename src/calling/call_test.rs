@@ -458,6 +458,14 @@ pub async fn run_call_with_controls(
     // with at least one resolved callee — the N-party create uses the
     // same single-shot shape with a multi-entry participants.to).
     let is_1to1_call = echo || !callees.is_empty();
+    // A CONSUMER thread call with no resolved callees must not fall
+    // through to the channel two-phase path (epconv builds a group
+    // placeholder conversation there — 60s ring-then-timeout; a
+    // transient roster read failure used to degrade here silently).
+    anyhow::ensure!(
+        !consumer || echo || thread_override.is_none() || !callees.is_empty(),
+        "consumer thread call resolved no callees (roster read failed or empty) — refusing the group-placeholder path"
+    );
 
     // Get tenant ID. Consumer threads carry the all-zeros tenant in
     // their properties (addedByTenantId) — that is the value to send.
@@ -1199,13 +1207,24 @@ pub async fn run_call_with_controls(
         .replace("http://", "ws://");
     let pump_stop = stop.clone();
     let pump_end = end_rx.clone();
+    let pump_end_tx = end_tx.clone();
     let pump_links = std::sync::Arc::clone(&latest_links);
     tokio::spawn(async move {
         let mut backoff_secs = 1u64;
         loop {
             // The pump must never outlive the call: check the call's own
             // end conditions before every recv and while reconnecting.
+            // A CLOSED stop channel (sender dropped without a signal —
+            // e.g. the embedder's task was torn down) also stops: a
+            // watch serves its last value (false) forever after sender
+            // drop, which would otherwise keep the pump reconnecting
+            // for the process's lifetime (adversarial finding: one
+            // live WebSocket leaked per call).
             if *pump_stop.borrow() || *pump_end.borrow() {
+                return;
+            }
+            if pump_stop.has_changed().is_err() {
+                tracing::info!("call socket pump: stop sender dropped — exiting");
                 return;
             }
             let frame = {
@@ -1223,69 +1242,90 @@ pub async fn run_call_with_controls(
                         }
                         continue;
                     }
+                    // ONE parse per frame (adversarial finding: the
+                    // previous shape parsed conversationUpdates twice).
+                    let parsed = extract_call_payload(&text);
                     // Harvest the freshest conversationUpdate link set
                     // (leave/end carry fresh e= epochs; the stale ones
-                    // 400 at hang-up).
-                    if text.contains("conversationUpdate") {
-                        if let Some(v) = extract_call_payload(&text) {
+                    // 400 at hang-up). Gated on the parsed event's own
+                    // links object, not a substring.
+                    if parsed.as_ref().is_some_and(|v| {
+                        v.get("type").and_then(|t| t.as_str()) == Some("conversationUpdate")
+                            || v.get("activeModalities").is_some()
+                    }) {
+                        if let Some(v) = parsed.as_ref() {
                             if let Some(links) = v.get("links").and_then(|l| l.as_object()) {
                                 let mut g = pump_links.lock().await;
                                 for (name, url) in links {
                                     if let Some(u) = url.as_str() {
-                                        g.insert(name.clone(), u.to_string());
+                                        if u.starts_with("https://") {
+                                            g.insert(name.clone(), u.to_string());
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                    if let Some(v) = extract_call_payload(&text) {
+                    if let Some(v) = parsed.as_ref() {
                         if v.get("callAcceptance").is_some() {
-                            let ack = v
-                                .pointer("/callAcceptance/links/acknowledgement")
-                                .and_then(|u| u.as_str());
-                            match ack {
-                                Some(url) => {
-                                    tracing::info!(
-                                        "callAcceptance frame on the call socket — forwarding ack URL"
-                                    );
-                                    let _ = late_ack_tx.try_send(url.to_string());
-                                }
-                                None => tracing::warn!(
-                                    "callAcceptance frame carried no acknowledgement URL"
-                                ),
+                        let ack = v
+                            .pointer("/callAcceptance/links/acknowledgement")
+                            .and_then(|u| u.as_str());
+                        match ack {
+                            Some(url) => {
+                                tracing::info!(
+                                    "callAcceptance frame on the call socket — forwarding ack URL"
+                                );
+                                let _ = late_ack_tx.try_send(url.to_string());
                             }
-                            // This late frame carries the FULL link set
-                            // (callLeg, updateCallState, …) — the SDP
-                            // frame the acceptance wait consumed has a
-                            // minimal set, so the hang-up chain would
-                            // never see a callLeg. Harvest latest-wins.
-                            if let Some(links) =
-                                v.pointer("/callAcceptance/links").and_then(|l| l.as_object())
-                            {
-                                let mut g = pump_links.lock().await;
-                                for (name, url) in links {
-                                    if let Some(u) = url.as_str() {
+                            None => tracing::warn!(
+                                "callAcceptance frame carried no acknowledgement URL"
+                            ),
+                        }
+                        // This late frame carries the FULL link set
+                        // (callLeg, updateCallState, …) — the SDP frame
+                        // the acceptance wait consumed has a minimal
+                        // set, so the hang-up chain would never see a
+                        // callLeg. Harvest latest-wins.
+                        if let Some(links) =
+                            v.pointer("/callAcceptance/links").and_then(|l| l.as_object())
+                        {
+                            let mut g = pump_links.lock().await;
+                            for (name, url) in links {
+                                if let Some(u) = url.as_str() {
+                                    if u.starts_with("https://") {
                                         g.insert(name.clone(), u.to_string());
                                     }
                                 }
-                                tracing::info!(
-                                    "harvested {} acceptance links (callLeg: {})",
-                                    links.len(),
-                                    g.contains_key("callLeg")
-                                );
                             }
+                            tracing::info!(
+                                "harvested {} acceptance links (callLeg: {})",
+                                links.len(),
+                                g.contains_key("callLeg")
+                            );
+                        }
                             continue;
                         }
                     }
-                    if text.contains("callEnd")
-                        || text.contains("call/end")
-                        || text.contains("conversationEnd")
-                    {
+                    // Remote-end detection: PARSED, not substring —
+                    // "callEndReason".contains("callEnd") is true, so a
+                    // benign roster/conversationUpdate frame carrying a
+                    // null callEndReason (or an echo of our own
+                    // registered callback URLs) must never end a healthy
+                    // call (adversarial finding). Key on the parsed
+                    // top-level callEnd object and the trouter delivery
+                    // URL suffix, like trouter_frame_response.
+                    let remote_ended = parsed
+                        .as_ref()
+                        .map(|v| check_call_end(v).is_some())
+                        .unwrap_or(false)
+                        || delivery_url_is_call_end(&text);
+                    if remote_ended {
                         tracing::info!(
                             "Remote end signal on the call socket — stopping: {}",
                             &text.chars().take(200).collect::<String>()
                         );
-                        let _ = end_tx.send(true);
+                        let _ = pump_end_tx.send(true);
                         return;
                     }
                 }
@@ -1341,6 +1381,10 @@ pub async fn run_call_with_controls(
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    // The main loop owns the call's lifetime: signal the pump now (the
+    // duration cap and any future exit path reach here without anyone
+    // flipping `stop`; the pump would otherwise outlive the call).
+    let _ = end_tx.send(true);
 
     // 11. Stop media
     outgoing_handles.abort_all();
@@ -1412,13 +1456,23 @@ pub async fn run_call_with_controls(
         // the acceptance.call_leg_url step.
         if !ended {
             if let Some(leg) = links.get("callLeg") {
-                let leg_end = match leg.find('?') {
-                    Some(idx) => format!("{}/end{}", &leg[..idx], &leg[idx..]),
-                    None => format!("{leg}/end"),
+                // Synthesis edge cases (adversarial): a leg already
+                // ending in /end would double it; a trailing slash
+                // would make //end. Skip/trim before synthesizing.
+                let trimmed = leg.trim_end_matches('/');
+                let base = match trimmed.find('?') {
+                    Some(idx) => &trimmed[..idx],
+                    None => trimmed,
                 };
-                tracing::info!("Trying harvested callLeg end link");
-                if end_call_by_url(&http, &conv_params, &leg_end).await.is_ok() {
-                    ended = true;
+                if !base.ends_with("/end") {
+                    let leg_end = match leg.find('?') {
+                        Some(idx) => format!("{trimmed}/end{}", &leg[idx..]),
+                        None => format!("{trimmed}/end"),
+                    };
+                    tracing::info!("Trying harvested callLeg end link");
+                    if end_call_by_url(&http, &conv_params, &leg_end).await.is_ok() {
+                        ended = true;
+                    }
                 }
             }
         }
@@ -2479,6 +2533,18 @@ fn spawn_media_leg(
                                                 "[{}] H.264 encoder initialized ({}x{}, {kbps}kbps)",
                                                 label, frame.width, frame.height
                                             );
+                                            // PACSI Stream Layout follows
+                                            // the reinit (media.rs does
+                                            // this on the answerer's
+                                            // shared loop; the caller's
+                                            // loop missed it — a
+                                            // caller's 720p share
+                                            // announced 320x240).
+                                            packetizer.set_stream_layout(
+                                                frame.width.min(u16::MAX as u32) as u16,
+                                                frame.height.min(u16::MAX as u32) as u16,
+                                                kbps * 1000,
+                                            );
                                             encoder = Some(enc);
                                         }
                                         Err(e) => {
@@ -2833,6 +2899,19 @@ struct CallAcceptanceResponse {
     /// URL for applying channel parameters (video send caps). Used later for video setup.
     #[allow(dead_code)]
     apply_channel_params_url: Option<String>,
+}
+
+/// Does a raw trouter 3::: frame's delivery URL name a call-end or
+/// conversation-end callback? Exact segment suffixes only — a substring
+/// match on "callEnd" would trip on the benign callEndReason field.
+fn delivery_url_is_call_end(text: &str) -> bool {
+    // The envelope's url field, JSON-escaped in the raw frame.
+    for key in [ "\"url\":\"/call/end/\"", "\"url\":\"/conversation/conversationEnd/\"" ] {
+        if text.contains(key) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Check a parsed JSON value for callEnd and return a descriptive string.

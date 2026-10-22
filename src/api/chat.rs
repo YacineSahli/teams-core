@@ -2492,6 +2492,7 @@ pub async fn create_group_from_thread_personal(
         .and_then(|l| l.split('?').next())
         .and_then(|l| l.rsplit('/').next())
         .map(|id| id.replace("%3A", ":").replace("%3a", ":").replace("%40", "@"))
+        .filter(|id| !id.is_empty())
         .context("consumer group create answered no thread id")?;
     Ok(ChatInfo {
         id: thread,
@@ -2538,6 +2539,7 @@ pub async fn create_one_to_one_personal(
         .and_then(|l| l.split('?').next())
         .and_then(|l| l.rsplit('/').next())
         .map(|id| id.replace("%3A", ":").replace("%3a", ":").replace("%40", "@"))
+        .filter(|id| !id.is_empty())
         .context("consumer 1:1 create answered no thread id")?;
     Ok(ChatInfo {
         id: thread,

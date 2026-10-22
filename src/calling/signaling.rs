@@ -285,7 +285,7 @@ pub async fn create_conversation(
     let body = resp.text().await.unwrap_or_default();
 
     tracing::info!("Phase 1 response: {} ({} bytes)", status, body.len());
-    tracing::debug!("Phase 1 response body: {}", &body[..body.len().min(2000)]);
+    tracing::debug!("Phase 1 response body: {}", &body.chars().take(2000).collect::<String>());
     for (k, v) in headers.iter() {
         tracing::debug!(
             "Phase 1 header: {}: {}",
@@ -422,7 +422,7 @@ pub async fn join_conversation_with_modalities(
     let body = resp.text().await.unwrap_or_default();
 
     tracing::info!("Phase 2 response: {} ({} bytes)", status, body.len());
-    tracing::debug!("Phase 2 response body: {}", &body[..body.len().min(2000)]);
+    tracing::debug!("Phase 2 response body: {}", &body.chars().take(2000).collect::<String>());
 
     if !status.is_success() {
         anyhow::bail!("Phase 2 join failed ({}): {}", status, body);
@@ -1392,7 +1392,7 @@ pub async fn create_echo_call(
     let body = resp.text().await.unwrap_or_default();
 
     tracing::info!("Echo call response: {} ({} bytes)", status, body.len());
-    tracing::debug!("Echo call response body: {}", &body[..body.len().min(2000)]);
+    tracing::debug!("Echo call response body: {}", &body.chars().take(2000).collect::<String>());
     for (k, v) in headers.iter() {
         tracing::debug!(
             "Echo call header: {}: {}",
@@ -1620,7 +1620,7 @@ pub async fn create_call_modalities_n(
     let body = resp.text().await.unwrap_or_default();
 
     tracing::info!("1:1 call response: {} ({} bytes)", status, body.len());
-    tracing::debug!("1:1 call response body: {}", &body[..body.len().min(2000)]);
+    tracing::debug!("1:1 call response body: {}", &body.chars().take(2000).collect::<String>());
 
     if !status.is_success() {
         anyhow::bail!("1:1 call epconv failed ({}): {}", status, body);

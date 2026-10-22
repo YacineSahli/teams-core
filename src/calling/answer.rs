@@ -389,16 +389,20 @@ pub async fn answer_call_with_stop(
                             // JSEP: the answer echoes the OFFER's mids —
                             // ours are hardcoded 0/1 (true for every
                             // captured web shape); align so a
-                            // mid-creative peer still matches. Applies to
-                            // audio-only answers too.
+                            // mid-creative peer still matches. Aligned
+                            // ONCE: the consumer acceptance embeds the
+                            // same answer SDP below, and a mismatched
+                            // pair would send two disagreeing answers
+                            // (adversarial finding).
                             &sdp::align_answer_mids_to_offer(&sdp_out, &blob),
                         )
                         .await
                         {
                             tracing::warn!("Failed to send media answer: {e:#}");
                         }
-                        // Consumer acceptance embeds the SDP itself.
-                        consumer_sdp = Some(sdp_out);
+                        // Consumer acceptance embeds the SDP itself
+                        // (aligned, like the mediaAnswer above).
+                        consumer_sdp = Some(sdp::align_answer_mids_to_offer(&sdp_out, &blob));
                     }
                     Err(e) => {
                         tracing::warn!("Could not parse SDP offer (may be compressed): {e:#}");
